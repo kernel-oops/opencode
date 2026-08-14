@@ -1,0 +1,146 @@
+name: Sync upstream stable release
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      latest_tag:
+        description: "Override the upstream tag (dry-run testing only)"
+        required: false
+        type: string
+      dry_run:
+        description: "Prepare and verify without publishing"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare immutable candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ steps.prepare.outputs.state }}
+      latest_tag: ${{ steps.prepare.outputs.latest_tag }}
+      previous_tag: ${{ steps.prepare.outputs.previous_tag }}
+      dry_run: ${{ steps.prepare.outputs.dry_run }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      candidate_tree: ${{ steps.prepare.outputs.candidate_tree }}
+      bundle_sha256: ${{ steps.prepare.outputs.bundle_sha256 }}
+      metadata_sha256: ${{ steps.prepare.outputs.metadata_sha256 }}
+      artifact_name: ${{ steps.prepare.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare candidate without executing it
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_TAG_OVERRIDE: ${{ inputs.latest_tag }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: .github/scripts/upstream-release-sync.sh prepare "$RUNNER_TEMP/release-sync-artifact"
+      - name: Upload immutable candidate bundle and metadata
+        id: upload
+        if: steps.prepare.outputs.state == 'update'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/release-sync-artifact/candidate.bundle
+            ${{ runner.temp }}/release-sync-artifact/metadata.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  verify:
+    name: Verify exact candidate
+    needs: prepare
+    if: needs.prepare.outputs.state == 'update'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: package.json
+      - name: Download immutable candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-sync-artifact
+      - name: Verify tests, types, formatting, build, and integrity
+        env:
+          EXPECTED_BUNDLE_SHA256: ${{ needs.prepare.outputs.bundle_sha256 }}
+          EXPECTED_METADATA_SHA256: ${{ needs.prepare.outputs.metadata_sha256 }}
+        run: .github/scripts/upstream-release-sync.sh verify "$RUNNER_TEMP/release-sync-artifact"
+
+  publish:
+    name: Atomically promote verified candidate
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.state == 'update' && needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download verified immutable candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-sync-artifact
+      - name: Post status and atomically promote exact head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_BUNDLE_SHA256: ${{ needs.prepare.outputs.bundle_sha256 }}
+          EXPECTED_METADATA_SHA256: ${{ needs.prepare.outputs.metadata_sha256 }}
+        run: .github/scripts/upstream-release-sync.sh publish "$RUNNER_TEMP/release-sync-artifact"
+
+  notify:
+    name: Report automation result
+    needs: [prepare, verify, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Create, update, or close durable failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          PREPARE_STATE: ${{ needs.prepare.outputs.state }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          LATEST_TAG_CONTEXT: ${{ needs.prepare.outputs.latest_tag }}
+          DRY_RUN_CONTEXT: ${{ needs.prepare.outputs.dry_run }}
+        run: .github/scripts/upstream-release-sync.sh notify
