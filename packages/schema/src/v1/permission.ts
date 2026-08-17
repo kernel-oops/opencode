@@ -48,9 +48,41 @@ export const Approval = Schema.Struct({ projectID: Project.ID, patterns: Schema.
 })
 export type Approval = typeof Approval.Type
 
-export const AskInput = Schema.Struct({ ...Request.fields, id: Schema.optional(ID), ruleset: Ruleset }).annotate({
-  identifier: "PermissionAskInput",
-})
+export const ReviewSource = Schema.Struct({
+  origin: Schema.Literals(["tool", "doom_loop", "unknown"]),
+  agent: Schema.optional(
+    Schema.Struct({
+      name: Schema.String,
+      mode: Schema.Literals(["subagent", "primary", "all"]),
+    }),
+  ),
+  model: Schema.optional(
+    Schema.Struct({
+      providerID: Schema.String,
+      modelID: Schema.String,
+    }),
+  ),
+  session: Schema.optional(
+    Schema.Struct({
+      parentID: Schema.optional(SessionID),
+      rootID: Schema.optional(SessionID),
+      lineage: Schema.Array(SessionID),
+      complete: Schema.Boolean,
+      reason: Schema.optional(
+        Schema.Union([Schema.Literal("missing_current"), Schema.Literal("missing_ancestor"), Schema.Literal("cycle")]),
+      ),
+    }),
+  ),
+  arguments: Schema.optional(Schema.Unknown),
+}).annotate({ identifier: "PermissionReviewSource" })
+export type ReviewSource = typeof ReviewSource.Type
+
+export const AskInput = Schema.Struct({
+  ...Request.fields,
+  id: Schema.optional(ID),
+  ruleset: Ruleset,
+  review: Schema.optional(ReviewSource),
+}).annotate({ identifier: "PermissionAskInput" })
 export type AskInput = typeof AskInput.Type
 
 export const ReplyInput = Schema.Struct({ requestID: ID, ...ReplyBody.fields }).annotate({
