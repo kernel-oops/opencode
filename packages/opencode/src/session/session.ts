@@ -38,7 +38,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Effect, Exit, Layer, Option, Context, Schema, Types } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -474,6 +474,55 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
 
 export const use = serviceUse(Service)
+
+export type LineageNode = Pick<Info, "id" | "parentID">
+export type Lineage = {
+  parentID?: SessionID
+  rootID?: SessionID
+  lineage: SessionID[]
+  complete: boolean
+  reason?: "missing_ancestor" | "cycle"
+}
+
+export function resolveLineage(
+  sessions: { readonly get: (id: SessionID) => Effect.Effect<LineageNode, unknown> },
+  current: LineageNode,
+): Effect.Effect<Lineage> {
+  return Effect.gen(function* () {
+    const ids = [current.id]
+    const seen = new Set(ids)
+    let parentID = current.parentID
+    while (parentID) {
+      if (seen.has(parentID)) {
+        return {
+          parentID: current.parentID,
+          lineage: ids.reverse(),
+          complete: false,
+          reason: "cycle" as const,
+        }
+      }
+      const parent = yield* sessions.get(parentID).pipe(Effect.exit)
+      if (Exit.isFailure(parent)) {
+        return {
+          parentID: current.parentID,
+          lineage: ids.reverse(),
+          complete: false,
+          reason: "missing_ancestor" as const,
+        }
+      }
+      ids.push(parent.value.id)
+      seen.add(parent.value.id)
+      parentID = parent.value.parentID
+    }
+    ids.reverse()
+    return {
+      parentID: current.parentID,
+      rootID: ids[0] ?? current.id,
+      lineage: ids,
+      complete: true,
+    }
+  })
+}
 
 export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" | "permission"> & {
   time?: Partial<Info["time"]>

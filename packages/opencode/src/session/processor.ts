@@ -369,13 +369,22 @@ const layer = Layer.effect(
             }
 
             const agent = yield* agents.get(ctx.assistantMessage.agent)
+            const currentSession = yield* session.get(ctx.assistantMessage.sessionID)
             yield* permission.ask({
               permission: "doom_loop",
               patterns: [value.name],
               sessionID: ctx.assistantMessage.sessionID,
               metadata: { tool: value.name, input },
               always: [value.name],
+              tool: { messageID: ctx.assistantMessage.id, callID: value.id },
               ruleset: agent.permission,
+              review: {
+                origin: "doom_loop",
+                agent: { name: agent.name, mode: agent.mode },
+                model: { providerID: ctx.model.providerID, modelID: ctx.model.id },
+                session: yield* Session.resolveLineage(session, currentSession),
+                arguments: input,
+              },
             })
             return
           }
@@ -624,7 +633,9 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+      const process: Handle["process"] = Effect.fn("SessionProcessor.process")(function* (
+        streamInput: LLM.StreamInput,
+      ) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
