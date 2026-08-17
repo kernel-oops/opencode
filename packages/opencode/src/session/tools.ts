@@ -51,6 +51,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
   const permission = yield* Permission.Service
+  const sessions = yield* Session.Service
   const registry = yield* ToolRegistry.Service
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
@@ -79,14 +80,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         }
       }),
     ask: (req) =>
-      permission
-        .ask({
+      Effect.gen(function* () {
+        const lineage = yield* Session.resolveLineage(sessions, input.session)
+        yield* permission.ask({
           ...req,
           sessionID: input.session.id,
           tool: { messageID: input.processor.message.id, callID: options.toolCallId },
           ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+          review: {
+            origin: "tool",
+            agent: { name: input.agent.name, mode: input.agent.mode },
+            model: { providerID: input.model.providerID, modelID: input.model.id },
+            session: lineage,
+            arguments: args,
+          },
         })
-        .pipe(Effect.orDie),
+      }).pipe(Effect.orDie),
   })
 
   for (const item of yield* registry.tools({

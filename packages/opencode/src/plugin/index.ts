@@ -1,6 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import type {
   Hooks,
+  PermissionReviewInput,
   PluginInput,
   Plugin as PluginInstance,
   PluginModule,
@@ -52,8 +53,15 @@ export interface Interface {
     input: Input,
     output: Output,
   ) => Effect.Effect<Output>
+  readonly preparePermissionAsk: (input: PermissionReviewInput) => Effect.Effect<(() => PermissionAskRun) | undefined>
   readonly list: () => Effect.Effect<Hooks[]>
   readonly init: () => Effect.Effect<void>
+}
+
+export type PermissionAskResult = "allow" | "ask" | "deny" | "error"
+export interface PermissionAskRun {
+  readonly result: Promise<PermissionAskResult>
+  readonly settled: Promise<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
@@ -294,6 +302,51 @@ const layer = Layer.effect(
       return output
     })
 
+    const preparePermissionAsk: Interface["preparePermissionAsk"] = Effect.fn("Plugin.preparePermissionAsk")(
+      function* (input) {
+        const s = yield* InstanceState.get(state)
+        const hooks = s.hooks.flatMap((hook) => {
+          const fn = hook["permission.ask"]
+          return fn ? [fn] : []
+        })
+        if (hooks.length === 0) return undefined
+
+        return () => {
+          const executions = hooks.map(async (hook): Promise<PermissionAskResult> => {
+            const output: Parameters<typeof hook>[1] = { status: "ask" }
+            try {
+              await hook(structuredClone(input), output)
+              const status: unknown = Object.getOwnPropertyDescriptor(output, "status")?.value
+              if (status === "deny" || status === "ask" || status === "allow") return status
+              return "error"
+            } catch {
+              return "error"
+            }
+          })
+          const all = Promise.all(executions)
+          const settled = all.then(() => undefined)
+          const deny = new Promise<PermissionAskResult>((resolve) => {
+            for (const execution of executions) {
+              void execution.then((result) => {
+                if (result === "deny") resolve("deny")
+              })
+            }
+          })
+          const aggregate = all.then((results): PermissionAskResult => {
+            if (results.includes("deny")) return "deny"
+            if (results.includes("error")) return "error"
+            if (results.includes("ask")) return "ask"
+            return results.every((result) => result === "allow") ? "allow" : "ask"
+          })
+
+          return {
+            result: Promise.race([deny, aggregate]),
+            settled,
+          }
+        }
+      },
+    )
+
     const list = Effect.fn("Plugin.list")(function* () {
       const s = yield* InstanceState.get(state)
       return s.hooks
@@ -303,7 +356,7 @@ const layer = Layer.effect(
       yield* InstanceState.get(state)
     })
 
-    return Service.of({ trigger, list, init })
+    return Service.of({ trigger, preparePermissionAsk, list, init })
   }),
 )
 
