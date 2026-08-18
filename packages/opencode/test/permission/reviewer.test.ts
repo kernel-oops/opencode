@@ -327,6 +327,83 @@ it.effect("rejects unsupported reasoning output instead of ignoring it", () =>
   }),
 )
 
+it.effect("accepts an empty reasoning envelope emitted by Responses reasoning models", () =>
+  Effect.gen(function* () {
+    reset()
+    language = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "reasoning-start" as const, id: "reasoning" },
+              { type: "reasoning-end" as const, id: "reasoning" },
+              { type: "text-start" as const, id: "review" },
+              { type: "text-delta" as const, id: "review", delta: '{"decision":"ask"}' },
+              { type: "text-end" as const, id: "review" },
+              { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
+            ],
+          }),
+        }),
+    })
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("rejects malformed empty reasoning envelopes", () =>
+  Effect.gen(function* () {
+    const cases = [
+      [
+        { type: "reasoning-start" as const, id: "reasoning" },
+        { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
+      ],
+      [
+        { type: "reasoning-start" as const, id: "reasoning" },
+        { type: "reasoning-start" as const, id: "nested" },
+        { type: "reasoning-end" as const, id: "nested" },
+        { type: "reasoning-end" as const, id: "reasoning" },
+        { type: "text-start" as const, id: "review" },
+        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-end" as const, id: "review" },
+        { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
+      ],
+      [
+        { type: "reasoning-start" as const, id: "reasoning" },
+        { type: "reasoning-end" as const, id: "different" },
+        { type: "text-start" as const, id: "review" },
+        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-end" as const, id: "review" },
+        { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
+      ],
+      [
+        { type: "reasoning-start" as const, id: "reasoning" },
+        { type: "text-start" as const, id: "review" },
+        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-end" as const, id: "review" },
+        { type: "reasoning-end" as const, id: "reasoning" },
+        { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
+      ],
+    ]
+
+    const reviewer = yield* PermissionReviewer.Service
+    for (const chunks of cases) {
+      reset()
+      language = new MockLanguageModelV3({
+        doStream: () => Promise.resolve({ stream: simulateReadableStream({ chunks }) }),
+      })
+      const result = yield* reviewer.review({
+        config,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      })
+      expect("failure" in result).toBe(true)
+    }
+  }),
+)
+
 it.effect("aborts and rejects as soon as streamed raw output exceeds 256 bytes", () =>
   Effect.gen(function* () {
     reset()

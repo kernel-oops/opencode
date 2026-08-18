@@ -174,8 +174,29 @@ export const layer = Layer.effect(
             })
             let text = ""
             let size = 0
+            let reasoning: string | undefined
             for await (const chunk of result.fullStream) {
               if (chunk.type === "error") throw new Error("permission reviewer provider failure")
+              if (chunk.type === "reasoning-start") {
+                if (reasoning !== undefined) {
+                  controller.abort()
+                  return { failure: "malformed" as const }
+                }
+                reasoning = chunk.id
+                continue
+              }
+              if (chunk.type === "reasoning-end") {
+                if (reasoning !== chunk.id) {
+                  controller.abort()
+                  return { failure: "malformed" as const }
+                }
+                reasoning = undefined
+                continue
+              }
+              if (reasoning !== undefined) {
+                controller.abort()
+                return { failure: "malformed" as const }
+              }
               if (chunk.type === "text-delta") {
                 size += Buffer.byteLength(chunk.text, "utf8")
                 if (size > MAX_OUTPUT_BYTES) {
@@ -196,6 +217,10 @@ export const layer = Layer.effect(
                 controller.abort()
                 return { failure: "malformed" as const }
               }
+            }
+            if (reasoning !== undefined) {
+              controller.abort()
+              return { failure: "malformed" as const }
             }
             const parsed = parse(text)
             if (
