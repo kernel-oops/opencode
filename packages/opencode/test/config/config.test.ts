@@ -2221,6 +2221,30 @@ test("parseManagedPlist parses enabled_providers", async () => {
   expect(config.enabled_providers).toEqual(["anthropic", "google"])
 })
 
+test("permission_reviewer accepts only the strict configured shape", () => {
+  const source = "test:permission-reviewer"
+  const valid = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({ permission_reviewer: { mode: "audit-only", model: "openai/gpt-5.6-luna-oauth" } }),
+      source,
+    ),
+    source,
+  )
+  expect(valid.permission_reviewer).toEqual({ mode: "audit-only", model: "openai/gpt-5.6-luna-oauth" })
+
+  for (const permission_reviewer of [
+    { mode: "audit", model: "openai/gpt-5.6-luna-oauth" },
+    { mode: "enforce" },
+    { model: "openai/gpt-5.6-luna-oauth" },
+    { mode: "enforce", model: "" },
+  ]) {
+    expect(() =>
+      ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(JSON.stringify({ permission_reviewer }), source), source),
+    ).toThrow()
+  }
+})
+
 test("parseManagedPlist handles empty config", async () => {
   const config = ConfigParse.schema(
     ConfigV1.Info,

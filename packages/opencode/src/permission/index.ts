@@ -2,18 +2,20 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Cause, Clock, Deferred, Effect, Layer, Context, Exit } from "effect"
+import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Scope } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Plugin } from "@/plugin"
 import { Session } from "@/session/session"
+import { Config } from "@/config/config"
 import {
   PERMISSION_REVIEW_POLICY_VERSION,
   type PermissionReviewContext,
   type PermissionReviewInput,
 } from "@opencode-ai/plugin"
 import { safeReviewValue } from "./review"
+import { PermissionReviewer } from "./reviewer"
 
 export const Event = PermissionV1.Event
 
@@ -29,22 +31,38 @@ interface PendingEntry {
 }
 
 interface ReviewLease {
-  result: Promise<Plugin.PermissionAskResult>
-  settlement: Promise<void>
   settled: boolean
+  completed: boolean
+}
+
+interface ActiveReviewerRun {
+  readonly run: PermissionReviewer.Run
 }
 
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
   approved: PermissionV1.Rule[]
   reviews: Set<ReviewLease>
+  reviewerRuns: Set<ActiveReviewerRun>
+  scope: Scope.Scope
+  disposed: boolean
   project: PermissionReviewContext["project"]
 }
 
 export const REVIEW_TIMEOUT = "30 seconds"
 export const REVIEW_CAPACITY = 4
 
-type ReviewResult = "allow" | "ask" | "deny" | "timeout" | "error" | "capacity" | "interrupted"
+type ReviewResult =
+  | "allow"
+  | "ask"
+  | "deny"
+  | "timeout"
+  | "error"
+  | "capacity"
+  | "interrupted"
+  | PermissionReviewer.Failure
+
+type BuiltinResult = PermissionReviewer.Result
 
 function safeReviewString(value: string) {
   const result = safeReviewValue(value)
@@ -71,12 +89,18 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const plugin = yield* Plugin.Service
     const sessions = yield* Session.Service
+    const config = yield* Config.Service
+    const reviewer = yield* PermissionReviewer.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
+        const scope = yield* Scope.Scope
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
           reviews: new Set<ReviewLease>(),
+          reviewerRuns: new Set<ActiveReviewerRun>(),
+          scope,
+          disposed: false,
           project: {
             id: ctx.project.id,
             directory: ctx.directory,
@@ -86,11 +110,14 @@ const layer = Layer.effect(
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
+            state.disposed = true
+            for (const active of state.reviewerRuns) active.run.abort()
             for (const item of state.pending.values()) {
               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
             }
             state.pending.clear()
             state.reviews.clear()
+            state.reviewerRuns.clear()
           }),
         )
 
@@ -117,6 +144,7 @@ const layer = Layer.effect(
       info: PermissionV1.Request
       review: PermissionReviewContext
       result: ReviewResult
+      source: "plugin" | "builtin"
       latencyMs: number
       fallbackToHuman: boolean
       reviewSettled: boolean
@@ -134,6 +162,7 @@ const layer = Layer.effect(
         modelID: input.review.model?.modelID,
         permission: input.info.permission,
         origin: input.review.origin,
+        source: input.source,
         result: input.result,
         latencyMs: input.latencyMs,
         policyVersion: input.review.policyVersion,
@@ -149,7 +178,7 @@ const layer = Layer.effect(
       let needsAsk = false
       const rules: PermissionReviewContext["rules"] = []
 
-      for (const pattern of request.patterns) {
+      for (const [patternIndex, pattern] of request.patterns.entries()) {
         const configured = evaluate(request.permission, pattern, ruleset)
         const learned = evaluate(request.permission, pattern, approved)
         // Learned approvals may satisfy asks, but configured allow/deny decisions remain authoritative.
@@ -163,8 +192,9 @@ const layer = Layer.effect(
         rules.push({ pattern: reviewedPattern, action: rule.action, matched: reviewedRule })
         yield* Effect.logInfo("evaluated", {
           permission: request.permission,
-          pattern: reviewedPattern,
-          action: reviewedRule,
+          action: rule.action,
+          patternIndex,
+          patternCount: request.patterns.length,
         })
         if (rule.action === "deny") {
           return yield* new PermissionV1.DeniedError({
@@ -210,71 +240,231 @@ const layer = Layer.effect(
         review,
       }
       const prepared = yield* plugin.preparePermissionAsk(hookInput)
+      const reviewerConfig = (yield* config.get()).permission_reviewer
       const started = yield* Clock.currentTimeMillis
       let result: Exclude<ReviewResult, "interrupted">
-      if (!prepared) {
-        result = "ask"
-        yield* audit({ info, review, result, latencyMs: 0, fallbackToHuman: true, reviewSettled: true })
-      } else {
-        const lease = yield* Effect.sync(() => {
-          if (current.reviews.size >= REVIEW_CAPACITY) return undefined
-          const run = prepared()
-          const item: ReviewLease = { result: run.result, settlement: run.settled, settled: false }
-          current.reviews.add(item)
-          void item.settlement.then(
-            () => {
-              item.settled = true
-              current.reviews.delete(item)
-            },
-            () => {
-              item.settled = true
-              current.reviews.delete(item)
-            },
-          )
-          return item
-        })
+      const reserve = () => {
+        if (current.reviews.size >= REVIEW_CAPACITY) return
+        const lease: ReviewLease = { settled: false, completed: false }
+        current.reviews.add(lease)
+        return lease
+      }
+      const finish = (lease: ReviewLease) => {
+        lease.completed = true
+        if (lease.settled) current.reviews.delete(lease)
+      }
+      const settle = (lease: ReviewLease) => {
+        lease.settled = true
+        if (lease.completed) current.reviews.delete(lease)
+      }
 
-        if (!lease) {
-          result = "capacity"
-          yield* audit({ info, review, result, latencyMs: 0, fallbackToHuman: true, reviewSettled: true })
-        } else {
-          const completed = yield* Effect.promise(() => lease.result).pipe(
-            Effect.timeoutOrElse({ duration: REVIEW_TIMEOUT, orElse: () => Effect.succeed("timeout" as const) }),
+      const pluginLease = prepared ? reserve() : undefined
+      const pluginRun = pluginLease ? prepared?.() : undefined
+      if (pluginLease && pluginRun) {
+        void pluginRun.settled.then(
+          () => settle(pluginLease),
+          () => settle(pluginLease),
+        )
+      }
+      const pluginWait = pluginRun
+        ? Effect.promise(() => pluginRun.result).pipe(
             Effect.catchCause((cause) => {
               if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
               return Effect.succeed("error" as const)
             }),
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                const latencyMs = (yield* Clock.currentTimeMillis) - started
+            Effect.timeoutOrElse({
+              duration: REVIEW_TIMEOUT,
+              orElse: () => Effect.succeed("timeout" as const),
+            }),
+            Effect.ensuring(Effect.sync(() => finish(pluginLease!))),
+          )
+        : Effect.succeed(prepared ? ("capacity" as const) : undefined)
+
+      const prepareReviewer = Effect.uninterruptible(
+        reviewer
+          .prepare({
+            config: reviewerConfig!,
+            permission: info.permission,
+            origin: review.origin,
+            arguments: source?.arguments,
+          })
+          .pipe(
+            Effect.tap((run) => {
+              if (!run.admitted) return Effect.void
+              const active: ActiveReviewerRun = { run }
+              current.reviewerRuns.add(active)
+              return run.settled.pipe(
+                Effect.flatMap(() =>
+                  current.disposed
+                    ? Effect.void
+                    : Effect.logInfo("permission review settled", {
+                        requestID: info.id,
+                        reviewID: review.reviewID,
+                        source: "builtin",
+                        reviewSettled: true,
+                      }),
+                ),
+                Effect.ensuring(Effect.sync(() => current.reviewerRuns.delete(active))),
+                Effect.forkIn(current.scope),
+                Effect.asVoid,
+              )
+            }),
+          ),
+      )
+      const waitReviewer = prepareReviewer.pipe(
+        Effect.flatMap((run) =>
+          run.result.pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+              return Effect.succeed({ failure: "provider" as const })
+            }),
+            Effect.map((reviewResult) => ({ run, reviewResult })),
+          ),
+        ),
+      )
+
+      if (reviewerConfig?.mode === "audit-only") {
+        const authoritative = yield* Deferred.make<void>()
+        yield* Deferred.await(authoritative).pipe(
+          Effect.andThen(waitReviewer),
+          Effect.flatMap(({ run, reviewResult }) =>
+            Effect.gen(function* () {
+              if (current.disposed) return
+              const latencyMs = (yield* Clock.currentTimeMillis) - started
+              yield* audit({
+                info,
+                review,
+                source: "builtin",
+                result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
+                latencyMs,
+                fallbackToHuman: false,
+                reviewSettled: run.isSettled(),
+              })
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            current.disposed
+              ? Effect.void
+              : Clock.currentTimeMillis.pipe(
+                  Effect.flatMap((now) =>
+                    audit({
+                      info,
+                      review,
+                      source: "builtin",
+                      result: Cause.hasInterrupts(cause) ? "interrupted" : "provider",
+                      latencyMs: now - started,
+                      fallbackToHuman: false,
+                      reviewSettled: false,
+                    }),
+                  ),
+                ),
+          ),
+          Effect.forkIn(current.scope),
+        )
+
+        const pluginResult = yield* pluginWait.pipe(
+          Effect.onInterrupt(() =>
+            prepared
+              ? Clock.currentTimeMillis.pipe(
+                  Effect.flatMap((now) =>
+                    audit({
+                      info,
+                      review,
+                      source: "plugin",
+                      result: "interrupted",
+                      latencyMs: now - started,
+                      fallbackToHuman: false,
+                      reviewSettled: pluginLease?.settled ?? true,
+                    }),
+                  ),
+                )
+              : Effect.void,
+          ),
+        )
+        // The detached built-in work cannot start until the authoritative disposition is known.
+        yield* Deferred.succeed(authoritative, undefined)
+        const latencyMs = (yield* Clock.currentTimeMillis) - started
+        if (pluginResult === "error") {
+          yield* Effect.logError("permission ask plugin failed or returned invalid status", {
+            requestID: info.id,
+            reviewID: review.reviewID,
+          })
+        }
+        yield* audit({
+          info,
+          review,
+          source: "plugin",
+          result: pluginResult ?? "ask",
+          latencyMs,
+          fallbackToHuman:
+            pluginResult === undefined ||
+            pluginResult === "ask" ||
+            pluginResult === "timeout" ||
+            pluginResult === "error" ||
+            pluginResult === "capacity",
+          reviewSettled: pluginLease?.settled ?? true,
+        })
+        result = pluginResult ?? "ask"
+      } else {
+        const reviewerWait: Effect.Effect<{ run: PermissionReviewer.Run; reviewResult: BuiltinResult } | undefined> =
+          reviewerConfig ? waitReviewer : Effect.succeed(undefined)
+        const completed = yield* Effect.all([pluginWait, reviewerWait] as const, { concurrency: "unbounded" }).pipe(
+          Effect.onInterrupt(() =>
+            Effect.gen(function* () {
+              const latencyMs = (yield* Clock.currentTimeMillis) - started
+              if (prepared) {
                 yield* audit({
                   info,
                   review,
+                  source: "plugin",
                   result: "interrupted",
                   latencyMs,
                   fallbackToHuman: false,
-                  reviewSettled: lease.settled,
+                  reviewSettled: pluginLease?.settled ?? true,
                 })
-              }),
-            ),
-          )
-          result = completed
-          const latencyMs = (yield* Clock.currentTimeMillis) - started
-          if (result === "error") {
-            yield* Effect.logError("permission ask plugin failed or returned invalid status", {
-              requestID: info.id,
-              reviewID: review.reviewID,
-            })
-          }
+              }
+            }),
+          ),
+        )
+        const [pluginResult, builtin] = completed
+        const builtinResult = builtin?.reviewResult
+        const latencyMs = (yield* Clock.currentTimeMillis) - started
+        if (pluginResult === "error") {
+          yield* Effect.logError("permission ask plugin failed or returned invalid status", {
+            requestID: info.id,
+            reviewID: review.reviewID,
+          })
+        }
+        if (pluginResult) {
           yield* audit({
             info,
             review,
-            result,
+            source: "plugin",
+            result: pluginResult,
             latencyMs,
-            fallbackToHuman: result === "ask" || result === "timeout" || result === "error",
-            reviewSettled: lease.settled,
+            fallbackToHuman: pluginResult !== "allow" && pluginResult !== "deny",
+            reviewSettled: pluginLease?.settled ?? true,
           })
         }
+        if (builtinResult) {
+          yield* audit({
+            info,
+            review,
+            source: "builtin",
+            result: "decision" in builtinResult ? builtinResult.decision : builtinResult.failure,
+            latencyMs,
+            fallbackToHuman: !("decision" in builtinResult) || builtinResult.decision === "ask",
+            reviewSettled: builtin?.run.isSettled() ?? true,
+          })
+        }
+
+        const enforcing = [
+          ...(pluginResult ? [pluginResult] : []),
+          ...(builtinResult ? ["decision" in builtinResult ? builtinResult.decision : "ask"] : []),
+        ]
+        if (enforcing.includes("deny")) result = "deny"
+        else if (enforcing.length > 0 && enforcing.every((item) => item === "allow")) result = "allow"
+        else result = "ask"
       }
 
       if (result === "allow") return
@@ -288,7 +478,7 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", {
         id,
         permission: info.permission,
-        patterns: info.patterns.map(safeReviewString),
+        patternCount: info.patterns.length,
       })
       return yield* Effect.acquireUseRelease(
         Effect.sync(() => pending.set(id, { info, deferred })),
@@ -407,7 +597,7 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, Plugin.node, Session.node],
+  deps: [EventV2Bridge.node, Plugin.node, Session.node, Config.node, PermissionReviewer.node],
 })
 
 export * as Permission from "."
