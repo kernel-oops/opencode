@@ -21,14 +21,25 @@ let resolved = ProviderTest.model({
 let language = new MockLanguageModelV3()
 let languageCalls = 0
 let modelResolution: Promise<typeof resolved> | undefined
+let failModelLookup = false
+let requireRuntimeMarker = false
 let failAuth = false
 const modelRequests: Array<readonly [string, string]> = []
+const RuntimeMarker = Context.Reference<string>("@test/PermissionReviewerRuntimeMarker", {
+  defaultValue: () => "missing",
+})
 
 const provider = ProviderTest.fake({
   model: resolved,
   getModel: (providerID, modelID) => {
     modelRequests.push([providerID, modelID])
-    return modelResolution ? Effect.promise(() => modelResolution!) : Effect.succeed(resolved)
+    if (failModelLookup) return Effect.die(new Error("raw model lookup failure secret"))
+    return Effect.gen(function* () {
+      if (requireRuntimeMarker && (yield* RuntimeMarker) !== "present") {
+        return yield* Effect.die(new Error("instance FiberRef context was lost"))
+      }
+      return modelResolution ? yield* Effect.promise(() => modelResolution!) : resolved
+    })
   },
   getLanguage: () => {
     languageCalls++
@@ -85,6 +96,8 @@ function reset(text = '{"decision":"allow"}') {
   })
   languageCalls = 0
   modelResolution = undefined
+  failModelLookup = false
+  requireRuntimeMarker = false
   failAuth = false
   modelRequests.length = 0
 }
@@ -231,8 +244,33 @@ it.effect("rejects aliases that do not resolve to the exact Luna model", () =>
     const reviewer = yield* PermissionReviewer.Service
     expect(
       yield* reviewer.review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } }),
-    ).toEqual({ failure: "model" })
+    ).toEqual({ failure: "model_identity" })
     expect(languageCalls).toBe(0)
+  }),
+)
+
+it.effect("reports model lookup failures without exposing provider details", () =>
+  Effect.gen(function* () {
+    reset()
+    failModelLookup = true
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } }),
+    ).toEqual({ failure: "model_lookup" })
+    expect(languageCalls).toBe(0)
+  }),
+)
+
+it.effect("preserves instance references in supervised reviewer work", () =>
+  Effect.gen(function* () {
+    reset()
+    requireRuntimeMarker = true
+    const reviewer = yield* PermissionReviewer.Service
+    const result = yield* reviewer
+      .review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } })
+      .pipe(Effect.provideService(RuntimeMarker, "present"))
+    expect(result).toEqual({ decision: "ask" })
+    expect(languageCalls).toBe(1)
   }),
 )
 
