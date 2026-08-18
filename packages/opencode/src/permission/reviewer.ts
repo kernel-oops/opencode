@@ -2,7 +2,7 @@ import { ConfigPermissionReviewerV1 } from "@opencode-ai/core/v1/config/permissi
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Auth } from "@/auth"
 import { Provider } from "@/provider/provider"
-import { Cause, Context, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { type ModelMessage, Output, streamText } from "ai"
 import { serialiseReviewInput } from "./reviewer-input"
 
@@ -20,7 +20,9 @@ const DecisionSchema = Schema.Struct({
 
 export type Decision = Schema.Schema.Type<typeof DecisionSchema>["decision"]
 export type Failure =
-  | "model"
+  | "model_config"
+  | "model_lookup"
+  | "model_identity"
   | "auth"
   | "provider"
   | "serialization"
@@ -121,12 +123,12 @@ export const layer = Layer.effect(
       owned.add(operation)
       const execute: Effect.Effect<Result> = Effect.gen(function* () {
         const parsed = Provider.parseModel(input.config.model)
-        if (!parsed.providerID || !parsed.modelID) return { failure: "model" as const }
+        if (!parsed.providerID || !parsed.modelID) return { failure: "model_config" as const }
         const modelResult = yield* provider.getModel(parsed.providerID, parsed.modelID).pipe(Effect.exit)
-        const model = yield* interruptOr(modelResult, "model")
+        const model = yield* interruptOr(modelResult, "model_lookup")
         if ("failure" in model) return model
         if (controller.signal.aborted) return { failure: "timeout" as const }
-        if (model.api.id !== REVIEW_MODEL_ID) return { failure: "model" as const }
+        if (model.api.id !== REVIEW_MODEL_ID) return { failure: "model_identity" as const }
 
         const languageResult = yield* provider.getLanguage(model).pipe(Effect.exit)
         const language = yield* interruptOr(languageResult, "provider")
@@ -209,22 +211,21 @@ export const layer = Layer.effect(
         }).pipe(Effect.catch(() => Effect.succeed({ failure: "provider" as const })))
       })
 
-      // Do not interrupt this wrapping Effect. Its Promise is the native-settlement witness;
-      // cancellation is requested separately through the controller.
-      const actual = Effect.runPromiseExit(execute)
-      void actual.then(
-        () => {
-          operation.settled = true
-          operations.delete(operation)
-          owned.delete(operation)
-        },
-        () => {
-          operation.settled = true
-          operations.delete(operation)
-          owned.delete(operation)
-        },
+      // A daemon fibre inherits the caller's instance references but is not interrupted
+      // when an individual permission waiter goes away. Its completion remains the
+      // actual-settlement witness for capacity accounting; cancellation is requested
+      // separately through the provider's AbortSignal.
+      const fibre = yield* execute.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            operation.settled = true
+            operations.delete(operation)
+            owned.delete(operation)
+          }),
+        ),
+        Effect.forkDetach({ startImmediately: true }),
       )
-      const joined = Effect.promise(() => actual).pipe(
+      const joined = Fiber.await(fibre).pipe(
         Effect.flatMap((exit) => (Exit.isSuccess(exit) ? Effect.succeed(exit.value) : Effect.failCause(exit.cause))),
       )
 
@@ -239,7 +240,7 @@ export const layer = Layer.effect(
       return {
         admitted: true,
         result,
-        settled: Effect.promise(() => actual).pipe(Effect.asVoid),
+        settled: Fiber.await(fibre).pipe(Effect.asVoid),
         abort: () => controller.abort(),
         isSettled: () => operation.settled,
       }
