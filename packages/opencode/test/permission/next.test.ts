@@ -3,7 +3,7 @@ import { test, expect } from "bun:test"
 import os from "os"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import * as TestConsole from "effect/testing/TestConsole"
 import * as TestClock from "effect/testing/TestClock"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
@@ -19,23 +19,43 @@ import { InstanceStore } from "../../src/project/instance-store"
 import { TestInstance, tmpdirScoped, withTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { AccountTest } from "../fake/account"
-import { AuthTest } from "../fake/auth"
 import { NpmTest } from "../fake/npm"
 import { MessageID, SessionID } from "../../src/session/schema"
 import { Session } from "../../src/session/session"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { safeReviewValue } from "../../src/permission/review"
+import { Provider } from "../../src/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { MockLanguageModelV3 } from "ai/test"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { simulateReadableStream } from "ai"
+
+const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
+const reviewerModel = ProviderTest.model({
+  id: reviewerAlias,
+  api: { id: "gpt-5.6-luna", url: "https://example.com", npm: "@ai-sdk/openai" },
+})
+let reviewerLanguage = new MockLanguageModelV3()
+const reviewerProvider = ProviderTest.fake({
+  model: reviewerModel,
+  getLanguage: () => Effect.succeed(reviewerLanguage),
+})
+const reviewerAuth = Layer.mock(Auth.Service)({
+  all: () => Effect.succeed({}),
+  get: () => Effect.succeed({ type: "oauth", refresh: "test", access: "test", expires: Date.now() + 60_000 }),
+})
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
   [
     [InstanceStore.bootstrapNode, noopBootstrap],
-    [Auth.node, AuthTest.empty],
+    [Auth.node, reviewerAuth],
     [Account.node, AccountTest.empty],
     [Npm.node, NpmTest.noop],
     [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true })],
+    [Provider.node, reviewerProvider.layer],
   ],
 )
 const it = testEffect(env)
@@ -96,6 +116,66 @@ const list = () =>
 
 const permissionHook = (body: string) =>
   ["export default async () => ({", '  "permission.ask": async (input, output) => {', body, "  },", "})", ""].join("\n")
+
+const reviewerUsage = {
+  inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+  outputTokens: { total: 5, text: 5, reasoning: undefined },
+}
+
+const reviewerOutput = (decision: "allow" | "ask" | "deny") => ({
+  stream: simulateReadableStream({
+    chunks: [
+      { type: "text-start" as const, id: "review" },
+      { type: "text-delta" as const, id: "review", delta: JSON.stringify({ decision }) },
+      { type: "text-end" as const, id: "review" },
+      { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage: reviewerUsage },
+    ],
+  }),
+})
+
+const reviewerAsk = (input: Parameters<Permission.Interface["ask"]>[0]) =>
+  ask({
+    ...input,
+    review: input.review ?? { origin: "tool", arguments: { command: "git status" } },
+  })
+
+const withBlockedBuiltinLogger = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.provide(
+      Logger.layer([
+        Logger.make((options) => {
+          if (JSON.stringify(options.message).includes('"source":"builtin"')) return new Promise(() => {})
+        }),
+      ]),
+    ),
+  )
+
+const withReviewer = (mode: "audit-only" | "enforce") => ({
+  git: true,
+  config: { permission_reviewer: { mode, model: `openai/${reviewerAlias}` } },
+})
+
+const withReviewerAndPlugins = (mode: "audit-only" | "enforce", ...sources: string[]) => ({
+  git: true,
+  init: (directory: string) =>
+    Effect.promise(async () => {
+      const plugins = await Promise.all(
+        sources.map(async (source, index) => {
+          const file = path.join(directory, `plugin-${index}.ts`)
+          await Bun.write(file, source)
+          return pathToFileURL(file).href
+        }),
+      )
+      await Bun.write(
+        path.join(directory, "opencode.json"),
+        JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+          plugin: plugins,
+          permission_reviewer: { mode, model: `openai/${reviewerAlias}` },
+        }),
+      )
+    }),
+})
 
 const withPlugins = (...sources: string[]) => ({
   git: true,
@@ -2334,4 +2414,619 @@ it.instance(
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
     }),
   { git: true },
+)
+
+it.instance(
+  "reviewer - audit-only records Luna but preserves plugin allow",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_plugin"),
+        permission: "bash",
+        patterns: ["dangerous-command"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect(yield* list()).toHaveLength(0)
+      while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin"')) {
+        yield* Effect.promise(() => Bun.sleep(1))
+      }
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"source":"builtin"')
+      expect(logs).toContain('"result":"deny"')
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - audit-only cannot allow without a plugin",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_only"),
+        permission: "bash",
+        patterns: ["needs-human"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("audit-only"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - audit-only Luna saturation does not delay plugin allow",
+  () =>
+    Effect.gen(function* () {
+      const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+      })
+
+      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        yield* reviewerAsk({
+          sessionID: SessionID.make(`session_audit_capacity_${index}`),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        while (resolvers.length <= index) yield* Effect.promise(() => Bun.sleep(1))
+      }
+
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_capacity_overflow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+      while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin","result":"capacity"')) {
+        yield* Effect.promise(() => Bun.sleep(1))
+      }
+
+      for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.effect("reviewer - audit-only Luna timeout does not delay plugin deny", () =>
+  Effect.gen(function* () {
+    let resolve!: (value: ReturnType<typeof reviewerOutput>) => void
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: () => new Promise((done) => (resolve = done)),
+    })
+
+    const error = yield* fail(
+      reviewerAsk({
+        sessionID: SessionID.make("session_audit_timeout_deny"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }),
+    )
+    expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin","result":"timeout"')) {
+      yield* Effect.yieldNow
+    }
+    expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"reviewSettled":false')
+    resolve(reviewerOutput("allow"))
+    while (!(yield* TestConsole.logLines).some((line) => JSON.stringify(line).includes("permission review settled")))
+      yield* Effect.yieldNow
+  }).pipe(
+    withTmpdirInstance<never, never>(
+      withReviewerAndPlugins("audit-only", permissionHook('    output.status = "deny"')),
+    ),
+  ),
+)
+
+it.instance(
+  "reviewer - instance reload aborts native work and suppresses post-disposal audits",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const store = yield* InstanceStore.Service
+      let signal: AbortSignal | undefined
+      let resolve!: (value: ReturnType<typeof reviewerOutput>) => void
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: (call) => {
+          signal = call.abortSignal
+          return new Promise((done) => (resolve = done))
+        },
+      })
+
+      yield* reviewerAsk({
+        id: PermissionV1.ID.make("per_reviewer_reload"),
+        sessionID: SessionID.make("session_reviewer_reload"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      while (!signal) yield* Effect.yieldNow
+
+      yield* store.reload({ directory: test.directory })
+      expect(signal.aborted).toBe(true)
+      const before = JSON.stringify(yield* TestConsole.logLines)
+      expect(before).not.toContain('"reviewID":"per_reviewer_reload","source":"builtin"')
+
+      resolve(reviewerOutput("deny"))
+      for (let index = 0; index < 10; index++) yield* Effect.yieldNow
+      const after = JSON.stringify(yield* TestConsole.logLines)
+      expect(after).not.toContain('"reviewID":"per_reviewer_reload","source":"builtin"')
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay plugin allow",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+        yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_allow"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        expect(yield* list()).toHaveLength(0)
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay plugin deny",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+        const error = yield* fail(
+          reviewerAsk({
+            sessionID: SessionID.make("session_blocked_logger_deny"),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          }),
+        )
+        expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "deny"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay saturation or plugin allow",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+        })
+        for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+          yield* reviewerAsk({
+            sessionID: SessionID.make(`session_blocked_logger_capacity_${index}`),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          })
+          while (resolvers.length <= index) yield* Effect.yieldNow
+        }
+        yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_capacity_overflow"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+        for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay no-plugin human ask",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+        const fiber = yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_ask"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        yield* Fiber.await(fiber)
+      }),
+    ),
+  withReviewer("audit-only"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce degrades Luna allow to a human ask",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_allow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce applies deny-wins aggregation",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+      const err = yield* fail(
+        reviewerAsk({
+          sessionID: SessionID.make("session_enforce_deny"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+    }),
+  withReviewerAndPlugins("enforce", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.effect("reviewer - enforce preserves Luna deny when the plugin times out", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const marker = path.join(test.directory, "plugin-timeout-started")
+    reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+    const fiber = yield* reviewerAsk({
+      sessionID: SessionID.make("session_enforce_plugin_timeout"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+
+    while (!(yield* Effect.promise(() => Bun.file(marker).exists()))) yield* Effect.yieldNow
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+    while (!(yield* TestConsole.logLines).some((line) => JSON.stringify(line).includes("permission review settled"))) {
+      yield* Effect.promise(() => Bun.sleep(1))
+    }
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.DeniedError)
+  }).pipe(
+    withTmpdirInstance<never, never>(
+      withReviewerAndPlugins(
+        "enforce",
+        permissionHook(
+          '    await Bun.write(new URL("plugin-timeout-started", import.meta.url), "started")\n    return new Promise(() => {})',
+        ),
+      ),
+    ),
+  ),
+)
+
+it.effect("reviewer - enforce preserves plugin deny when Luna times out", () =>
+  Effect.gen(function* () {
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: (call) =>
+        new Promise<never>((_, reject) =>
+          call.abortSignal?.addEventListener("abort", () => reject(new Error("aborted"))),
+        ),
+    })
+    const fiber = yield* reviewerAsk({
+      sessionID: SessionID.make("session_enforce_luna_timeout"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.DeniedError)
+  }).pipe(
+    withTmpdirInstance<never, never>(withReviewerAndPlugins("enforce", permissionHook('    output.status = "deny"'))),
+  ),
+)
+
+it.instance(
+  "reviewer - enforce requires every configured source to allow",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_plugin_ask"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewerAndPlugins("enforce", permissionHook('    output.status = "ask"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce falls back to human ask on any ask or provider failure",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider-secret-body")
+        },
+      })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_failure"),
+        permission: "bash",
+        patterns: ["raw-pattern-secret"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", arguments: { command: "raw-command-secret" } },
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).not.toContain("provider-secret-body")
+      expect(logs).not.toContain("raw-pattern-secret")
+      expect(logs).not.toContain("raw-command-secret")
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce sends unclassifiable arguments to a human without calling Luna",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_unclassifiable"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", arguments: { command: "git status", unknown: "secret" } },
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - starts plugin and Luna concurrently",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          await Bun.write(path.join(test.directory, "model-started"), "started")
+          while (!(await Bun.file(path.join(test.directory, "plugin-started")).exists())) await Bun.sleep(1)
+          return reviewerOutput("allow")
+        },
+      })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_concurrent_sources"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      while (!(yield* Effect.promise(() => Bun.file(path.join(test.directory, "model-started")).exists()))) {
+        yield* Effect.yieldNow
+      }
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewerAndPlugins(
+    "enforce",
+    permissionHook(
+      '    await Bun.write(new URL("plugin-started", import.meta.url), "started")\n    while (!(await Bun.file(new URL("model-started", import.meta.url)).exists())) await Bun.sleep(1)\n    output.status = "allow"',
+    ),
+  ),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforces the four-request built-in review capacity",
+  () =>
+    Effect.gen(function* () {
+      const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+      })
+      const fibers = []
+      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        fibers.push(
+          yield* reviewerAsk({
+            sessionID: SessionID.make(`session_capacity_${index}`),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          }).pipe(Effect.forkScoped),
+        )
+      }
+      while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+
+      const overflow = yield* reviewerAsk({
+        id: PermissionV1.ID.make("per_builtin_capacity"),
+        sessionID: SessionID.make("session_capacity_overflow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect((yield* waitForPending(1))[0]?.id).toBe(PermissionV1.ID.make("per_builtin_capacity"))
+
+      for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+      expect(yield* waitForPending(Permission.REVIEW_CAPACITY + 1)).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+      yield* rejectAll()
+      for (const fiber of fibers) yield* Fiber.await(fiber)
+      yield* Fiber.await(overflow)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.effect("reviewer - retains built-in capacity until timed-out generation actually settles", () =>
+  Effect.gen(function* () {
+    const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+    })
+    const fibers = []
+    for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      fibers.push(
+        yield* reviewerAsk({
+          sessionID: SessionID.make(`session_settlement_${index}`),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped),
+      )
+    }
+    while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* waitForPending(Permission.REVIEW_CAPACITY)).toHaveLength(Permission.REVIEW_CAPACITY)
+    const overflow = yield* reviewerAsk({
+      sessionID: SessionID.make("session_settlement_overflow"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 1) yield* Effect.yieldNow
+    expect(yield* list()).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+    expect(reviewerLanguage.doStreamCalls).toHaveLength(Permission.REVIEW_CAPACITY)
+
+    for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+    while (
+      (yield* TestConsole.logLines).filter((line) => JSON.stringify(line).includes("permission review settled"))
+        .length < 4
+    ) {
+      yield* Effect.yieldNow
+    }
+    const afterSettlement = yield* reviewerAsk({
+      sessionID: SessionID.make("session_after_settlement"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+    while (resolvers.length === Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    resolvers.at(-1)!(reviewerOutput("allow"))
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 2) yield* Effect.yieldNow
+
+    yield* rejectAll()
+    for (const fiber of fibers) yield* Fiber.await(fiber)
+    yield* Fiber.await(overflow)
+    yield* Fiber.await(afterSettlement)
+  }).pipe(withTmpdirInstance<never, never>(withReviewer("enforce"))),
+)
+
+it.instance(
+  "reviewer - static allow and deny bypass Luna structurally",
+  () =>
+    Effect.gen(function* () {
+      let calls = 0
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          calls++
+          return reviewerOutput("deny")
+        },
+      })
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_static_allow"),
+        permission: "bash",
+        patterns: ["allowed"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "allow" }],
+      })
+      const denied = yield* fail(
+        reviewerAsk({
+          sessionID: SessionID.make("session_static_deny"),
+          permission: "bash",
+          patterns: ["denied"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "deny" }],
+        }),
+      )
+      expect(denied).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(calls).toBe(0)
+    }),
+  withReviewer("enforce"),
+  15_000,
 )
