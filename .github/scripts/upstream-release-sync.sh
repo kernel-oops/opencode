@@ -26,23 +26,30 @@ readonly PATCH_BRANCHES=(
   "fix/directory-sse-replacement"
   "fix/permission-ask-hook"
   "permission-review-foundation"
+  "permission-model-reviewer"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
   "cd8d39747332305cee8f24437a24252ca6b63fec"
   "2d809744f702b22e522bded27be89f159bb6a007"
   "d5a64752b2cb925ad648334cd6fe7a7db05c644e"
+  "62c7c05b62aef0b4ea2688114e8d2a348d5d1c12"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
   "ae77d8aa248de63bfe63205f9a6472813ff5d9f4"
   "dd25dface43a03915fe49e706bcb4d0771d399e9"
   "eba08dbfe9997d0aed92260c924dfe99edd0eb7a"
+  "73491a9cbbb9ba54a7b88b95f905efe76e14db4b"
 )
 readonly REVIEWED_TESTS=(
+  "packages/core/test/config/config.test.ts"
   "packages/core/test/pty/activity.test.ts"
   "packages/opencode/test/effect/runtime-flags.test.ts"
+  "packages/opencode/test/config/config.test.ts"
   "packages/opencode/test/permission/next.test.ts"
+  "packages/opencode/test/permission/reviewer-input.test.ts"
+  "packages/opencode/test/permission/reviewer.test.ts"
   "packages/opencode/test/plugin/trigger.test.ts"
   "packages/opencode/test/project/instance.test.ts"
   "packages/opencode/test/server/httpapi-event.test.ts"
