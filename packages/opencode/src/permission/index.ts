@@ -16,6 +16,7 @@ import {
 } from "@opencode-ai/plugin"
 import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
+import { InstanceRef } from "@/effect/instance-ref"
 
 export const Event = PermissionV1.Event
 
@@ -172,6 +173,7 @@ const layer = Layer.effect(
     })
 
     const ask: Interface["ask"] = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+      const instance = yield* InstanceState.context
       const current = yield* InstanceState.get(state)
       const { approved, pending } = current
       const { ruleset, review: source, ...request } = input
@@ -310,7 +312,7 @@ const layer = Layer.effect(
               )
             }),
           ),
-      )
+      ).pipe(Effect.provideService(InstanceRef, instance))
       const waitReviewer = prepareReviewer.pipe(
         Effect.flatMap((run) =>
           run.result.pipe(
