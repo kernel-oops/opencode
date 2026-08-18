@@ -27,6 +27,7 @@ readonly PATCH_BRANCHES=(
   "fix/permission-ask-hook"
   "permission-review-foundation"
   "permission-model-reviewer"
+  "reviewer-context-fix"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -34,6 +35,7 @@ readonly PATCH_IDS=(
   "2d809744f702b22e522bded27be89f159bb6a007"
   "d5a64752b2cb925ad648334cd6fe7a7db05c644e"
   "62c7c05b62aef0b4ea2688114e8d2a348d5d1c12"
+  "b3238c230f1aa12173a58af1c1b90e81ed8eb3c5"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -41,6 +43,7 @@ readonly PATCH_TIPS=(
   "dd25dface43a03915fe49e706bcb4d0771d399e9"
   "eba08dbfe9997d0aed92260c924dfe99edd0eb7a"
   "73491a9cbbb9ba54a7b88b95f905efe76e14db4b"
+  "48b090a66190d25a3eccdbd65d86060507d960a6"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
