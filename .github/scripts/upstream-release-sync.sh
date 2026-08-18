@@ -25,27 +25,32 @@ readonly PATCH_BRANCHES=(
   "feat/instance-idle-eviction"
   "fix/directory-sse-replacement"
   "fix/permission-ask-hook"
+  "permission-review-foundation"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
   "cd8d39747332305cee8f24437a24252ca6b63fec"
   "2d809744f702b22e522bded27be89f159bb6a007"
+  "d5a64752b2cb925ad648334cd6fe7a7db05c644e"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
   "ae77d8aa248de63bfe63205f9a6472813ff5d9f4"
   "dd25dface43a03915fe49e706bcb4d0771d399e9"
+  "eba08dbfe9997d0aed92260c924dfe99edd0eb7a"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/pty/activity.test.ts"
   "packages/opencode/test/effect/runtime-flags.test.ts"
   "packages/opencode/test/permission/next.test.ts"
+  "packages/opencode/test/plugin/trigger.test.ts"
   "packages/opencode/test/project/instance.test.ts"
   "packages/opencode/test/server/httpapi-event.test.ts"
   "packages/opencode/test/server/httpapi-instance-context.test.ts"
   "packages/opencode/test/server/instance-eviction.test.ts"
   "packages/opencode/test/server/project-init-git.test.ts"
   "packages/opencode/test/session/prompt.test.ts"
+  "packages/opencode/test/tool/registry.test.ts"
 )
 
 summary() {
@@ -339,7 +344,7 @@ validate_metadata() {
       (.candidate_sha | test("^[0-9a-f]{40}$")) and (.candidate_tree | test("^[0-9a-f]{40}$")) and
       (.head_sha | test("^[0-9a-f]{40}$")) and (.head_tree | test("^[0-9a-f]{40}$")) and
       (.bundle_sha256 | test("^[0-9a-f]{64}$")) and .candidate_tree == .head_tree and
-      (.patches | type) == "array" and (.patches | length) == 3 and
+      (.patches | type) == "array" and (.patches | length) == ($branches | length) and
       all(.patches[]; (keys | sort) == (["branch", "disposition", "expected_patch_id", "tip_sha"] | sort)) and
       [.patches[].branch] == $branches and [.patches[].expected_patch_id] == $patch_ids and
       [.patches[].tip_sha] == $patch_tips and
