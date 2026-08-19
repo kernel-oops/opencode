@@ -61,6 +61,78 @@ test("shell classification scans the dangerous suffix instead of truncating it",
   expect(result.value.operation.commandCount).toBe("many")
 })
 
+test("shell classification handles quoted delimiters and ordinary control flow", () => {
+  const pipeline = data("bash", {
+    command:
+      "find /home/opencode/.local/share/planefolio -maxdepth 5 \\( -type f -o -type d \\) -printf '%y %p\\n' 2>/dev/null | grep -E '(deploy|journal|intent|lock|pending)' | sort",
+    workdir: "/mnt/crypt/home/syncthing/Development/planefolio",
+  })
+  expect(pipeline.value.operation).toMatchObject({
+    kind: "shell",
+    commands: ["find", "grep", "sort"],
+    commandCount: 3,
+  })
+
+  const loop = data("bash", {
+    command:
+      'for p in /tmp/one /tmp/two; do if [ -e "$p" ]; then stat -c \'PRESENT %n\' "$p"; else printf \'ABSENT %s\\n\' "$p"; fi; done',
+    workdir: "/tmp",
+  })
+  expect(loop.value.operation).toMatchObject({
+    kind: "shell",
+    commands: ["[", "printf", "stat"],
+    commandCount: "many",
+  })
+  expect(loop.value.operation.traits).toEqual(
+    expect.arrayContaining(["absolute-path", "control-flow", "interpolation"]),
+  )
+})
+
+test("complex shell execution is represented conservatively", () => {
+  for (const command of [
+    'case x in x) "rm" -rf relative-target;; esac',
+    "env custom-secret-runner positional-secret",
+    '"env" custom-secret-runner positional-secret',
+    "/usr/bin/env custom-secret-runner positional-secret",
+    "xargs custom-secret-runner",
+    '"xargs" custom-secret-runner',
+    "/usr/bin/xargs custom-secret-runner",
+    "sudo env custom-secret-runner positional-secret",
+    "sudo /usr/bin/xargs custom-secret-runner",
+    'echo "$(custom-one; custom-two; custom-three)"',
+    "cat <(custom-secret-runner positional-secret)",
+  ]) {
+    const result = data("bash", { command })
+    expect(result.raw).not.toContain("custom-secret-runner")
+    expect(result.raw).not.toContain("positional-secret")
+    expect(result.raw).not.toContain("custom-one")
+    expect(result.value.operation.traits).toContain("unknown-command")
+  }
+
+  const case_ = data("bash", { command: 'case x in x) "rm" -rf relative-target;; esac' })
+  expect(case_.value.operation).toMatchObject({ commandCount: "many" })
+  expect(case_.value.operation.traits).toEqual(
+    expect.arrayContaining(["control-flow", "destructive", "unknown-command"]),
+  )
+
+  const nested = data("bash", { command: 'echo "$(custom-one; custom-two; custom-three)"' })
+  expect(nested.value.operation).toMatchObject({ commandCount: "many", commands: ["echo"] })
+  expect(nested.value.operation.traits).toEqual(
+    expect.arrayContaining(["dynamic-execution", "interpolation", "unknown-command"]),
+  )
+
+  const process = data("bash", { command: "cat <(custom-secret-runner positional-secret)" })
+  expect(process.value.operation).toMatchObject({ commandCount: "many", commands: ["cat"] })
+  expect(process.value.operation.traits).toEqual(
+    expect.arrayContaining(["dynamic-execution", "redirection", "unknown-command"]),
+  )
+})
+
+test("shell comments and ANSI-C strings do not confuse quote tracking", () => {
+  expect(data("bash", { command: 'printf ok # unmatched "' }).value.operation.commands).toEqual(["printf"])
+  expect(data("bash", { command: "printf $'can\\'t'" }).value.operation.commands).toEqual(["printf"])
+})
+
 test("path and URL facts are non-reversible but risk-preserving", () => {
   const path = "/home/alice/.ssh/id_ed25519"
   const read = data("read", { filePath: path, offset: 1, limit: 20 })
@@ -146,13 +218,10 @@ test("unknown, oversized, accessor, proxy, and cyclic argument shapes fail befor
       arguments: { command: "git status", unexpected: "secret" },
     }),
   ).toEqual({ failure: "input" })
-  expect(
-    serialiseReviewInput({
-      permission: "bash",
-      origin: "tool",
-      arguments: { command: "custom-secret-runner positional-secret" },
-    }),
-  ).toEqual({ failure: "input" })
+  const unknown = data("bash", { command: "custom-secret-runner positional-secret" })
+  expect(unknown.raw).not.toContain("custom-secret-runner")
+  expect(unknown.raw).not.toContain("positional-secret")
+  expect(unknown.value.operation).toMatchObject({ commands: [], traits: ["unknown-command"] })
   expect(
     serialiseReviewInput({
       permission: "bash",
