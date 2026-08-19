@@ -29,6 +29,7 @@ readonly PATCH_BRANCHES=(
   "permission-model-reviewer"
   "reviewer-context-fix"
   "reviewer-stream-fix"
+  "shell-classifier-fix"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -38,6 +39,7 @@ readonly PATCH_IDS=(
   "62c7c05b62aef0b4ea2688114e8d2a348d5d1c12"
   "b3238c230f1aa12173a58af1c1b90e81ed8eb3c5"
   "4b5e8f1cbbb0a9382f4153ce50df98567d55f82b"
+  "eaeee8050336276bddf64d8a98cd5b6def379a3c"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -47,6 +49,7 @@ readonly PATCH_TIPS=(
   "73491a9cbbb9ba54a7b88b95f905efe76e14db4b"
   "48b090a66190d25a3eccdbd65d86060507d960a6"
   "03f9f95247d8dc118114d5d039b98c3e8257a868"
+  "590ad2822dbd8a1eb517a2bbba9ea75ce48423de"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
