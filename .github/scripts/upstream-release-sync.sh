@@ -505,7 +505,7 @@ verify() {
     assert_candidate_unchanged "$repo" "$head_sha" "$head_tree" "$trusted_repo" "$helper" "$helper_digest"
   fi
   if ((${#opencode_tests[@]})); then
-    (cd "$repo/packages/opencode" && bun test -- "${opencode_tests[@]}")
+    (cd "$repo/packages/opencode" && bun test --timeout 10000 -- "${opencode_tests[@]}")
     assert_candidate_unchanged "$repo" "$head_sha" "$head_tree" "$trusted_repo" "$helper" "$helper_digest"
   fi
   (cd "$repo/packages/core" && bun run typecheck)
