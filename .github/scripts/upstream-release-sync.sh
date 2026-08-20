@@ -596,7 +596,7 @@ publish() {
   head_sha="$(metadata_value "$metadata" .head_sha)"
   head_tree="$(metadata_value "$metadata" .head_tree)"
   tag="$(metadata_value "$metadata" .upstream_tag)"
-  dry_run="$(metadata_value "$metadata" .dry_run)"
+  dry_run="$(metadata_value "$metadata" '.dry_run | tostring')"
   [[ "$dry_run" == "false" ]] || die "publisher refuses a dry-run artifact"
   [[ "$(git -C "$repo" rev-parse "${head_sha}^{tree}")" == "$head_tree" ]] || die "publisher tree check failed"
 
