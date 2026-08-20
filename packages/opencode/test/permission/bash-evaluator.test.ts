@@ -197,7 +197,7 @@ it.effect("invokes the exact argv with a minimal environment and canonical actio
     expect(yield* run.result).toEqual({ decision: "allow" })
     const observed = yield* Effect.promise(() => Bun.file(capture).json())
     expect(observed.args).toEqual(["--opencode", "--config", "/proc/self/fd/4", "--no-telemetry"])
-    expect(observed.input).toBe(JSON.stringify({ command: "git status", cwd: directory }))
+    expect(observed.input).toBe(JSON.stringify({ tool: "bash", command: "git status", cwd: directory }))
     expect(observed.cwd).toBe("/")
     expect(observed.env).toEqual({ HOME: "/nonexistent", LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" })
   }),
@@ -370,6 +370,7 @@ it.effect("strictly rejects malformed, duplicate, trailing, oversized, and noisy
       { raw: '{"decision":"allow","reason":"x"} trailing' },
       { raw: '{"decision":"approve","reason":"x"}' },
       { raw: '{"decision":"allow","reason":"x","extra":"x"}' },
+      { raw: '{"decision":"noop","error":"invalid OpenCode input"}' },
       { raw: "x".repeat(4 * 1024 + 1) },
       { decision: "allow", stderr: "secret diagnostic" },
     ]) {
