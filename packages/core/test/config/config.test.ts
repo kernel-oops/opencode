@@ -7,6 +7,7 @@ import { Config } from "@opencode-ai/core/config"
 import { ConfigProvider } from "@opencode-ai/core/config/provider"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { ConfigBashPermissionEvaluatorV1 } from "@opencode-ai/core/v1/config/bash-permission-evaluator"
 import { ConfigMigrateV1 } from "@opencode-ai/core/v1/config/migrate"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -50,6 +51,25 @@ const provider = {
   },
   models: {},
 }
+
+it.effect("bash evaluator JSON schema forbids additional properties", () =>
+  Effect.sync(() => {
+    const document = Schema.toJsonSchemaDocument(ConfigV1.Info)
+    const definition = document.definitions.BashPermissionEvaluatorConfig
+    ConfigBashPermissionEvaluatorV1.closeGeneratedSchema(definition)
+    const closed = definition as {
+      anyOf: ReadonlyArray<{
+        additionalProperties?: unknown
+        properties?: { expected?: { additionalProperties?: unknown } }
+      }>
+    }
+    expect(closed.anyOf).toHaveLength(3)
+    for (const branch of closed.anyOf) {
+      expect(branch.additionalProperties).toBe(false)
+      if (branch.properties?.expected) expect(branch.properties.expected.additionalProperties).toBe(false)
+    }
+  }),
+)
 
 describe("Config", () => {
   it.effect("returns the latest defined scalar from priority-ordered documents", () =>

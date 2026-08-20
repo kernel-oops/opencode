@@ -41,6 +41,7 @@ type ShellTestServices =
   | (typeof shellLayer extends Layer.Layer<infer ROut, infer _E, infer _RIn> ? ROut : never)
   | InstanceStore.Service
   | Scope.Scope
+type ToolAsk = Parameters<Tool.Context["ask"]>[0]
 
 const initShell = Effect.fn("ShellToolTest.init")(function* () {
   const info = yield* ShellTool
@@ -776,6 +777,12 @@ describe("tool.shell permissions", () => {
           const extDirReq = requests.find((r) => r.permission === "external_directory")
           expect(extDirReq).toBeDefined()
           expect(extDirReq!.patterns).toContain(glob(path.join(os.tmpdir(), "*")))
+          expect((extDirReq as ToolAsk).action).toMatchObject({
+            identity: "bash",
+            cwd: os.tmpdir(),
+            complete: true,
+            arguments: { command: "echo ok", workdir: os.tmpdir() },
+          })
         }),
       )
     }),

@@ -5,7 +5,7 @@ import path from "node:path"
 import { Effect, Exit, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { CrossSpawnSpawner, registerInheritedReadOnlyFds } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { testEffect } from "../lib/effect"
 
@@ -38,6 +38,21 @@ function alive(pid: number) {
   } catch {
     return false
   }
+}
+
+function parsePids(value: string) {
+  const parsed: unknown = JSON.parse(value)
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    !("parent" in parsed) ||
+    typeof parsed.parent !== "number" ||
+    !("child" in parsed) ||
+    typeof parsed.child !== "number"
+  ) {
+    throw new Error("invalid process capture")
+  }
+  return { parent: parsed.parent, child: parsed.child }
 }
 
 async function tmpdir() {
@@ -257,7 +272,7 @@ describe("cross-spawn spawner", () => {
       }),
     )
 
-    fx.effect(
+    fx.live(
       "forceKillAfter escalates for stubborn processes",
       Effect.gen(function* () {
         if (process.platform === "win32") return
@@ -274,6 +289,201 @@ describe("cross-spawn spawner", () => {
         expect(Date.now() - started).toBeLessThan(1_000)
         expect(Exit.isFailure(exit) ? true : exit.value !== ChildProcessSpawner.ExitCode(0)).toBe(true)
       }),
+      10_000,
+    )
+
+    fx.live(
+      "forceKillAfter kills descendants after the parent handles SIGTERM",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const capture = path.join(tmp.path, "pids.json")
+        const ready = path.join(tmp.path, "ready")
+        const term = path.join(tmp.path, "term")
+        const child = [
+          'const fs = require("node:fs")',
+          `process.on("SIGTERM", () => fs.writeFileSync(${JSON.stringify(term)}, "term"))`,
+          `fs.writeFileSync(${JSON.stringify(ready)}, "ready")`,
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const parent = [
+          'const { spawn } = require("node:child_process")',
+          'const fs = require("node:fs")',
+          `const child = spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" })`,
+          'process.on("SIGTERM", () => process.exit(0))',
+          `const ready = ${JSON.stringify(ready)}`,
+          `const capture = ${JSON.stringify(capture)}`,
+          "const wait = () => fs.existsSync(ready) ? fs.writeFileSync(capture, JSON.stringify({ parent: process.pid, child: child.pid })) : setTimeout(wait, 5)",
+          "wait()",
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const command = js(parent, { forceKillAfter: 100 })
+        const pids = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* command
+            return yield* Effect.promise(async () => {
+              const deadline = Date.now() + 5_000
+              while (Date.now() < deadline) {
+                try {
+                  return JSON.parse(await fs.readFile(capture, "utf8")) as { parent: number; child: number }
+                } catch {
+                  await new Promise((resolve) => setTimeout(resolve, 10))
+                }
+              }
+              throw new Error("process capture was not written")
+            })
+          }),
+        )
+        expect(yield* Effect.promise(() => fs.readFile(ready, "utf8"))).toBe("ready")
+        expect(yield* Effect.promise(() => fs.readFile(term, "utf8"))).toBe("term")
+        expect(yield* Effect.promise(() => gone(pids.parent))).toBe(true)
+        expect(yield* Effect.promise(() => gone(pids.child))).toBe(true)
+      }),
+      10_000,
+    )
+
+    fx.live(
+      "tears down a successful leader group after its descendant drops inherited descriptors",
+      Effect.gen(function* () {
+        if (process.platform !== "linux") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const capture = path.join(tmp.path, "successful.json")
+        const ready = path.join(tmp.path, "ready")
+        const token = yield* Effect.acquireRelease(
+          Effect.promise(() => fs.open(path.join(tmp.path, "lease"), "w+")),
+          (handle) => Effect.promise(() => handle.close()),
+        )
+        const child = [
+          'const fs = require("node:fs")',
+          "try { fs.closeSync(3) } catch {}",
+          'process.on("SIGTERM", () => {})',
+          `fs.writeFileSync(${JSON.stringify(ready)}, "ready")`,
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const parent = [
+          'const { spawn } = require("node:child_process")',
+          'const fs = require("node:fs")',
+          `const child = spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: ["ignore", "ignore", "ignore", "ignore"] })`,
+          `const ready = ${JSON.stringify(ready)}`,
+          `const capture = ${JSON.stringify(capture)}`,
+          "const wait = () => fs.existsSync(ready) ? (fs.writeFileSync(capture, JSON.stringify({ parent: process.pid, child: child.pid })), process.exit(0)) : setTimeout(wait, 5)",
+          "wait()",
+        ].join(";")
+        const command = js(parent, { forceKillAfter: 100 })
+        registerInheritedReadOnlyFds(command, [{ child: 3, parent: token.fd }])
+        const pids = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* command
+            expect(yield* handle.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+            const pids = yield* Effect.promise(() => fs.readFile(capture, "utf8").then(parsePids))
+            expect(alive(pids.child)).toBe(true)
+            return pids
+          }),
+        )
+        expect(yield* Effect.promise(() => gone(pids.parent))).toBe(true)
+        expect(yield* Effect.promise(() => gone(pids.child))).toBe(true)
+      }),
+      10_000,
+    )
+
+    fx.live(
+      "explicit forceKillAfter tears down the captured process group",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const capture = path.join(tmp.path, "explicit-kill.json")
+        const ready = path.join(tmp.path, "explicit-ready")
+        const term = path.join(tmp.path, "explicit-term")
+        const child = [
+          'const fs = require("node:fs")',
+          `process.on("SIGTERM", () => fs.writeFileSync(${JSON.stringify(term)}, "term"))`,
+          `fs.writeFileSync(${JSON.stringify(ready)}, "ready")`,
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const parent = [
+          'const { spawn } = require("node:child_process")',
+          'const fs = require("node:fs")',
+          `const child = spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: "ignore" })`,
+          'process.on("SIGTERM", () => process.exit(0))',
+          `const ready = ${JSON.stringify(ready)}`,
+          `const capture = ${JSON.stringify(capture)}`,
+          "const wait = () => fs.existsSync(ready) ? fs.writeFileSync(capture, JSON.stringify({ parent: process.pid, child: child.pid })) : setTimeout(wait, 5)",
+          "wait()",
+          "setInterval(() => {}, 10_000)",
+        ].join(";")
+        const pids = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* js(parent)
+            const pids = yield* Effect.promise(async () => {
+              const deadline = Date.now() + 5_000
+              while (Date.now() < deadline) {
+                try {
+                  return parsePids(await fs.readFile(capture, "utf8"))
+                } catch {
+                  await new Promise((resolve) => setTimeout(resolve, 10))
+                }
+              }
+              throw new Error("process capture was not written")
+            })
+            yield* handle.kill({ forceKillAfter: 100 })
+            return pids
+          }),
+        )
+        expect(yield* Effect.promise(() => fs.readFile(ready, "utf8"))).toBe("ready")
+        expect(yield* Effect.promise(() => fs.readFile(term, "utf8"))).toBe("term")
+        expect(yield* Effect.promise(() => gone(pids.parent))).toBe(true)
+        expect(yield* Effect.promise(() => gone(pids.child))).toBe(true)
+      }),
+      10_000,
+    )
+
+    fx.live(
+      "does not signal a descendant which leaves the captured session",
+      Effect.gen(function* () {
+        if (process.platform !== "linux") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const capture = path.join(tmp.path, "escaped-session.json")
+        const child = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
+        const parent = [
+          'const { spawn } = require("node:child_process")',
+          'const fs = require("node:fs")',
+          `const child = spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { detached: true, stdio: "ignore" })`,
+          "child.unref()",
+          `fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ parent: process.pid, child: child.pid }))`,
+        ].join(";")
+        const pids = yield* Effect.acquireRelease(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* js(parent, { forceKillAfter: 100 })
+              expect(yield* handle.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+              return yield* Effect.promise(() => fs.readFile(capture, "utf8").then(parsePids))
+            }),
+          ),
+          (pids) =>
+            Effect.sync(() => {
+              try {
+                process.kill(pids.child, "SIGKILL")
+              } catch {
+                // Child already exited.
+              }
+            }),
+        )
+        expect(yield* Effect.promise(() => gone(pids.parent))).toBe(true)
+        expect(alive(pids.child)).toBe(true)
+      }),
+      10_000,
     )
 
     fx.effect(

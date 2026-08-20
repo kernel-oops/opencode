@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { Config } from "@/config/config"
+import { ConfigBashPermissionEvaluatorV1 } from "@opencode-ai/core/v1/config/bash-permission-evaluator"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { TuiConfig } from "@opencode-ai/tui/config"
 import { Schema } from "effect"
@@ -8,7 +9,7 @@ import { Schema } from "effect"
 type JsonSchema = Record<string, unknown>
 const MODEL_REF = "https://models.dev/model-schema.json#/$defs/Model"
 
-function generateEffect(schema: Schema.Top) {
+function generateEffect(schema: Schema.Top, closeBashEvaluator = false) {
   const document = Schema.toJsonSchemaDocument(schema)
   const normalized = normalize({
     $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -18,6 +19,11 @@ function generateEffect(schema: Schema.Top) {
   if (!isRecord(normalized)) throw new Error("schema generator produced a non-object schema")
   const restored = restoreModelRefs(normalized)
   if (!isRecord(restored)) throw new Error("schema generator produced a non-object schema")
+  if (closeBashEvaluator) {
+    const definitions = restored.$defs
+    if (!isRecord(definitions)) throw new Error("config schema is missing definitions")
+    ConfigBashPermissionEvaluatorV1.closeGeneratedSchema(definitions.BashPermissionEvaluatorConfig)
+  }
   restored.allowComments = true
   restored.allowTrailingCommas = true
   return restored
@@ -68,10 +74,16 @@ function isRecord(value: unknown): value is JsonSchema {
 const configFile = process.argv[2]
 const tuiFile = process.argv[3]
 
-console.log(configFile)
-await Bun.write(configFile, JSON.stringify(generateEffect(ConfigV1.Info), null, 2))
+export function generateConfigSchema() {
+  return generateEffect(ConfigV1.Info, true)
+}
 
-if (tuiFile) {
-  console.log(tuiFile)
-  await Bun.write(tuiFile, JSON.stringify(generateEffect(TuiConfig.Info), null, 2))
+if (import.meta.main) {
+  console.log(configFile)
+  await Bun.write(configFile, JSON.stringify(generateConfigSchema(), null, 2))
+
+  if (tuiFile) {
+    console.log(tuiFile)
+    await Bun.write(tuiFile, JSON.stringify(generateEffect(TuiConfig.Info), null, 2))
+  }
 }

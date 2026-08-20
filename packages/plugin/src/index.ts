@@ -26,6 +26,55 @@ export type PermissionReviewValue =
   | PermissionReviewValue[]
   | { [key: string]: PermissionReviewValue }
 
+export type PermissionReviewEvidenceSource =
+  | "human"
+  | "developer"
+  | "agent"
+  | "instruction"
+  | "assistant"
+  | "tool"
+  | "child_prompt"
+  | "skill"
+  | "mcp"
+  | "plugin"
+  | "http"
+  | "environment"
+  | "summary"
+
+export type PermissionReviewEvidence = {
+  source: PermissionReviewEvidenceSource
+  trusted: boolean
+  text: string
+}
+
+export type PermissionReviewSelection<T> = {
+  items: T[]
+  complete: boolean
+  omitted_items: number
+  omitted_bytes: number
+}
+
+export type PermissionReviewSnapshot = {
+  version: "1"
+  context_safe_for_gate: boolean
+  action: {
+    identity: string
+    permission: string
+    origin: "tool" | "doom_loop" | "unknown"
+    cwd?: string
+    cwd_status: "exact" | "not_applicable" | "unknown"
+    patterns: PermissionReviewValue
+    metadata: PermissionReviewValue
+    arguments?: PermissionReviewValue
+    complete: boolean
+    omitted_items: number
+    omitted_bytes: number
+  }
+  trusted: PermissionReviewSelection<PermissionReviewEvidence>
+  untrusted: PermissionReviewSelection<PermissionReviewEvidence>
+  complete: boolean
+}
+
 export type PermissionReviewContext = {
   policyVersion: typeof PERMISSION_REVIEW_POLICY_VERSION
   reviewID: string
@@ -51,6 +100,7 @@ export type PermissionReviewContext = {
     modelID: string
   }
   arguments?: PermissionReviewValue
+  snapshot: PermissionReviewSnapshot
   rules: Array<{
     pattern: string
     action: "allow" | "deny" | "ask"
