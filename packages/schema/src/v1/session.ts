@@ -329,6 +329,13 @@ const messageBase = {
   sessionID: partBase.sessionID,
 }
 
+export const PermissionReviewAdmission = Schema.Struct({
+  version: Schema.Literal(1),
+  text: Schema.Array(Schema.String),
+  complete: Schema.Boolean,
+}).annotate({ identifier: "PermissionReviewAdmission" })
+export type PermissionReviewAdmission = Types.DeepMutable<Schema.Schema.Type<typeof PermissionReviewAdmission>>
+
 export const User = Schema.Struct({
   ...messageBase,
   role: Schema.Literal("user"),
@@ -351,6 +358,11 @@ export const User = Schema.Struct({
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  permissionReview: Schema.optional(
+    Schema.Struct({
+      admission: PermissionReviewAdmission,
+    }),
+  ),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
 

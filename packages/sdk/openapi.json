@@ -21085,6 +21085,10 @@
           "model": {
             "type": "string",
             "minLength": 1
+          },
+          "automatic_allow": {
+            "type": "string",
+            "enum": ["never"]
           }
         },
         "required": ["mode", "model"],

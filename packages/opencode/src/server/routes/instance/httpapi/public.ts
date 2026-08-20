@@ -1,4 +1,5 @@
 import { OpenApi } from "effect/unstable/httpapi"
+import { ConfigBashPermissionEvaluatorV1 } from "@opencode-ai/core/v1/config/bash-permission-evaluator"
 import { OpenCodeHttpApi } from "./api"
 import { QueryBooleanOpenApi } from "./groups/query"
 
@@ -98,6 +99,8 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
   normalizeComponentNames(spec)
   collapseDuplicateComponents(spec)
   applyLegacySchemaOverrides(spec)
+  const bashEvaluator = spec.components?.schemas?.BashPermissionEvaluatorConfig
+  if (bashEvaluator) ConfigBashPermissionEvaluatorV1.closeGeneratedSchema(bashEvaluator)
   normalizeComponentDescriptions(spec)
   addLegacyErrorSchemas(spec)
   delete spec.components?.securitySchemes

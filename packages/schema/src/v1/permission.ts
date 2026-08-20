@@ -48,6 +48,14 @@ export const Approval = Schema.Struct({ projectID: Project.ID, patterns: Schema.
 })
 export type Approval = typeof Approval.Type
 
+export const ReviewAction = Schema.Struct({
+  identity: Schema.String,
+  arguments: Schema.optional(Schema.Unknown),
+  cwd: Schema.optional(Schema.Union([Schema.String, Schema.Null])),
+  complete: Schema.Boolean,
+}).annotate({ identifier: "PermissionReviewAction" })
+export type ReviewAction = typeof ReviewAction.Type
+
 export const ReviewSource = Schema.Struct({
   origin: Schema.Literals(["tool", "doom_loop", "unknown"]),
   agent: Schema.optional(
@@ -73,7 +81,9 @@ export const ReviewSource = Schema.Struct({
       ),
     }),
   ),
+  cwd: Schema.optional(Schema.String),
   arguments: Schema.optional(Schema.Unknown),
+  action: Schema.optional(ReviewAction),
 }).annotate({ identifier: "PermissionReviewSource" })
 export type ReviewSource = typeof ReviewSource.Type
 
