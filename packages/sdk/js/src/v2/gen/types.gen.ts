@@ -1872,6 +1872,11 @@ export type McpRemoteConfig = {
  */
 export type LayoutConfig = "auto" | "stretch"
 
+export type PermissionReviewerConfig = {
+  mode: "audit-only" | "enforce"
+  model: string
+}
+
 export type ImageAttachmentConfig = {
   auto_resize?: boolean
   max_width?: number
@@ -2000,6 +2005,7 @@ export type Config = {
   instructions?: Array<string>
   layout?: LayoutConfig
   permission?: PermissionConfig
+  permission_reviewer?: PermissionReviewerConfig
   tools?: {
     [key: string]: boolean
   }

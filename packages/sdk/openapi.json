@@ -21075,6 +21075,21 @@
         "enum": ["auto", "stretch"],
         "description": "@deprecated Always uses stretch layout."
       },
+      "PermissionReviewerConfig": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["audit-only", "enforce"]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["mode", "model"],
+        "additionalProperties": false
+      },
       "ImageAttachmentConfig": {
         "type": "object",
         "properties": {
@@ -21461,6 +21476,9 @@
           },
           "permission": {
             "$ref": "#/components/schemas/PermissionConfig"
+          },
+          "permission_reviewer": {
+            "$ref": "#/components/schemas/PermissionReviewerConfig"
           },
           "tools": {
             "type": "object",

@@ -3,8 +3,9 @@ import { test, expect } from "bun:test"
 import os from "os"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger } from "effect"
 import * as TestConsole from "effect/testing/TestConsole"
+import * as TestClock from "effect/testing/TestClock"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Npm } from "@opencode-ai/core/npm"
@@ -15,24 +16,46 @@ import { Account } from "../../src/account/account"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
-import { TestInstance, tmpdirScoped } from "../fixture/fixture"
+import { TestInstance, tmpdirScoped, withTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { AccountTest } from "../fake/account"
-import { AuthTest } from "../fake/auth"
 import { NpmTest } from "../fake/npm"
 import { MessageID, SessionID } from "../../src/session/schema"
+import { Session } from "../../src/session/session"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { safeReviewValue } from "../../src/permission/review"
+import { Provider } from "../../src/provider/provider"
+import { ProviderTest } from "../fake/provider"
+import { MockLanguageModelV3 } from "ai/test"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { simulateReadableStream } from "ai"
+
+const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
+const reviewerModel = ProviderTest.model({
+  id: reviewerAlias,
+  api: { id: "gpt-5.6-luna", url: "https://example.com", npm: "@ai-sdk/openai" },
+})
+let reviewerLanguage = new MockLanguageModelV3()
+const reviewerProvider = ProviderTest.fake({
+  model: reviewerModel,
+  getLanguage: () => Effect.succeed(reviewerLanguage),
+})
+const reviewerAuth = Layer.mock(Auth.Service)({
+  all: () => Effect.succeed({}),
+  get: () => Effect.succeed({ type: "oauth", refresh: "test", access: "test", expires: Date.now() + 60_000 }),
+})
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
   [
     [InstanceStore.bootstrapNode, noopBootstrap],
-    [Auth.node, AuthTest.empty],
+    [Auth.node, reviewerAuth],
     [Account.node, AccountTest.empty],
     [Npm.node, NpmTest.noop],
     [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true })],
+    [Provider.node, reviewerProvider.layer],
   ],
 )
 const it = testEffect(env)
@@ -94,6 +117,66 @@ const list = () =>
 const permissionHook = (body: string) =>
   ["export default async () => ({", '  "permission.ask": async (input, output) => {', body, "  },", "})", ""].join("\n")
 
+const reviewerUsage = {
+  inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+  outputTokens: { total: 5, text: 5, reasoning: undefined },
+}
+
+const reviewerOutput = (decision: "allow" | "ask" | "deny") => ({
+  stream: simulateReadableStream({
+    chunks: [
+      { type: "text-start" as const, id: "review" },
+      { type: "text-delta" as const, id: "review", delta: JSON.stringify({ decision }) },
+      { type: "text-end" as const, id: "review" },
+      { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage: reviewerUsage },
+    ],
+  }),
+})
+
+const reviewerAsk = (input: Parameters<Permission.Interface["ask"]>[0]) =>
+  ask({
+    ...input,
+    review: input.review ?? { origin: "tool", arguments: { command: "git status" } },
+  })
+
+const withBlockedBuiltinLogger = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.provide(
+      Logger.layer([
+        Logger.make((options) => {
+          if (JSON.stringify(options.message).includes('"source":"builtin"')) return new Promise(() => {})
+        }),
+      ]),
+    ),
+  )
+
+const withReviewer = (mode: "audit-only" | "enforce") => ({
+  git: true,
+  config: { permission_reviewer: { mode, model: `openai/${reviewerAlias}` } },
+})
+
+const withReviewerAndPlugins = (mode: "audit-only" | "enforce", ...sources: string[]) => ({
+  git: true,
+  init: (directory: string) =>
+    Effect.promise(async () => {
+      const plugins = await Promise.all(
+        sources.map(async (source, index) => {
+          const file = path.join(directory, `plugin-${index}.ts`)
+          await Bun.write(file, source)
+          return pathToFileURL(file).href
+        }),
+      )
+      await Bun.write(
+        path.join(directory, "opencode.json"),
+        JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+          plugin: plugins,
+          permission_reviewer: { mode, model: `openai/${reviewerAlias}` },
+        }),
+      )
+    }),
+})
+
 const withPlugins = (...sources: string[]) => ({
   git: true,
   init: (directory: string) =>
@@ -110,6 +193,183 @@ const withPlugins = (...sources: string[]) => ({
         JSON.stringify({ $schema: "https://opencode.ai/config.json", plugin: plugins }),
       )
     }),
+})
+
+test("safeReviewValue - canonicalises and redacts secret-bearing input", () => {
+  const circular: Record<string, unknown> = {}
+  circular.self = circular
+  const result = safeReviewValue({
+    z: "last",
+    password: "do-not-expose",
+    command: "curl -H 'Authorization: Bearer abc123' https://user:pass@example.com",
+    cli: "--password command-secret",
+    environment: "OPENAI_API_KEY=env-secret",
+    cloudEnvironment: "AWS_SECRET_ACCESS_KEY=aws-env AWS_SESSION_TOKEN=session-env",
+    cloudCli: "--secret-access-key cloud-cli",
+    json: '{"token":"json-secret"}',
+    a: { access_token: "hidden", keep: true },
+    circular,
+  })
+
+  expect(result).toEqual({
+    a: { access_token: "[REDACTED]", keep: true },
+    circular: { self: "[CIRCULAR]" },
+    cli: "--password [REDACTED]",
+    cloudCli: "--secret-access-key [REDACTED]",
+    cloudEnvironment: "AWS_SECRET_ACCESS_KEY=[REDACTED] AWS_SESSION_TOKEN=[REDACTED]",
+    command: "curl -H 'Authorization: [REDACTED]' https://[REDACTED]@example.com",
+    environment: "OPENAI_API_KEY=[REDACTED]",
+    json: '{"token":"[REDACTED]"}',
+    password: "[REDACTED]",
+    z: "last",
+  })
+  expect(Object.keys(result as Record<string, unknown>)).toEqual([
+    "a",
+    "circular",
+    "cli",
+    "cloudCli",
+    "cloudEnvironment",
+    "command",
+    "environment",
+    "json",
+    "password",
+    "z",
+  ])
+})
+
+test("safeReviewValue - redacts complete sensitive HTTP header values", () => {
+  const result = safeReviewValue({
+    digest: "Authorization: Digest username=x,response=secret",
+    plain: "Authorization: definitely-secret",
+    cookieHeader: "Cookie: session=secret; csrf=topsecret",
+    proxy: "Proxy-Authorization: Custom proxy-secret",
+    responseHeader: 'Set-Cookie: session="cookie-secret"; Path=/; HttpOnly',
+    assignment: "Authorization=assignment-secret",
+    command: "curl -H 'Authorization: Digest username=x,response=command-secret' https://example.com",
+    quotedCommand: 'curl --header "Cookie: session=quoted-secret; csrf=quoted-csrf" https://example.com',
+  })
+
+  expect(result).toEqual({
+    assignment: "Authorization=[REDACTED]",
+    command: "curl -H 'Authorization: [REDACTED]' https://example.com",
+    cookieHeader: "Cookie: [REDACTED]",
+    digest: "Authorization: [REDACTED]",
+    plain: "Authorization: [REDACTED]",
+    proxy: "Proxy-Authorization: [REDACTED]",
+    quotedCommand: 'curl --header "Cookie: [REDACTED]" https://example.com',
+    responseHeader: "Set-Cookie: [REDACTED]",
+  })
+  const serialised = JSON.stringify(result)
+  for (const secret of [
+    "response=secret",
+    "definitely-secret",
+    "session=secret",
+    "topsecret",
+    "proxy-secret",
+    "cookie-secret",
+    "assignment-secret",
+    "command-secret",
+    "quoted-secret",
+    "quoted-csrf",
+  ]) {
+    expect(serialised).not.toContain(secret)
+  }
+})
+
+test("safeReviewValue - rejects accessors, proxies, unsafe keys, and non-plain values", () => {
+  let getterCalls = 0
+  let proxyCalls = 0
+  const input: Record<string, unknown> = {
+    AWS_SECRET_ACCESS_KEY: "aws-secret",
+    secretAccessKey: "cloud-secret",
+    accessKeyId: "access-secret",
+    sessionToken: "session-secret",
+    created: new Date(0),
+    proxied: new Proxy(
+      {},
+      {
+        ownKeys() {
+          proxyCalls++
+          return []
+        },
+      },
+    ),
+  }
+  Object.defineProperty(input, "dynamicSecret", {
+    enumerable: true,
+    get() {
+      getterCalls++
+      return "getter-secret"
+    },
+  })
+  Object.defineProperty(input, "__proto__", { enumerable: true, value: "prototype-secret" })
+  input[`secretAccessKey${"x".repeat(200)}`] = "long-key-secret"
+
+  const result = safeReviewValue(input) as Record<string, unknown>
+
+  expect(getterCalls).toBe(0)
+  expect(proxyCalls).toBe(0)
+  expect(Object.getPrototypeOf(result)).toBeNull()
+  expect(result.AWS_SECRET_ACCESS_KEY).toBe("[REDACTED]")
+  expect(result.secretAccessKey).toBe("[REDACTED]")
+  expect(result.accessKeyId).toBe("[REDACTED]")
+  expect(result.sessionToken).toBe("[REDACTED]")
+  expect(result.dynamicSecret).toBe("[ACCESSOR]")
+  expect(result.created).toBe("[UNSUPPORTED:object]")
+  expect(result.proxied).toBe("[UNSUPPORTED:proxy]")
+  expect(Object.keys(result).some((key) => key.startsWith("[UNSAFE_KEY_"))).toBe(true)
+  expect(Object.keys(result).some((key) => key.startsWith("[LONG_KEY_"))).toBe(true)
+  expect(JSON.stringify(result)).not.toContain("prototype-secret")
+  expect(JSON.stringify(result)).not.toContain("long-key-secret")
+})
+
+const lineageLookup = (...nodes: Session.LineageNode[]) => {
+  const entries = new Map(nodes.map((node) => [node.id, node]))
+  return {
+    get: (id: SessionID) => {
+      const node = entries.get(id)
+      return node ? Effect.succeed(node) : Effect.fail(new Error(`missing ${id}`))
+    },
+  }
+}
+
+test("resolveLineage - reports a complete root-to-child lineage", async () => {
+  const root = SessionID.make("session_root")
+  const parent = SessionID.make("session_parent")
+  const child = SessionID.make("session_child")
+  const result = await Effect.runPromise(
+    Session.resolveLineage(lineageLookup({ id: root }, { id: parent, parentID: root }), {
+      id: child,
+      parentID: parent,
+    }),
+  )
+  expect(result).toEqual({ parentID: parent, rootID: root, lineage: [root, parent, child], complete: true })
+})
+
+test("resolveLineage - marks a missing ancestor as incomplete without appending it", async () => {
+  const missing = SessionID.make("session_missing")
+  const child = SessionID.make("session_child")
+  const result = await Effect.runPromise(Session.resolveLineage(lineageLookup(), { id: child, parentID: missing }))
+  expect(result).toEqual({
+    parentID: missing,
+    lineage: [child],
+    complete: false,
+    reason: "missing_ancestor",
+  })
+})
+
+test("resolveLineage - marks cycles as incomplete without claiming a root", async () => {
+  const first = SessionID.make("session_first")
+  const second = SessionID.make("session_second")
+  const result = await Effect.runPromise(
+    Session.resolveLineage(lineageLookup({ id: second, parentID: first }), { id: first, parentID: second }),
+  )
+  expect(result).toEqual({
+    parentID: second,
+    lineage: [second, first],
+    complete: false,
+    reason: "cycle",
+  })
 })
 
 // fromConfig tests
@@ -733,6 +993,43 @@ it.instance(
 )
 
 it.instance(
+  "ask - interruption while an asked listener is blocked clears pending state",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const entered = yield* Deferred.make<void>()
+      const blocked = yield* Deferred.make<void>()
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== Permission.Event.Asked.type) return Effect.void
+        return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(blocked)))
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_blocked_asked"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* Deferred.await(entered).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("timed out waiting for blocked asked listener")),
+        }),
+      )
+      expect(yield* list()).toHaveLength(1)
+      yield* Fiber.interrupt(fiber)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
   "ask - fully static allow bypasses permission hook",
   () =>
     Effect.gen(function* () {
@@ -769,6 +1066,130 @@ it.instance(
 )
 
 it.instance(
+  "ask - permission hook receives trusted review context with redacted arguments",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const rootID = SessionID.make("session_root")
+      const childID = SessionID.make("session_child")
+
+      yield* ask({
+        id: PermissionV1.ID.make("per_context"),
+        sessionID: childID,
+        permission: "bash",
+        patterns: ["echo ok", "curl --token pattern-secret example.com"],
+        metadata: { accessToken: "metadata-secret", label: "visible" },
+        always: ["echo ok", "--password always-secret"],
+        tool: { messageID: MessageID.make("msg_context"), callID: "call_context" },
+        ruleset: [{ permission: "bash", pattern: "echo *", action: "allow" }],
+        review: {
+          origin: "tool",
+          agent: { name: "build", mode: "primary" },
+          model: { providerID: "openai", modelID: "gpt-test" },
+          session: { parentID: rootID, rootID, lineage: [rootID, childID], complete: true },
+          arguments: {
+            command: "curl -H 'Authorization: Bearer argument-secret' example.com",
+            apiKey: "key-secret",
+            nested: { password: "password-secret" },
+          },
+        },
+      })
+
+      const review = JSON.parse(yield* Effect.promise(() => Bun.file(path.join(test.directory, "review.json")).text()))
+      expect(review).toMatchObject({
+        id: "per_context",
+        sessionID: childID,
+        permission: "bash",
+        patterns: ["echo ok", "curl --token pattern-secret example.com"],
+        always: ["echo ok", "--password always-secret"],
+        metadata: { accessToken: "metadata-secret", label: "visible" },
+        tool: { messageID: "msg_context", callID: "call_context" },
+        review: {
+          policyVersion: "1",
+          reviewID: "review_per_context",
+          origin: "tool",
+          project: { directory: test.directory, worktree: test.directory },
+          session: { parentID: rootID, rootID, lineage: [rootID, childID], complete: true },
+          agent: { name: "build", mode: "primary" },
+          model: { providerID: "openai", modelID: "gpt-test" },
+          arguments: {
+            apiKey: "[REDACTED]",
+            nested: { password: "[REDACTED]" },
+          },
+          rules: [
+            {
+              pattern: "echo ok",
+              action: "allow",
+              matched: { permission: "bash", pattern: "echo *", action: "allow" },
+            },
+            {
+              pattern: "curl --token [REDACTED] example.com",
+              action: "ask",
+              matched: { permission: "bash", pattern: "*", action: "ask" },
+            },
+          ],
+        },
+      })
+      expect(review.review.project.id).toBeTruthy()
+      const reviewContext = JSON.stringify(review.review)
+      expect(reviewContext).not.toContain("argument-secret")
+      expect(reviewContext).not.toContain("key-secret")
+      expect(reviewContext).not.toContain("password-secret")
+      expect(reviewContext).not.toContain("pattern-secret")
+      expect(JSON.stringify(review.metadata)).toContain("metadata-secret")
+      expect(JSON.stringify(review.patterns)).toContain("pattern-secret")
+      expect(JSON.stringify(review.always)).toContain("always-secret")
+
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain("permission review")
+      expect(logs).toContain('"result":"allow"')
+      expect(logs).toContain('"fallbackToHuman":false')
+      expect(logs).toContain('"reviewSettled":true')
+      expect(logs).not.toContain("pattern-secret")
+      expect(logs).not.toContain("argument-secret")
+      expect(logs).not.toContain("metadata-secret")
+    }),
+  withPlugins(
+    permissionHook(
+      [
+        '    await Bun.write(new URL("review.json", import.meta.url), JSON.stringify(input))',
+        '    output.status = "allow"',
+      ].join("\n"),
+    ),
+  ),
+)
+
+it.instance(
+  "ask - permission hook sees an incomplete lineage when the current session is missing",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.make("session_missing_current")
+      yield* ask({
+        sessionID,
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+
+      const context = JSON.parse(
+        yield* Effect.promise(() => Bun.file(path.join(test.directory, "lineage.json")).text()),
+      )
+      expect(context).toEqual({ lineage: [sessionID], complete: false, reason: "missing_current" })
+    }),
+  withPlugins(
+    permissionHook(
+      [
+        '    await Bun.write(new URL("lineage.json", import.meta.url), JSON.stringify(input.review.session))',
+        '    output.status = "allow"',
+      ].join("\n"),
+    ),
+  ),
+)
+
+it.instance(
   "ask - permission hook deny returns DeniedError",
   () =>
     Effect.gen(function* () {
@@ -790,21 +1211,288 @@ it.instance(
 )
 
 it.instance(
-  "ask - later permission hook overrides earlier decision",
+  "ask - permission hook deny outranks a later allow",
   () =>
     Effect.gen(function* () {
-      yield* ask({
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain("asking")
+    }),
+  withPlugins(permissionHook('    output.status = "deny"'), permissionHook('    output.status = "allow"')),
+)
+
+it.instance(
+  "ask - permission hook deny outranks an earlier allow",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  withPlugins(permissionHook('    output.status = "allow"'), permissionHook('    output.status = "deny"')),
+)
+
+it.instance(
+  "ask - permission hook deny outranks errors in either order",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  withPlugins(permissionHook('    throw new Error("failed first")'), permissionHook('    output.status = "deny"')),
+)
+
+it.instance(
+  "ask - permission hook deny outranks a concurrently started later error",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      yield* Effect.gen(function* () {
+        while (!(yield* Effect.promise(() => Bun.file(path.join(test.directory, "lower-priority-ran")).exists()))) {
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "10 seconds",
+          orElse: () => Effect.fail(new Error("timed out waiting for concurrent permission hook")),
+        }),
+      )
+    }),
+  withPlugins(
+    permissionHook('    output.status = "deny"'),
+    permissionHook(
+      [
+        '    await Bun.write(new URL("lower-priority-ran", import.meta.url), "ran")',
+        '    throw new Error("failed later")',
+      ].join("\n"),
+    ),
+  ),
+)
+
+it.instance(
+  "ask - a later deny bypasses an earlier hung hook while the hung work retains capacity",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const active = Array.from({ length: Permission.REVIEW_CAPACITY }, (_, index) =>
+        PermissionV1.ID.make(`per_hung_deny_${index}`),
+      )
+
+      for (const id of active) {
+        const err = yield* fail(
+          ask({
+            id,
+            sessionID: SessionID.make(`session_${id}`),
+            permission: "bash",
+            patterns: ["ls"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          }),
+        ).pipe(
+          Effect.timeoutOrElse({
+            duration: "10 seconds",
+            orElse: () => Effect.fail(new Error(`timed out waiting for concurrent deny ${id}`)),
+          }),
+        )
+        expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      }
+
+      yield* Effect.gen(function* () {
+        while (true) {
+          const ready = yield* Effect.forEach(active, (id) =>
+            Effect.all([
+              Effect.promise(() => Bun.file(path.join(test.directory, `hung-${id}`)).exists()),
+              Effect.promise(() => Bun.file(path.join(test.directory, `deny-${id}`)).exists()),
+            ]),
+          )
+          if (ready.every(([hung, deny]) => hung && deny)) return
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "10 seconds",
+          orElse: () => Effect.fail(new Error("timed out waiting for concurrent permission hooks")),
+        }),
+      )
+      expect(yield* list()).toHaveLength(0)
+
+      const overflowID = PermissionV1.ID.make("per_hung_deny_capacity")
+      const overflow = yield* ask({
+        id: overflowID,
+        sessionID: SessionID.make("session_hung_deny_capacity"),
+        permission: "bash",
+        patterns: ["pwd"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect((yield* waitForPending(1)).map((item) => item.id)).toEqual([overflowID])
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, `hung-${overflowID}`)).exists())).toBe(
+        false,
+      )
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, `deny-${overflowID}`)).exists())).toBe(
+        false,
+      )
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"result":"deny"')
+      expect(logs).toContain('"reviewSettled":false')
+      expect(logs).toContain('"result":"capacity"')
+      expect(logs).toContain('"fallbackToHuman":true')
+      yield* reply({ requestID: overflowID, reply: "reject" })
+      yield* Fiber.await(overflow)
+    }),
+  withPlugins(
+    permissionHook(
+      [
+        '    await Bun.write(new URL(`hung-${input.id}`, import.meta.url), "started")',
+        "    return new Promise(() => {})",
+      ].join("\n"),
+    ),
+    permissionHook(
+      [
+        '    await Bun.write(new URL(`deny-${input.id}`, import.meta.url), "started")',
+        '    output.status = "deny"',
+      ].join("\n"),
+    ),
+  ),
+)
+
+it.instance(
+  "ask - permission hook deny outranks an invalid result",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+    }),
+  withPlugins(permissionHook('    output.status = "invalid"'), permissionHook('    output.status = "deny"')),
+)
+
+it.instance(
+  "ask - permission hook deny outranks an earlier ask",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  withPlugins(permissionHook('    output.status = "ask"'), permissionHook('    output.status = "deny"')),
+)
+
+it.instance(
+  "ask - one asking hook prevents automatic allow",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
         sessionID: SessionID.make("session_test"),
         permission: "bash",
         patterns: ["ls"],
         metadata: {},
         always: [],
         ruleset: [],
-      })
-      expect(yield* list()).toHaveLength(0)
-      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain("asking")
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
     }),
-  withPlugins(permissionHook('    output.status = "deny"'), permissionHook('    output.status = "allow"')),
+  withPlugins(permissionHook('    output.status = "allow"'), permissionHook('    output.status = "ask"')),
+)
+
+it.instance(
+  "ask - an earlier asking hook also prevents automatic allow",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withPlugins(permissionHook('    output.status = "ask"'), permissionHook('    output.status = "allow"')),
+)
+
+it.instance(
+  "ask - an earlier permission hook error prevents a later automatic allow",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"result":"error"')
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withPlugins(permissionHook('    throw new Error("failed first")'), permissionHook('    output.status = "allow"')),
 )
 
 it.instance(
@@ -823,6 +1511,9 @@ it.instance(
       expect(yield* waitForPending(1)).toHaveLength(1)
       const logs = JSON.stringify(yield* TestConsole.logLines)
       expect(logs).toContain("permission ask plugin failed")
+      expect(logs).toContain('"result":"error"')
+      expect(logs).toContain('"fallbackToHuman":true')
+      expect(logs).toContain('"reviewSettled":true')
       expect(logs).toContain("asking")
       yield* rejectAll()
       yield* Fiber.await(fiber)
@@ -830,6 +1521,224 @@ it.instance(
   withPlugins(
     permissionHook('    output.status = "allow"'),
     permissionHook('    throw new Error("later hook failed")'),
+  ),
+)
+
+it.instance(
+  "ask - invalid permission hook status falls back to human ask",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_invalid"),
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      expect((yield* waitForPending(1))[0]?.id).toBe(PermissionV1.ID.make("per_invalid"))
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain("permission ask plugin failed or returned invalid status")
+      expect(logs).toContain('"result":"error"')
+      expect(logs).toContain('"fallbackToHuman":true')
+      expect(logs).toContain('"reviewSettled":true')
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withPlugins(permissionHook('    output.status = "invalid"'), permissionHook('    output.status = "allow"')),
+)
+
+it.instance(
+  "ask - permission hook status accessors cannot auto-approve",
+  () =>
+    Effect.gen(function* () {
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"result":"error"')
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withPlugins(
+    permissionHook('    Object.defineProperty(output, "status", { get() { throw new Error("must not run") } })'),
+  ),
+)
+
+it.effect("ask - timed out native hooks retain capacity until they actually settle", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const firstID = PermissionV1.ID.make("per_timeout")
+    const marker = path.join(test.directory, `timeout-${firstID}`)
+    const fiber = yield* ask({
+      id: firstID,
+      sessionID: SessionID.make("session_timeout"),
+      permission: "bash",
+      patterns: ["ls"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+
+    while (!(yield* Effect.promise(() => Bun.file(marker).exists()))) yield* Effect.yieldNow
+    expect(yield* list()).toHaveLength(0)
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+
+    const pending = yield* list()
+    expect(pending.map((item) => item.id)).toEqual([firstID])
+    const logs = JSON.stringify(yield* TestConsole.logLines)
+    expect(logs).toContain('"result":"timeout"')
+    expect(logs).toContain('"latencyMs":30000')
+    expect(logs).toContain('"fallbackToHuman":true')
+    expect(logs).toContain('"reviewSettled":false')
+
+    const additional = Array.from({ length: Permission.REVIEW_CAPACITY - 1 }, (_, index) =>
+      PermissionV1.ID.make(`per_timeout_${index}`),
+    )
+    const additionalFibers = yield* Effect.forEach(additional, (id) =>
+      ask({
+        id,
+        sessionID: SessionID.make(`session_${id}`),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped),
+    )
+    while (true) {
+      const ready = yield* Effect.forEach(additional, (id) =>
+        Effect.promise(() => Bun.file(path.join(test.directory, `timeout-${id}`)).exists()),
+      )
+      if (ready.every(Boolean)) break
+      yield* Effect.yieldNow
+    }
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+
+    const overflowID = PermissionV1.ID.make("per_timeout_capacity")
+    const overflow = yield* ask({
+      id: overflowID,
+      sessionID: SessionID.make("session_timeout_capacity"),
+      permission: "bash",
+      patterns: ["pwd"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 1) yield* Effect.yieldNow
+    expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, `timeout-${overflowID}`)).exists())).toBe(
+      false,
+    )
+    expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"result":"capacity"')
+
+    yield* rejectAll()
+    yield* Effect.forEach([fiber, ...additionalFibers, overflow], Fiber.await, { discard: true })
+  }).pipe(
+    withTmpdirInstance<never, never>(
+      withPlugins(
+        permissionHook(
+          [
+            '    await Bun.write(new URL(`timeout-${input.id}`, import.meta.url), "started")',
+            "    return new Promise(() => {})",
+          ].join("\n"),
+        ),
+      ),
+    ),
+  ),
+)
+
+it.instance(
+  "ask - permission hook capacity immediately falls back to human ask",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const active = Array.from({ length: Permission.REVIEW_CAPACITY }, (_, index) =>
+        PermissionV1.ID.make(`per_active_${index}`),
+      )
+      const fibers = yield* Effect.forEach(active, (id) =>
+        ask({
+          id,
+          sessionID: SessionID.make(`session_${id}`),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped),
+      )
+
+      yield* Effect.gen(function* () {
+        while (true) {
+          const ready = yield* Effect.forEach(active, (id) =>
+            Effect.promise(() => Bun.file(path.join(test.directory, `hook-${id}`)).exists()),
+          )
+          if (ready.every(Boolean)) return
+          yield* Effect.yieldNow
+        }
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "10 seconds",
+          orElse: () => Effect.fail(new Error("timed out waiting for permission hooks to occupy capacity")),
+        }),
+      )
+
+      const overflowID = PermissionV1.ID.make("per_capacity")
+      const overflow = yield* ask({
+        id: overflowID,
+        sessionID: SessionID.make("session_capacity"),
+        permission: "bash",
+        patterns: ["pwd"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      expect((yield* waitForPending(1)).map((item) => item.id)).toEqual([overflowID])
+      expect(yield* Effect.promise(() => Bun.file(path.join(test.directory, `hook-${overflowID}`)).exists())).toBe(
+        false,
+      )
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"result":"capacity"')
+      expect(logs).toContain('"fallbackToHuman":true')
+      expect(logs).toContain('"reviewSettled":true')
+
+      yield* reply({ requestID: overflowID, reply: "reject" })
+      yield* Fiber.await(overflow)
+      yield* Effect.forEach(fibers, Fiber.interrupt)
+
+      const afterInterruptID = PermissionV1.ID.make("per_after_interrupt")
+      const afterInterrupt = yield* ask({
+        id: afterInterruptID,
+        sessionID: SessionID.make("session_after_interrupt"),
+        permission: "bash",
+        patterns: ["whoami"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect((yield* waitForPending(1)).map((item) => item.id)).toEqual([afterInterruptID])
+      expect(
+        yield* Effect.promise(() => Bun.file(path.join(test.directory, `hook-${afterInterruptID}`)).exists()),
+      ).toBe(false)
+      yield* reply({ requestID: afterInterruptID, reply: "reject" })
+      yield* Fiber.await(afterInterrupt)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  withPlugins(
+    permissionHook(
+      [
+        '    await Bun.write(new URL(`hook-${input.id}`, import.meta.url), "started")',
+        "    return new Promise(() => {})",
+      ].join("\n"),
+    ),
   ),
 )
 
@@ -852,6 +1761,46 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   withPlugins(permissionHook('    input.metadata.nested.value = "mutated"')),
+)
+
+it.instance(
+  "ask - each permission hook receives isolated input and must independently allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: { nested: { value: "original" } },
+        always: ["ls"],
+        ruleset: [],
+      })
+      const observed = JSON.parse(
+        yield* Effect.promise(() => Bun.file(path.join(test.directory, "isolated-input.json")).text()),
+      )
+      expect(observed).toEqual({
+        metadata: { nested: { value: "original" } },
+        patterns: ["ls"],
+        always: ["ls"],
+      })
+    }),
+  withPlugins(
+    permissionHook(
+      [
+        '    input.metadata.nested.value = "mutated"',
+        '    input.patterns[0] = "mutated"',
+        '    input.always[0] = "mutated"',
+        '    output.status = "allow"',
+      ].join("\n"),
+    ),
+    permissionHook(
+      [
+        '    await Bun.write(new URL("isolated-input.json", import.meta.url), JSON.stringify({ metadata: input.metadata, patterns: input.patterns, always: input.always }))',
+        '    output.status = "allow"',
+      ].join("\n"),
+    ),
+  ),
 )
 
 it.instance(
@@ -882,7 +1831,7 @@ it.instance(
         while (!(yield* Effect.promise(() => Bun.file(marker).exists()))) yield* Effect.sleep("10 millis")
       }).pipe(
         Effect.timeoutOrElse({
-          duration: "1 second",
+          duration: "10 seconds",
           orElse: () => Effect.fail(new Error("timed out waiting for permission hook")),
         }),
       )
@@ -892,6 +1841,10 @@ it.instance(
       expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
       expect(yield* list()).toHaveLength(0)
       expect(asked).toBe(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"result":"interrupted"')
+      expect(logs).toContain('"fallbackToHuman":false')
+      expect(logs).toContain('"reviewSettled":false')
     }),
   withPlugins(
     permissionHook(
@@ -1009,6 +1962,39 @@ it.instance(
         ruleset: [],
       })
       expect(result).toBeUndefined()
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - configured deny outranks a learned wildcard approval",
+  () =>
+    Effect.gen(function* () {
+      const learned = yield* ask({
+        id: PermissionV1.ID.make("per_learn_allow"),
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: ["*"],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_learn_allow"), reply: "always" })
+      yield* Fiber.join(learned)
+
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["rm -rf /"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "rm *", action: "deny" }],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
     }),
   { git: true },
 )
@@ -1168,6 +2154,54 @@ it.instance(
         requestID: PermissionV1.ID.make("per_test7"),
         reply: "once",
       })
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply - settles and removes pending state before a replied listener can block",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const askFiber = yield* ask({
+        id: PermissionV1.ID.make("per_blocked_replied"),
+        sessionID: SessionID.make("session_blocked_replied"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+
+      const entered = yield* Deferred.make<void>()
+      const blocked = yield* Deferred.make<void>()
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== Permission.Event.Replied.type) return Effect.void
+        return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(blocked)))
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const replyFiber = yield* reply({ requestID: PermissionV1.ID.make("per_blocked_replied"), reply: "once" }).pipe(
+        Effect.forkScoped,
+      )
+      yield* Deferred.await(entered).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("timed out waiting for blocked replied listener")),
+        }),
+      )
+      yield* Fiber.join(askFiber).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("pending ask did not settle before replied publication")),
+        }),
+      )
+      expect(yield* list()).toHaveLength(0)
+      yield* Fiber.interrupt(replyFiber)
+      const exit = yield* Fiber.await(replyFiber)
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(yield* list()).toHaveLength(0)
     }),
   { git: true },
 )
@@ -1380,4 +2414,619 @@ it.instance(
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
     }),
   { git: true },
+)
+
+it.instance(
+  "reviewer - audit-only records Luna but preserves plugin allow",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_plugin"),
+        permission: "bash",
+        patterns: ["dangerous-command"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect(yield* list()).toHaveLength(0)
+      while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin"')) {
+        yield* Effect.promise(() => Bun.sleep(1))
+      }
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"source":"builtin"')
+      expect(logs).toContain('"result":"deny"')
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - audit-only cannot allow without a plugin",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_only"),
+        permission: "bash",
+        patterns: ["needs-human"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("audit-only"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - audit-only Luna saturation does not delay plugin allow",
+  () =>
+    Effect.gen(function* () {
+      const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+      })
+
+      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        yield* reviewerAsk({
+          sessionID: SessionID.make(`session_audit_capacity_${index}`),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        while (resolvers.length <= index) yield* Effect.promise(() => Bun.sleep(1))
+      }
+
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_audit_capacity_overflow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+      while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin","result":"capacity"')) {
+        yield* Effect.promise(() => Bun.sleep(1))
+      }
+
+      for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.effect("reviewer - audit-only Luna timeout does not delay plugin deny", () =>
+  Effect.gen(function* () {
+    let resolve!: (value: ReturnType<typeof reviewerOutput>) => void
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: () => new Promise((done) => (resolve = done)),
+    })
+
+    const error = yield* fail(
+      reviewerAsk({
+        sessionID: SessionID.make("session_audit_timeout_deny"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }),
+    )
+    expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    while (!JSON.stringify(yield* TestConsole.logLines).includes('"source":"builtin","result":"timeout"')) {
+      yield* Effect.yieldNow
+    }
+    expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"reviewSettled":false')
+    resolve(reviewerOutput("allow"))
+    while (!(yield* TestConsole.logLines).some((line) => JSON.stringify(line).includes("permission review settled")))
+      yield* Effect.yieldNow
+  }).pipe(
+    withTmpdirInstance<never, never>(
+      withReviewerAndPlugins("audit-only", permissionHook('    output.status = "deny"')),
+    ),
+  ),
+)
+
+it.instance(
+  "reviewer - instance reload aborts native work and suppresses post-disposal audits",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const store = yield* InstanceStore.Service
+      let signal: AbortSignal | undefined
+      let resolve!: (value: ReturnType<typeof reviewerOutput>) => void
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: (call) => {
+          signal = call.abortSignal
+          return new Promise((done) => (resolve = done))
+        },
+      })
+
+      yield* reviewerAsk({
+        id: PermissionV1.ID.make("per_reviewer_reload"),
+        sessionID: SessionID.make("session_reviewer_reload"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      while (!signal) yield* Effect.yieldNow
+
+      yield* store.reload({ directory: test.directory })
+      expect(signal.aborted).toBe(true)
+      const before = JSON.stringify(yield* TestConsole.logLines)
+      expect(before).not.toContain('"reviewID":"per_reviewer_reload","source":"builtin"')
+
+      resolve(reviewerOutput("deny"))
+      for (let index = 0; index < 10; index++) yield* Effect.yieldNow
+      const after = JSON.stringify(yield* TestConsole.logLines)
+      expect(after).not.toContain('"reviewID":"per_reviewer_reload","source":"builtin"')
+    }),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay plugin allow",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+        yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_allow"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        expect(yield* list()).toHaveLength(0)
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay plugin deny",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+        const error = yield* fail(
+          reviewerAsk({
+            sessionID: SessionID.make("session_blocked_logger_deny"),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          }),
+        )
+        expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "deny"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay saturation or plugin allow",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+        })
+        for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+          yield* reviewerAsk({
+            sessionID: SessionID.make(`session_blocked_logger_capacity_${index}`),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          })
+          while (resolvers.length <= index) yield* Effect.yieldNow
+        }
+        yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_capacity_overflow"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })
+        expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+        for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+      }),
+    ),
+  withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - blocked audit logger cannot delay no-plugin human ask",
+  () =>
+    withBlockedBuiltinLogger(
+      Effect.gen(function* () {
+        reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+        const fiber = yield* reviewerAsk({
+          sessionID: SessionID.make("session_blocked_logger_ask"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        yield* Fiber.await(fiber)
+      }),
+    ),
+  withReviewer("audit-only"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce degrades Luna allow to a human ask",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_allow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce applies deny-wins aggregation",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+      const err = yield* fail(
+        reviewerAsk({
+          sessionID: SessionID.make("session_enforce_deny"),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+    }),
+  withReviewerAndPlugins("enforce", permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.effect("reviewer - enforce preserves Luna deny when the plugin times out", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const marker = path.join(test.directory, "plugin-timeout-started")
+    reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("deny") })
+    const fiber = yield* reviewerAsk({
+      sessionID: SessionID.make("session_enforce_plugin_timeout"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+
+    while (!(yield* Effect.promise(() => Bun.file(marker).exists()))) yield* Effect.yieldNow
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+    while (!(yield* TestConsole.logLines).some((line) => JSON.stringify(line).includes("permission review settled"))) {
+      yield* Effect.promise(() => Bun.sleep(1))
+    }
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.DeniedError)
+  }).pipe(
+    withTmpdirInstance<never, never>(
+      withReviewerAndPlugins(
+        "enforce",
+        permissionHook(
+          '    await Bun.write(new URL("plugin-timeout-started", import.meta.url), "started")\n    return new Promise(() => {})',
+        ),
+      ),
+    ),
+  ),
+)
+
+it.effect("reviewer - enforce preserves plugin deny when Luna times out", () =>
+  Effect.gen(function* () {
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: (call) =>
+        new Promise<never>((_, reject) =>
+          call.abortSignal?.addEventListener("abort", () => reject(new Error("aborted"))),
+        ),
+    })
+    const fiber = yield* reviewerAsk({
+      sessionID: SessionID.make("session_enforce_luna_timeout"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+
+    while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.DeniedError)
+  }).pipe(
+    withTmpdirInstance<never, never>(withReviewerAndPlugins("enforce", permissionHook('    output.status = "deny"'))),
+  ),
+)
+
+it.instance(
+  "reviewer - enforce requires every configured source to allow",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_plugin_ask"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewerAndPlugins("enforce", permissionHook('    output.status = "ask"')),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce falls back to human ask on any ask or provider failure",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider-secret-body")
+        },
+      })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_failure"),
+        permission: "bash",
+        patterns: ["raw-pattern-secret"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", arguments: { command: "raw-command-secret" } },
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).not.toContain("provider-secret-body")
+      expect(logs).not.toContain("raw-pattern-secret")
+      expect(logs).not.toContain("raw-command-secret")
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforce sends unclassifiable arguments to a human without calling Luna",
+  () =>
+    Effect.gen(function* () {
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_enforce_unclassifiable"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", arguments: { command: "git status", unknown: "secret" } },
+      }).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.instance(
+  "reviewer - starts plugin and Luna concurrently",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          await Bun.write(path.join(test.directory, "model-started"), "started")
+          while (!(await Bun.file(path.join(test.directory, "plugin-started")).exists())) await Bun.sleep(1)
+          return reviewerOutput("allow")
+        },
+      })
+      const fiber = yield* reviewerAsk({
+        sessionID: SessionID.make("session_concurrent_sources"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      while (!(yield* Effect.promise(() => Bun.file(path.join(test.directory, "model-started")).exists()))) {
+        yield* Effect.yieldNow
+      }
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withReviewerAndPlugins(
+    "enforce",
+    permissionHook(
+      '    await Bun.write(new URL("plugin-started", import.meta.url), "started")\n    while (!(await Bun.file(new URL("model-started", import.meta.url)).exists())) await Bun.sleep(1)\n    output.status = "allow"',
+    ),
+  ),
+  15_000,
+)
+
+it.instance(
+  "reviewer - enforces the four-request built-in review capacity",
+  () =>
+    Effect.gen(function* () {
+      const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+      })
+      const fibers = []
+      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        fibers.push(
+          yield* reviewerAsk({
+            sessionID: SessionID.make(`session_capacity_${index}`),
+            permission: "bash",
+            patterns: ["reviewed-operation"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          }).pipe(Effect.forkScoped),
+        )
+      }
+      while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+
+      const overflow = yield* reviewerAsk({
+        id: PermissionV1.ID.make("per_builtin_capacity"),
+        sessionID: SessionID.make("session_capacity_overflow"),
+        permission: "bash",
+        patterns: ["reviewed-operation"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      expect((yield* waitForPending(1))[0]?.id).toBe(PermissionV1.ID.make("per_builtin_capacity"))
+
+      for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+      expect(yield* waitForPending(Permission.REVIEW_CAPACITY + 1)).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+      yield* rejectAll()
+      for (const fiber of fibers) yield* Fiber.await(fiber)
+      yield* Fiber.await(overflow)
+    }),
+  withReviewer("enforce"),
+  15_000,
+)
+
+it.effect("reviewer - retains built-in capacity until timed-out generation actually settles", () =>
+  Effect.gen(function* () {
+    const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
+    reviewerLanguage = new MockLanguageModelV3({
+      doStream: () => new Promise((resolve) => resolvers.push(resolve)),
+    })
+    const fibers = []
+    for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      fibers.push(
+        yield* reviewerAsk({
+          sessionID: SessionID.make(`session_settlement_${index}`),
+          permission: "bash",
+          patterns: ["reviewed-operation"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped),
+      )
+    }
+    while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+
+    yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
+    expect(yield* waitForPending(Permission.REVIEW_CAPACITY)).toHaveLength(Permission.REVIEW_CAPACITY)
+    const overflow = yield* reviewerAsk({
+      sessionID: SessionID.make("session_settlement_overflow"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 1) yield* Effect.yieldNow
+    expect(yield* list()).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+    expect(reviewerLanguage.doStreamCalls).toHaveLength(Permission.REVIEW_CAPACITY)
+
+    for (const resolve of resolvers) resolve(reviewerOutput("allow"))
+    while (
+      (yield* TestConsole.logLines).filter((line) => JSON.stringify(line).includes("permission review settled"))
+        .length < 4
+    ) {
+      yield* Effect.yieldNow
+    }
+    const afterSettlement = yield* reviewerAsk({
+      sessionID: SessionID.make("session_after_settlement"),
+      permission: "bash",
+      patterns: ["reviewed-operation"],
+      metadata: {},
+      always: [],
+      ruleset: [],
+    }).pipe(Effect.forkScoped)
+    while (resolvers.length === Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    resolvers.at(-1)!(reviewerOutput("allow"))
+    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 2) yield* Effect.yieldNow
+
+    yield* rejectAll()
+    for (const fiber of fibers) yield* Fiber.await(fiber)
+    yield* Fiber.await(overflow)
+    yield* Fiber.await(afterSettlement)
+  }).pipe(withTmpdirInstance<never, never>(withReviewer("enforce"))),
+)
+
+it.instance(
+  "reviewer - static allow and deny bypass Luna structurally",
+  () =>
+    Effect.gen(function* () {
+      let calls = 0
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          calls++
+          return reviewerOutput("deny")
+        },
+      })
+      yield* reviewerAsk({
+        sessionID: SessionID.make("session_static_allow"),
+        permission: "bash",
+        patterns: ["allowed"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "allow" }],
+      })
+      const denied = yield* fail(
+        reviewerAsk({
+          sessionID: SessionID.make("session_static_deny"),
+          permission: "bash",
+          patterns: ["denied"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "deny" }],
+        }),
+      )
+      expect(denied).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(calls).toBe(0)
+    }),
+  withReviewer("enforce"),
+  15_000,
 )

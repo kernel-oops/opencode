@@ -16,6 +16,56 @@ import { type ToolDefinition } from "./tool.js"
 
 export * from "./tool.js"
 
+export const PERMISSION_REVIEW_POLICY_VERSION = "1" as const
+
+export type PermissionReviewValue =
+  | null
+  | boolean
+  | number
+  | string
+  | PermissionReviewValue[]
+  | { [key: string]: PermissionReviewValue }
+
+export type PermissionReviewContext = {
+  policyVersion: typeof PERMISSION_REVIEW_POLICY_VERSION
+  reviewID: string
+  origin: "tool" | "doom_loop" | "unknown"
+  project: {
+    id: string
+    directory: string
+    worktree: string
+  }
+  session: {
+    parentID?: string
+    rootID?: string
+    lineage: string[]
+    complete: boolean
+    reason?: "missing_current" | "missing_ancestor" | "cycle"
+  }
+  agent?: {
+    name: string
+    mode: "subagent" | "primary" | "all"
+  }
+  model?: {
+    providerID: string
+    modelID: string
+  }
+  arguments?: PermissionReviewValue
+  rules: Array<{
+    pattern: string
+    action: "allow" | "deny" | "ask"
+    matched: {
+      permission: string
+      pattern: string
+      action: "allow" | "deny" | "ask"
+    }
+  }>
+}
+
+export type PermissionReviewInput = PermissionRequest & {
+  review: PermissionReviewContext
+}
+
 export type ProviderContext = {
   source: "env" | "config" | "custom" | "api"
   info: Provider
@@ -257,7 +307,7 @@ export interface Hooks {
     input: { sessionID: string; agent: string; model: Model; provider: ProviderContext; message: UserMessage },
     output: { headers: Record<string, string> },
   ) => Promise<void>
-  "permission.ask"?: (input: PermissionRequest, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
+  "permission.ask"?: (input: PermissionReviewInput, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
   "command.execute.before"?: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Part[] },
