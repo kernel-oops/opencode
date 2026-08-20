@@ -30,6 +30,7 @@ readonly PATCH_BRANCHES=(
   "reviewer-context-fix"
   "reviewer-stream-fix"
   "shell-classifier-fix"
+  "review-pipeline"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -40,6 +41,7 @@ readonly PATCH_IDS=(
   "b3238c230f1aa12173a58af1c1b90e81ed8eb3c5"
   "4b5e8f1cbbb0a9382f4153ce50df98567d55f82b"
   "eaeee8050336276bddf64d8a98cd5b6def379a3c"
+  "e18a0e461cc5c077ee40c04d34762eb9b6c74335"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -50,23 +52,32 @@ readonly PATCH_TIPS=(
   "48b090a66190d25a3eccdbd65d86060507d960a6"
   "03f9f95247d8dc118114d5d039b98c3e8257a868"
   "590ad2822dbd8a1eb517a2bbba9ea75ce48423de"
+  "97cb7f2f7ca1af615d417783c22871283054418d"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
+  "packages/core/test/effect/cross-spawn-spawner.test.ts"
   "packages/core/test/pty/activity.test.ts"
   "packages/opencode/test/effect/runtime-flags.test.ts"
   "packages/opencode/test/config/config.test.ts"
+  "packages/opencode/test/permission/admission.test.ts"
+  "packages/opencode/test/permission/advisory-gate.test.ts"
+  "packages/opencode/test/permission/bash-evaluator.test.ts"
   "packages/opencode/test/permission/next.test.ts"
+  "packages/opencode/test/permission/replay-oauth.test.ts"
   "packages/opencode/test/permission/reviewer-input.test.ts"
   "packages/opencode/test/permission/reviewer.test.ts"
   "packages/opencode/test/plugin/trigger.test.ts"
   "packages/opencode/test/project/instance.test.ts"
   "packages/opencode/test/server/httpapi-event.test.ts"
   "packages/opencode/test/server/httpapi-instance-context.test.ts"
+  "packages/opencode/test/server/httpapi-instance.test.ts"
+  "packages/opencode/test/server/httpapi-sdk.test.ts"
   "packages/opencode/test/server/instance-eviction.test.ts"
   "packages/opencode/test/server/project-init-git.test.ts"
   "packages/opencode/test/session/prompt.test.ts"
   "packages/opencode/test/tool/registry.test.ts"
+  "packages/opencode/test/tool/shell.test.ts"
 )
 
 summary() {
