@@ -137,7 +137,7 @@ function canonical(action: PermissionV1.ReviewAction | undefined) {
   const values = args as Record<string, unknown>
   if (typeof values.command !== "string" || typeof values.workdir !== "string" || values.workdir !== action.cwd) return
   if (typeof values.shell !== "string" || typeof values.timeout !== "number" || !Number.isFinite(values.timeout)) return
-  return { command: values.command, cwd: action.cwd }
+  return { tool: "bash", command: values.command, cwd: action.cwd }
 }
 
 interface PathComponent {
