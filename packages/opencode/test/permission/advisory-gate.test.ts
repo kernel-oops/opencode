@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
 import { isAdvisoryAllowCandidate } from "../../src/permission/advisory-gate"
+import { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "../../src/permission/obvious-risk-gate"
 
 const snapshot = {
   version: "1",
@@ -66,5 +67,53 @@ describe("permission review advisory gate", () => {
         }),
       ).toBe(false)
     }
+  })
+})
+
+describe("obvious-risk-only-v1 authoritative gate", () => {
+  const assessment = {
+    outcome: "allow" as const,
+    reason_code: "routine_or_low_impact" as const,
+    safer_alternative: "none" as const,
+  }
+
+  test("accepts settled lossless Bash tool actions despite bounded untrusted context", () => {
+    expect(isObviousRiskCandidate({ settled: true, permission: "bash", assessment, snapshot })).toBe(true)
+  })
+
+  test("keeps non-Bash, unsettled, lossy, unknown-cwd, and malformed semantic cases human", () => {
+    const cases = [
+      { settled: false },
+      { permission: "edit" },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, identity: "write" } } },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, origin: "doom_loop" as const } } },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, complete: false } } },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, omitted_items: 1 } } },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, omitted_bytes: 1 } } },
+      { snapshot: { ...snapshot, action: { ...snapshot.action, cwd: undefined, cwd_status: "unknown" as const } } },
+      {
+        assessment: {
+          outcome: "allow" as const,
+          reason_code: "destructive_or_irreversible" as const,
+          safer_alternative: "none" as const,
+        },
+      },
+    ]
+    for (const change of cases) {
+      expect(
+        isObviousRiskCandidate({
+          settled: "settled" in change && change.settled === false ? false : true,
+          permission: "permission" in change && change.permission ? change.permission : "bash",
+          assessment: "assessment" in change && change.assessment ? change.assessment : assessment,
+          snapshot: "snapshot" in change && change.snapshot ? change.snapshot : snapshot,
+        }),
+      ).toBe(false)
+    }
+  })
+
+  test("maps alternatives to fixed local feedback only", () => {
+    expect(obviousRiskRewriteFeedback("narrow_target")).toBe("Narrow the action to the smallest necessary target.")
+    expect(obviousRiskRewriteFeedback("request_specific_authorisation")).toBeUndefined()
+    expect(obviousRiskRewriteFeedback("none")).toBeUndefined()
   })
 })

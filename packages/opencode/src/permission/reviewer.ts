@@ -12,12 +12,24 @@ import {
   type AssessmentResult,
   type Decision,
   type Failure,
+  type ObviousRiskAssessment,
   type Review,
+  type ReviewerAssessment,
 } from "./reviewer-assessment"
 
 const REVIEW_TIMEOUT = "30 seconds"
-export { CAPACITY, type Assessment, type AssessmentResult, type Decision, type Failure, type Review }
+export {
+  CAPACITY,
+  type Assessment,
+  type AssessmentResult,
+  type Decision,
+  type Failure,
+  type ObviousRiskAssessment,
+  type Review,
+  type ReviewerAssessment,
+}
 export { isAdvisoryAllowCandidate } from "./advisory-gate"
+export { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "./obvious-risk-gate"
 export type Result = { decision: Decision } | { failure: Failure }
 
 export interface Input {
@@ -157,6 +169,7 @@ export const layer = Layer.effect(
               openaiOauth,
               openaiProvider: model.providerID === "openai",
               temperature: model.capabilities.temperature ? 0 : undefined,
+              policy: input.config.policy ?? "conservative-v1",
             }),
           )
         })
@@ -204,9 +217,12 @@ export const layer = Layer.effect(
         result: run.result.pipe(
           Effect.map((result): Result => {
             if ("failure" in result) return result
-            if (result.assessment.outcome === "allow" && (input.config.automatic_allow ?? "never") === "never")
+            if (input.config.mode !== "enforce") return { decision: "ask" }
+            if ((input.config.policy ?? "conservative-v1") === "obvious-risk-only-v1") {
               return { decision: "ask" }
-            return { decision: result.assessment.outcome }
+            }
+            if (result.assessment.outcome === "allow") return { decision: "ask" }
+            return { decision: result.assessment.outcome as Decision }
           }),
         ),
       }

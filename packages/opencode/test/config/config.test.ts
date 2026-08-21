@@ -2048,7 +2048,9 @@ test("permission_reviewer accepts only the strict configured shape", () => {
   expect(valid.permission_reviewer).toEqual({
     mode: "audit-only",
     model: "openai/gpt-5.6-luna-oauth",
+    policy: "conservative-v1",
     automatic_allow: "never",
+    automatic_rewrite: "never",
   })
 
   const policy = ConfigParse.schema(
@@ -2067,12 +2069,55 @@ test("permission_reviewer accepts only the strict configured shape", () => {
   )
   expect(policy.permission_reviewer?.automatic_allow).toBe("never")
 
+  const automatic = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({
+        permission_reviewer: {
+          mode: "enforce",
+          model: "openai/gpt-5.6-luna-oauth",
+          policy: "obvious-risk-only-v1",
+          automatic_allow: "policy-gated",
+          automatic_rewrite: "once-per-turn",
+        },
+      }),
+      source,
+    ),
+    source,
+  )
+  expect(automatic.permission_reviewer).toMatchObject({
+    policy: "obvious-risk-only-v1",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  })
+
   for (const permission_reviewer of [
     { mode: "audit", model: "openai/gpt-5.6-luna-oauth" },
     { mode: "enforce" },
     { model: "openai/gpt-5.6-luna-oauth" },
     { mode: "enforce", model: "" },
     { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_allow: "always" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", policy: "custom" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_rewrite: "always" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_allow: "policy-gated" },
+    {
+      mode: "enforce",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "conservative-v1",
+      automatic_rewrite: "once-per-turn",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "obvious-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "obvious-risk-only-v1",
+      automatic_rewrite: "once-per-turn",
+    },
   ]) {
     expect(() =>
       ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(JSON.stringify({ permission_reviewer }), source), source),

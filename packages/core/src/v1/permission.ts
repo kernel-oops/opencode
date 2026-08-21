@@ -18,6 +18,17 @@ export class CorrectedError extends Schema.TaggedErrorClass<CorrectedError>()("P
   }
 }
 
+export class PolicyCorrectionError extends Schema.TaggedErrorClass<PolicyCorrectionError>()(
+  "PermissionPolicyCorrectionError",
+  {
+    feedback: Schema.String,
+  },
+) {
+  override get message() {
+    return `The permission policy requires this tool call to be corrected before retrying: ${this.feedback}`
+  }
+}
+
 export class DeniedError extends Schema.TaggedErrorClass<DeniedError>()("PermissionDeniedError", {
   ruleset: Schema.Any,
 }) {
@@ -30,4 +41,4 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Per
   requestID: ID,
 }) {}
 
-export type Error = DeniedError | RejectedError | CorrectedError
+export type Error = DeniedError | RejectedError | CorrectedError | PolicyCorrectionError

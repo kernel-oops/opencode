@@ -1287,6 +1287,7 @@ const layer = Layer.effect(
             yield* permission.captureTurn({
               sessionID,
               rootSessionID: reviewLineage.rootID ?? sessionID,
+              turnID: lastUser.id,
               trusted: storedHuman,
               untrusted: [
                 ...configuredContext,

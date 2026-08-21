@@ -1884,7 +1884,9 @@ export type LayoutConfig = "auto" | "stretch"
 export type PermissionReviewerConfig = {
   mode: "audit-only" | "enforce"
   model: string
-  automatic_allow?: "never"
+  policy?: "conservative-v1" | "obvious-risk-only-v1"
+  automatic_allow?: "never" | "policy-gated"
+  automatic_rewrite?: "never" | "once-per-turn"
 }
 
 export type BashPermissionEvaluatorConfig =
