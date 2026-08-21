@@ -146,6 +146,15 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`permission_review_correction\` (
+          \`turn_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`fk_permission_review_correction_turn_id_message_id_fk\` FOREIGN KEY (\`turn_id\`) REFERENCES \`message\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_permission_review_correction_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_context_epoch\` (
           \`session_id\` text PRIMARY KEY,
           \`baseline\` text NOT NULL,
@@ -246,6 +255,9 @@ export default {
       )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`permission_review_correction_session_idx\` ON \`permission_review_correction\` (\`session_id\`);`,
+      )
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
       )

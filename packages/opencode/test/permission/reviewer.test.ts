@@ -91,6 +91,9 @@ function output(text: string, chunks = [text]) {
 const reviewText = (outcome: "allow" | "ask" | "deny", rationale = "bounded rationale") =>
   JSON.stringify({ risk_level: "low", user_authorization: "explicit", outcome, rationale })
 
+const obviousReviewText = () =>
+  JSON.stringify({ outcome: "allow", reason_code: "routine_or_low_impact", safer_alternative: "none" })
+
 function reset(text = reviewText("allow")) {
   resolved = ProviderTest.model({
     id: alias,
@@ -284,6 +287,65 @@ it.effect("exposes the strict assessment internally without weakening production
     expect(
       yield* reviewer.review({
         config: { ...config, mode: "audit-only" },
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("uses the fixed obvious-risk policy contract without exposing an ungated reviewer allow", () =>
+  Effect.gen(function* () {
+    reset(obviousReviewText())
+    const reviewer = yield* PermissionReviewer.Service
+    const obvious = {
+      mode: "enforce",
+      model: `openai/${alias}`,
+      policy: "obvious-risk-only-v1",
+      automatic_allow: "policy-gated",
+      automatic_rewrite: "never",
+    } as const
+    expect(
+      yield* reviewer.assess({
+        config: obvious,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({
+      assessment: { outcome: "allow", reason_code: "routine_or_low_impact", safer_alternative: "none" },
+    })
+    expect(language.doStreamCalls[0]?.providerOptions?.openai?.instructions).toContain(
+      "fixed obvious-risk-only-v1 profile",
+    )
+    expect(JSON.stringify(language.doStreamCalls[0]?.responseFormat)).not.toContain("rationale")
+
+    reset(obviousReviewText())
+    expect(
+      yield* reviewer.review({
+        config: obvious,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("keeps audit-only observational even if an unvalidated caller supplies automatic settings", () =>
+  Effect.gen(function* () {
+    reset(obviousReviewText())
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.review({
+        config: {
+          mode: "audit-only",
+          model: `openai/${alias}`,
+          policy: "obvious-risk-only-v1",
+          automatic_allow: "policy-gated",
+          automatic_rewrite: "once-per-turn",
+        },
         permission: "bash",
         origin: "tool",
         arguments: { command: "git status" },

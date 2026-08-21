@@ -300,6 +300,18 @@ describe("SessionPrompt input schemas", () => {
     expect(() => decode(bad)).toThrow()
   })
 
+  test("PromptInput cannot supply permission correction state", () => {
+    const decode = decodeUnknown(SessionPrompt.PromptInput)
+    const decoded = decode({
+      sessionID,
+      parts: [{ type: "text", text: "hello" }],
+      permissionReview: {
+        correctionUsed: { turnID: "msg_forged" },
+      },
+    })
+    expect(decoded).not.toHaveProperty("permissionReview")
+  })
+
   test("CommandInput round-trips core fields", () => {
     const decode = decodeUnknown(SessionPrompt.CommandInput)
     const expected = {

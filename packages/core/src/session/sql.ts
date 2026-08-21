@@ -79,6 +79,24 @@ export const MessageTable = sqliteTable(
   (table) => [index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id)],
 )
 
+export const PermissionReviewCorrectionTable = sqliteTable(
+  "permission_review_correction",
+  {
+    turn_id: text()
+      .$type<MessageID>()
+      .primaryKey()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    time_created: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [index("permission_review_correction_session_idx").on(table.session_id)],
+)
+
 export const PartTable = sqliteTable(
   "part",
   {

@@ -1,13 +1,18 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
+import { ConfigPermissionReviewerV1 } from "@opencode-ai/core/v1/config/permission-reviewer"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Scope } from "effect"
+import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Option, Scope } from "effect"
+import { and, eq } from "drizzle-orm"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { Database } from "@opencode-ai/core/database/database"
+import { MessageTable, PermissionReviewCorrectionTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Plugin } from "@/plugin"
 import { Session } from "@/session/session"
+import { MessageID } from "@/session/schema"
 import { Config } from "@/config/config"
 import {
   PERMISSION_REVIEW_POLICY_VERSION,
@@ -18,7 +23,7 @@ import { BashPermissionEvaluator } from "./bash-evaluator"
 import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
 import { InstanceRef } from "@/effect/instance-ref"
-import { buildPermissionReviewSnapshot, type EvidenceInput } from "./reviewer-input"
+import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type EvidenceInput } from "./reviewer-input"
 
 export const Event = PermissionV1.Event
 
@@ -27,8 +32,9 @@ export interface Interface {
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
   readonly captureTurn: (input: {
-    sessionID: string
-    rootSessionID: string
+    sessionID: PermissionV1.Request["sessionID"]
+    rootSessionID: PermissionV1.Request["sessionID"]
+    turnID: string
     trusted: readonly EvidenceInput[]
     untrusted: readonly EvidenceInput[]
     complete?: boolean
@@ -51,6 +57,12 @@ interface ActiveReviewerRun {
   readonly run: { abort: () => void }
 }
 
+type RewriteState =
+  | { readonly status: "available" }
+  | { readonly status: "claimed"; readonly token: number }
+  | { readonly status: "persisting"; readonly token: number }
+  | { readonly status: "used" }
+
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
   approved: PermissionV1.Rule[]
@@ -64,6 +76,10 @@ interface State {
     {
       trusted: EvidenceInput[]
       untrusted: EvidenceInput[]
+      rootSessionID: string
+      turnID: string
+      directPromptAdmission: boolean
+      rewrite: RewriteState
       trustedComplete: boolean
       untrustedComplete: boolean
       contextSafeForGate: boolean
@@ -75,6 +91,7 @@ const MAX_EVIDENCE_ITEMS = 64
 const MAX_EVIDENCE_BYTES = 8 * 1024
 const MAX_TRUSTED_EVIDENCE_BYTES = 40 * 1024
 const MAX_EVIDENCE_SESSIONS = 64
+let rewriteClaim = 0
 
 export const REVIEW_TIMEOUT = "30 seconds"
 export const REVIEW_CAPACITY = 4
@@ -83,13 +100,15 @@ type ReviewResult =
   | "allow"
   | "ask"
   | "deny"
+  | "rewrite"
+  | "human_review"
   | "timeout"
   | "error"
   | "capacity"
   | "interrupted"
   | PermissionReviewer.Failure
 
-type BuiltinResult = PermissionReviewer.Result
+type BuiltinResult = PermissionReviewer.AssessmentResult
 
 function safeReviewString(value: string) {
   const result = safeReviewValue(value)
@@ -119,6 +138,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const reviewer = yield* PermissionReviewer.Service
     const bashEvaluator = yield* BashPermissionEvaluator.Service
+    const { db } = yield* Database.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         const scope = yield* Scope.Scope
@@ -201,13 +221,98 @@ const layer = Layer.effect(
       const current = yield* InstanceState.get(state)
       const trusted = boundedTrustedEvidence(input.trusted)
       const untrusted = boundedEvidence(input.untrusted)
+      const persisted = yield* sessions
+        .findMessage(input.sessionID, (message) => message.info.role === "user")
+        .pipe(Effect.catch(() => Effect.succeed(Option.none())))
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const marker = yield* db
+        .select({ turnID: PermissionReviewCorrectionTable.turn_id })
+        .from(PermissionReviewCorrectionTable)
+        .where(
+          and(
+            eq(PermissionReviewCorrectionTable.session_id, input.sessionID),
+            eq(PermissionReviewCorrectionTable.turn_id, MessageID.make(input.turnID)),
+          ),
+        )
+        .get()
+        .pipe(Effect.exit)
+      const markerHealthy = Exit.isSuccess(marker)
+      const correctionUsed = markerHealthy && marker.value !== undefined
+      const directPromptAdmission =
+        markerHealthy &&
+        session !== undefined &&
+        session.parentID === undefined &&
+        input.rootSessionID === input.sessionID &&
+        Option.isSome(persisted) &&
+        persisted.value.info.role === "user" &&
+        persisted.value.info.id === input.turnID &&
+        persisted.value.info.sessionID === input.sessionID &&
+        validPermissionReviewAdmission(persisted.value.info.permissionReview?.admission)
+      const previous = current.turns.get(input.sessionID)
+      const rewrite: RewriteState =
+        !markerHealthy || correctionUsed
+          ? { status: "used" }
+          : previous?.turnID === input.turnID
+            ? previous.rewrite
+            : { status: "available" }
       remember(current.turns, input.sessionID, {
         trusted: trusted.items,
         untrusted: untrusted.items,
+        rootSessionID: input.rootSessionID,
+        turnID: input.turnID,
+        directPromptAdmission,
+        rewrite,
         trustedComplete: (input.complete ?? true) && trusted.complete,
         untrustedComplete: false,
         contextSafeForGate: input.contextSafeForGate === true,
       })
+    })
+
+    const persistCorrection = Effect.fn("Permission.persistCorrection")(function* (input: {
+      sessionID: PermissionV1.Request["sessionID"]
+      turnID: string
+    }) {
+      const turnID = MessageID.make(input.turnID)
+      return yield* db.transaction((tx) =>
+        Effect.gen(function* () {
+          const session = yield* tx
+            .select({ id: SessionTable.id, parentID: SessionTable.parent_id })
+            .from(SessionTable)
+            .where(eq(SessionTable.id, input.sessionID))
+            .get()
+          if (!session || session.parentID !== null) return "invalid" as const
+
+          const message = yield* tx
+            .select({ data: MessageTable.data })
+            .from(MessageTable)
+            .where(and(eq(MessageTable.id, turnID), eq(MessageTable.session_id, input.sessionID)))
+            .get()
+          const data: unknown = message?.data
+          const review =
+            data !== null && typeof data === "object" && !Array.isArray(data) && "permissionReview" in data
+              ? data.permissionReview
+              : undefined
+          const admission =
+            review !== null && typeof review === "object" && !Array.isArray(review) && "admission" in review
+              ? review.admission
+              : undefined
+          if (!message || message.data.role !== "user" || !validPermissionReviewAdmission(admission))
+            return "invalid" as const
+
+          const existing = yield* tx
+            .select({ turnID: PermissionReviewCorrectionTable.turn_id })
+            .from(PermissionReviewCorrectionTable)
+            .where(eq(PermissionReviewCorrectionTable.turn_id, turnID))
+            .get()
+          if (existing) return "used" as const
+
+          yield* tx
+            .insert(PermissionReviewCorrectionTable)
+            .values({ session_id: input.sessionID, turn_id: turnID })
+            .run()
+          return "inserted" as const
+        }),
+      )
     })
 
     const captureUntrusted: Interface["captureUntrusted"] = Effect.fn("Permission.captureUntrusted")(function* (input) {
@@ -245,26 +350,31 @@ const layer = Layer.effect(
       latencyMs: number
       fallbackToHuman: boolean
       reviewSettled: boolean
+      policy?: ConfigPermissionReviewerV1.Info["policy"]
+      assessment?: PermissionReviewer.ReviewerAssessment
+      dispositionAuthority?: "observational" | "automatic_allow" | "automatic_rewrite" | "deny" | "human" | "plugin"
     }) {
+      const assessment = input.assessment
+      const outcome =
+        assessment?.outcome ??
+        (["allow", "ask", "deny", "rewrite", "human_review"].includes(input.result) ? input.result : undefined)
+      if (input.source === "builtin") {
+        yield* Effect.logInfo("permission review", {
+          policy: input.policy,
+          outcome,
+          reasonCode: assessment && "reason_code" in assessment ? assessment.reason_code : undefined,
+          saferAlternative: assessment && "safer_alternative" in assessment ? assessment.safer_alternative : undefined,
+          failure: outcome === undefined ? input.result : undefined,
+          dispositionAuthority: input.dispositionAuthority ?? "human",
+          latencyMs: input.latencyMs,
+        })
+        return
+      }
       yield* Effect.logInfo("permission review", {
-        requestID: input.info.id,
-        reviewID: input.review.reviewID,
-        sessionID: input.info.sessionID,
-        parentSessionID: input.review.session.parentID,
-        rootSessionID: input.review.session.rootID,
-        projectID: input.review.project.id,
-        messageID: input.info.tool?.messageID,
-        callID: input.info.tool?.callID,
-        providerID: input.review.model?.providerID,
-        modelID: input.review.model?.modelID,
-        permission: input.info.permission,
-        origin: input.review.origin,
         source: input.source,
         result: input.result,
+        dispositionAuthority: input.dispositionAuthority ?? "human",
         latencyMs: input.latencyMs,
-        policyVersion: input.review.policyVersion,
-        fallbackToHuman: input.fallbackToHuman,
-        reviewSettled: input.reviewSettled,
       })
     })
 
@@ -334,6 +444,10 @@ const layer = Layer.effect(
       const turn = current.turns.get(info.sessionID) ?? {
         trusted: [],
         untrusted: [],
+        rootSessionID: "",
+        turnID: "",
+        directPromptAdmission: false,
+        rewrite: { status: "used" } as RewriteState,
         trustedComplete: false,
         untrustedComplete: false,
         contextSafeForGate: false,
@@ -381,6 +495,7 @@ const layer = Layer.effect(
       const started = yield* Clock.currentTimeMillis
       const deadline = started + 30_000
       let result: Exclude<ReviewResult, "interrupted">
+      let correctionFeedback: string | undefined
       const reserve = () => {
         if (current.reviews.size >= REVIEW_CAPACITY) return
         const lease: ReviewLease = { settled: false, completed: false }
@@ -424,7 +539,7 @@ const layer = Layer.effect(
       const prepareReviewer = (timeoutMs: number) =>
         Effect.uninterruptible(
           reviewer
-            .prepare({
+            .prepareAssessment({
               config: reviewerConfig!,
               permission: info.permission,
               origin: review.origin,
@@ -441,8 +556,6 @@ const layer = Layer.effect(
                     current.disposed
                       ? Effect.void
                       : Effect.logInfo("permission review settled", {
-                          requestID: info.id,
-                          reviewID: review.reviewID,
                           source: "builtin",
                           reviewSettled: true,
                         }),
@@ -535,14 +648,11 @@ const layer = Layer.effect(
             )
           : undefined
       const evaluatorResult = evaluator?.reviewResult
-      const evaluatorFallback =
-        evaluatorResult !== undefined && ("failure" in evaluatorResult || evaluatorResult.decision === "noop")
-      const evaluatorDisposition =
-        evaluatorResult && "decision" in evaluatorResult && evaluatorResult.decision === "allow" ? "allow" : "ask"
       const remaining = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
 
       const evaluatorEnforcing = evaluatorConfig?.mode === "enforce"
-      const needsReviewer = !evaluatorEnforcing || evaluatorFallback
+      const evaluatorDecision = evaluatorResult && "decision" in evaluatorResult ? evaluatorResult.decision : undefined
+      const needsReviewer = !evaluatorEnforcing || evaluatorDecision === "noop"
       if (reviewerConfig?.mode === "audit-only" && needsReviewer && remaining > 0) {
         yield* waitReviewer(remaining).pipe(
           Effect.flatMap(({ run, reviewResult }) =>
@@ -553,10 +663,13 @@ const layer = Layer.effect(
                 info,
                 review,
                 source: "builtin",
-                result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
+                result: "assessment" in reviewResult ? reviewResult.assessment.outcome : reviewResult.failure,
                 latencyMs,
                 fallbackToHuman: false,
                 reviewSettled: run.isSettled(),
+                policy: reviewerConfig.policy ?? "conservative-v1",
+                assessment: "assessment" in reviewResult ? reviewResult.assessment : undefined,
+                dispositionAuthority: "observational",
               })
             }),
           ),
@@ -573,121 +686,212 @@ const layer = Layer.effect(
                       latencyMs: now - started,
                       fallbackToHuman: false,
                       reviewSettled: false,
+                      policy: reviewerConfig.policy ?? "conservative-v1",
+                      dispositionAuthority: "observational",
                     }),
                   ),
                 ),
           ),
           Effect.forkIn(current.scope),
         )
+      }
 
-        const pluginResult = yield* pluginWait.pipe(
-          Effect.onInterrupt(() =>
-            prepared
-              ? Clock.currentTimeMillis.pipe(
-                  Effect.flatMap((now) =>
-                    audit({
-                      info,
-                      review,
-                      source: "plugin",
-                      result: "interrupted",
-                      latencyMs: now - started,
-                      fallbackToHuman: false,
-                      reviewSettled: pluginLease?.settled ?? true,
-                    }),
-                  ),
-                )
-              : Effect.void,
-          ),
-        )
-        const latencyMs = (yield* Clock.currentTimeMillis) - started
-        if (pluginResult === "error") {
-          yield* Effect.logError("permission ask plugin failed or returned invalid status", {
-            requestID: info.id,
-            reviewID: review.reviewID,
-          })
-        }
+      const reviewerWait: Effect.Effect<
+        { run: PermissionReviewer.AssessmentRun; reviewResult: BuiltinResult } | undefined
+      > =
+        reviewerConfig?.mode === "enforce" && needsReviewer && remaining > 0
+          ? waitReviewer(remaining)
+          : Effect.succeed(undefined)
+      const [pluginResult, builtin] = yield* Effect.all([pluginWait, reviewerWait] as const, {
+        concurrency: "unbounded",
+      }).pipe(
+        Effect.onInterrupt(() =>
+          Effect.gen(function* () {
+            const latencyMs = (yield* Clock.currentTimeMillis) - started
+            if (prepared) {
+              yield* audit({
+                info,
+                review,
+                source: "plugin",
+                result: "interrupted",
+                latencyMs,
+                fallbackToHuman: false,
+                reviewSettled: pluginLease?.settled ?? true,
+                dispositionAuthority: "human",
+              })
+            }
+          }),
+        ),
+      )
+      const builtinResult = builtin?.reviewResult
+      const pluginPermits = pluginResult === undefined || pluginResult === "allow"
+      const evaluatorPermits = !evaluatorEnforcing || evaluatorDecision === "allow" || evaluatorDecision === "noop"
+      const otherSourcesPermit = pluginPermits && evaluatorPermits
+      const obviousRiskConfig =
+        reviewerConfig?.mode === "enforce" && (reviewerConfig.policy ?? "conservative-v1") === "obvious-risk-only-v1"
+      const obviousRiskAssessment =
+        builtinResult && "assessment" in builtinResult && "reason_code" in builtinResult.assessment
+          ? builtinResult.assessment
+          : undefined
+      const obviousRiskCandidate =
+        obviousRiskConfig &&
+        obviousRiskAssessment !== undefined &&
+        PermissionReviewer.isObviousRiskCandidate({
+          settled: builtin?.run.isSettled() ?? false,
+          permission: info.permission,
+          assessment: obviousRiskAssessment,
+          snapshot,
+        })
+
+      if (pluginResult === "deny") result = "deny"
+      else if (evaluatorEnforcing && evaluatorDecision === "deny") result = "deny"
+      else if (pluginResult === "ask") result = "ask"
+      else if (evaluatorEnforcing && !evaluatorPermits) result = "ask"
+      else if (builtinResult && "failure" in builtinResult) result = "ask"
+      else if (obviousRiskAssessment) {
+        if (
+          obviousRiskAssessment.outcome === "allow" &&
+          reviewerConfig?.automatic_allow === "policy-gated" &&
+          obviousRiskCandidate &&
+          otherSourcesPermit
+        ) {
+          result = "allow"
+        } else if (
+          obviousRiskAssessment.outcome === "rewrite" &&
+          reviewerConfig?.automatic_rewrite === "once-per-turn" &&
+          obviousRiskCandidate &&
+          otherSourcesPermit &&
+          turn.rootSessionID === info.sessionID &&
+          turn.directPromptAdmission &&
+          turn.turnID.length > 0 &&
+          turn.rewrite.status === "available"
+        ) {
+          correctionFeedback = PermissionReviewer.obviousRiskRewriteFeedback(obviousRiskAssessment.safer_alternative)
+          result = correctionFeedback ? "rewrite" : "ask"
+        } else result = "ask"
+      } else if (builtinResult && "assessment" in builtinResult) {
+        result = builtinResult.assessment.outcome === "deny" ? "deny" : "ask"
+      } else if (evaluatorEnforcing && evaluatorDecision === "allow" && pluginPermits) result = "allow"
+      else if (reviewerConfig?.mode !== "enforce" && !evaluatorEnforcing && pluginResult === "allow") result = "allow"
+      else result = "ask"
+
+      const latencyMs = (yield* Clock.currentTimeMillis) - started
+      if (pluginResult === "error") {
+        yield* Effect.logError("permission ask plugin failed or returned invalid status")
+      }
+      if (pluginResult) {
         yield* audit({
           info,
           review,
           source: "plugin",
-          result: pluginResult ?? "ask",
+          result: pluginResult,
           latencyMs,
-          fallbackToHuman:
-            pluginResult === undefined ||
-            pluginResult === "ask" ||
-            pluginResult === "timeout" ||
-            pluginResult === "error" ||
-            pluginResult === "capacity",
+          fallbackToHuman: pluginResult !== "allow" && pluginResult !== "deny",
           reviewSettled: pluginLease?.settled ?? true,
+          dispositionAuthority: result === "deny" ? "deny" : result === "allow" ? "plugin" : "human",
         })
-        result = evaluatorFallback ? (pluginResult === "deny" ? "deny" : "ask") : (pluginResult ?? "ask")
-      } else {
-        const reviewerWait: Effect.Effect<{ run: PermissionReviewer.Run; reviewResult: BuiltinResult } | undefined> =
-          reviewerConfig?.mode === "enforce" && needsReviewer && remaining > 0
-            ? waitReviewer(remaining)
-            : Effect.succeed(undefined)
-        const completed = yield* Effect.all([pluginWait, reviewerWait] as const, { concurrency: "unbounded" }).pipe(
-          Effect.onInterrupt(() =>
-            Effect.gen(function* () {
-              const latencyMs = (yield* Clock.currentTimeMillis) - started
-              if (prepared) {
-                yield* audit({
-                  info,
-                  review,
-                  source: "plugin",
-                  result: "interrupted",
-                  latencyMs,
-                  fallbackToHuman: false,
-                  reviewSettled: pluginLease?.settled ?? true,
+      }
+      if (builtinResult && result !== "rewrite") {
+        yield* audit({
+          info,
+          review,
+          source: "builtin",
+          result: "assessment" in builtinResult ? builtinResult.assessment.outcome : builtinResult.failure,
+          latencyMs,
+          fallbackToHuman: result === "ask",
+          reviewSettled: builtin?.run.isSettled() ?? true,
+          policy: reviewerConfig?.policy ?? "conservative-v1",
+          assessment: "assessment" in builtinResult ? builtinResult.assessment : undefined,
+          dispositionAuthority: result === "allow" ? "automatic_allow" : result === "deny" ? "deny" : "human",
+        })
+      }
+
+      if (result === "allow") return
+      if (result === "rewrite" && correctionFeedback) {
+        const token = yield* Effect.sync(() => {
+          const active = current.turns.get(info.sessionID)
+          if (active?.turnID !== turn.turnID || !active.directPromptAdmission || active.rewrite.status !== "available")
+            return undefined
+          const token = ++rewriteClaim
+          active.rewrite = { status: "claimed", token }
+          return token
+        })
+        if (token !== undefined) {
+          yield* Effect.gen(function* () {
+            if (builtinResult) {
+              yield* audit({
+                info,
+                review,
+                source: "builtin",
+                result: "assessment" in builtinResult ? builtinResult.assessment.outcome : builtinResult.failure,
+                latencyMs,
+                fallbackToHuman: false,
+                reviewSettled: builtin?.run.isSettled() ?? true,
+                policy: reviewerConfig?.policy ?? "conservative-v1",
+                assessment: "assessment" in builtinResult ? builtinResult.assessment : undefined,
+                dispositionAuthority: "automatic_rewrite",
+              })
+            }
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                const claimed = yield* Effect.sync(() => {
+                  const active = current.turns.get(info.sessionID)
+                  if (
+                    active?.turnID !== turn.turnID ||
+                    !active.directPromptAdmission ||
+                    active.rewrite.status !== "claimed" ||
+                    active.rewrite.token !== token
+                  )
+                    return false
+                  active.rewrite = { status: "persisting", token }
+                  return true
                 })
-              }
-            }),
-          ),
-        )
-        const [pluginResult, builtin] = completed
-        const builtinResult = builtin?.reviewResult
-        const latencyMs = (yield* Clock.currentTimeMillis) - started
-        if (pluginResult === "error") {
-          yield* Effect.logError("permission ask plugin failed or returned invalid status", {
-            requestID: info.id,
-            reviewID: review.reviewID,
-          })
+                if (!claimed) return false
+                const persisted = yield* persistCorrection({ sessionID: info.sessionID, turnID: turn.turnID }).pipe(
+                  Effect.exit,
+                )
+                yield* Effect.sync(() => {
+                  const active = current.turns.get(info.sessionID)
+                  if (
+                    active?.turnID === turn.turnID &&
+                    active.rewrite.status === "persisting" &&
+                    active.rewrite.token === token
+                  )
+                    active.rewrite = { status: "used" }
+                })
+                if (Exit.isFailure(persisted) || persisted.value !== "inserted") return false
+                return yield* new PermissionV1.PolicyCorrectionError({ feedback: correctionFeedback })
+              }),
+            )
+          }).pipe(
+            Effect.onExit(() =>
+              Effect.sync(() => {
+                const active = current.turns.get(info.sessionID)
+                if (active?.turnID !== turn.turnID) return
+                if (active.rewrite.status === "claimed" && active.rewrite.token === token)
+                  active.rewrite = { status: "available" }
+                if (active.rewrite.status === "persisting" && active.rewrite.token === token)
+                  active.rewrite = { status: "used" }
+              }),
+            ),
+          )
         }
-        if (pluginResult) {
-          yield* audit({
-            info,
-            review,
-            source: "plugin",
-            result: pluginResult,
-            latencyMs,
-            fallbackToHuman: pluginResult !== "allow" && pluginResult !== "deny",
-            reviewSettled: pluginLease?.settled ?? true,
-          })
-        }
+        result = "ask"
         if (builtinResult) {
           yield* audit({
             info,
             review,
             source: "builtin",
-            result: "decision" in builtinResult ? builtinResult.decision : builtinResult.failure,
+            result: "assessment" in builtinResult ? builtinResult.assessment.outcome : builtinResult.failure,
             latencyMs,
-            fallbackToHuman: !("decision" in builtinResult) || builtinResult.decision === "ask",
+            fallbackToHuman: true,
             reviewSettled: builtin?.run.isSettled() ?? true,
+            policy: reviewerConfig?.policy ?? "conservative-v1",
+            assessment: "assessment" in builtinResult ? builtinResult.assessment : undefined,
+            dispositionAuthority: "human",
           })
         }
-
-        const enforcing = [
-          ...(pluginResult ? [pluginResult] : []),
-          ...(builtinResult ? ["decision" in builtinResult ? builtinResult.decision : "ask"] : []),
-          ...(evaluatorEnforcing && !evaluatorFallback ? [evaluatorDisposition] : []),
-          ...(evaluatorFallback && (!reviewerConfig || remaining === 0) ? (["ask"] as const) : []),
-        ]
-        if (enforcing.includes("deny")) result = "deny"
-        else if (enforcing.length > 0 && enforcing.every((item) => item === "allow")) result = "allow"
-        else result = "ask"
       }
-
-      if (result === "allow") return
       if (result === "deny") {
         return yield* new PermissionV1.DeniedError({
           ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
@@ -824,6 +1028,7 @@ export const node = LayerNode.make({
     Config.node,
     PermissionReviewer.node,
     BashPermissionEvaluator.node,
+    Database.node,
   ],
 })
 

@@ -46,7 +46,7 @@ export type SnapshotInput = {
   contextSafeForGate?: boolean
 }
 
-function validAdmission(value: unknown): value is SessionV1.PermissionReviewAdmission {
+export function validPermissionReviewAdmission(value: unknown): value is SessionV1.PermissionReviewAdmission {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const admission = value as Partial<SessionV1.PermissionReviewAdmission>
   return (
@@ -85,7 +85,7 @@ export function transcriptEvidence(
     if (message.info.summary) complete = false
     if (message.info.role === "user") {
       const record = message.info.permissionReview?.admission
-      if (!child && includeAdmission && provenanceKnown && validAdmission(record)) {
+      if (!child && includeAdmission && provenanceKnown && validPermissionReviewAdmission(record)) {
         admitted += 1
         for (const text of record.text) if (text) items.push({ source: "human", text })
         if (!record.complete) complete = false
