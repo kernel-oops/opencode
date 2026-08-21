@@ -31,6 +31,7 @@ readonly PATCH_BRANCHES=(
   "reviewer-stream-fix"
   "shell-classifier-fix"
   "review-pipeline"
+  "evaluator-contract-fix"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -42,6 +43,7 @@ readonly PATCH_IDS=(
   "4b5e8f1cbbb0a9382f4153ce50df98567d55f82b"
   "eaeee8050336276bddf64d8a98cd5b6def379a3c"
   "e18a0e461cc5c077ee40c04d34762eb9b6c74335"
+  "8e6ab9b0a308c9bb5b5153c7af8124b89e782531"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -53,6 +55,7 @@ readonly PATCH_TIPS=(
   "03f9f95247d8dc118114d5d039b98c3e8257a868"
   "590ad2822dbd8a1eb517a2bbba9ea75ce48423de"
   "97cb7f2f7ca1af615d417783c22871283054418d"
+  "fa8ff68b0328497d88399b79a7ea7712dfb8ff70"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
