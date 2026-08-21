@@ -32,6 +32,7 @@ readonly PATCH_BRANCHES=(
   "shell-classifier-fix"
   "review-pipeline"
   "evaluator-contract-fix"
+  "luna-policy-gate"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -44,6 +45,7 @@ readonly PATCH_IDS=(
   "eaeee8050336276bddf64d8a98cd5b6def379a3c"
   "e18a0e461cc5c077ee40c04d34762eb9b6c74335"
   "8e6ab9b0a308c9bb5b5153c7af8124b89e782531"
+  "05b11db331352eaab7c178fc91af52a4114ebf5b"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -56,6 +58,7 @@ readonly PATCH_TIPS=(
   "590ad2822dbd8a1eb517a2bbba9ea75ce48423de"
   "97cb7f2f7ca1af615d417783c22871283054418d"
   "fa8ff68b0328497d88399b79a7ea7712dfb8ff70"
+  "7c4ff70252edd64b036f0285e8cb64bbab76fd32"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
@@ -67,6 +70,7 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/permission/advisory-gate.test.ts"
   "packages/opencode/test/permission/bash-evaluator.test.ts"
   "packages/opencode/test/permission/next.test.ts"
+  "packages/opencode/test/permission/obvious-risk-policy.test.ts"
   "packages/opencode/test/permission/replay-oauth.test.ts"
   "packages/opencode/test/permission/reviewer-input.test.ts"
   "packages/opencode/test/permission/reviewer.test.ts"
@@ -79,6 +83,7 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/server/instance-eviction.test.ts"
   "packages/opencode/test/server/project-init-git.test.ts"
   "packages/opencode/test/session/prompt.test.ts"
+  "packages/opencode/test/session/schema-decoding.test.ts"
   "packages/opencode/test/tool/registry.test.ts"
   "packages/opencode/test/tool/shell.test.ts"
 )
