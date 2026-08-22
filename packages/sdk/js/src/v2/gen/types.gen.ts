@@ -236,6 +236,12 @@ export type OutputFormatJsonSchema = {
 
 export type OutputFormat = OutputFormatText | OutputFormatJsonSchema
 
+export type PermissionReviewAdmission = {
+  version: 1
+  text: Array<string>
+  complete: boolean
+}
+
 export type UserMessage = {
   id: string
   sessionID: string
@@ -258,6 +264,9 @@ export type UserMessage = {
   system?: string
   tools?: {
     [key: string]: boolean
+  }
+  permissionReview?: {
+    admission: PermissionReviewAdmission
   }
 }
 
@@ -1875,7 +1884,51 @@ export type LayoutConfig = "auto" | "stretch"
 export type PermissionReviewerConfig = {
   mode: "audit-only" | "enforce"
   model: string
+  policy?: "conservative-v1" | "obvious-risk-only-v1"
+  automatic_allow?: "never" | "policy-gated"
+  automatic_rewrite?: "never" | "once-per-turn"
 }
+
+export type BashPermissionEvaluatorConfig =
+  | {
+      mode: "disabled"
+    }
+  | {
+      mode: "audit-only"
+      executable: string
+      policy: string
+      executable_sha256: string
+      policy_sha256: string
+      expected: {
+        implementation: string
+        version: string
+        commit: string
+        protocol: string
+        platform: string
+      }
+      timeout_seconds?: number
+      capacity?: number
+      max_input_bytes?: number
+      max_output_bytes?: number
+    }
+  | {
+      mode: "enforce"
+      executable: string
+      policy: string
+      executable_sha256: string
+      policy_sha256: string
+      expected: {
+        implementation: string
+        version: string
+        commit: string
+        protocol: string
+        platform: string
+      }
+      timeout_seconds?: number
+      capacity?: number
+      max_input_bytes?: number
+      max_output_bytes?: number
+    }
 
 export type ImageAttachmentConfig = {
   auto_resize?: boolean
@@ -2006,6 +2059,7 @@ export type Config = {
   layout?: LayoutConfig
   permission?: PermissionConfig
   permission_reviewer?: PermissionReviewerConfig
+  bash_permission_evaluator?: BashPermissionEvaluatorConfig
   tools?: {
     [key: string]: boolean
   }

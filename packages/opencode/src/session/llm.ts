@@ -111,6 +111,12 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      if (prepared.permissionReviewPluginSystem) {
+        yield* perm.captureUntrusted({
+          sessionID: input.sessionID,
+          evidence: [{ source: "plugin", text: prepared.permissionReviewPluginSystem }],
+        })
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system

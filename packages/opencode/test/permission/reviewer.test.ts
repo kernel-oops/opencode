@@ -24,6 +24,7 @@ let modelResolution: Promise<typeof resolved> | undefined
 let failModelLookup = false
 let requireRuntimeMarker = false
 let failAuth = false
+let oauth = true
 const modelRequests: Array<readonly [string, string]> = []
 const RuntimeMarker = Context.Reference<string>("@test/PermissionReviewerRuntimeMarker", {
   defaultValue: () => "missing",
@@ -52,7 +53,11 @@ const auth = Layer.succeed(
     get: () =>
       failAuth
         ? Effect.fail(new Auth.AuthError({ message: "raw auth failure secret" }))
-        : Effect.succeed({ type: "oauth", refresh: "test", access: "test", expires: Date.now() + 60_000 } as const),
+        : Effect.succeed(
+            oauth
+              ? ({ type: "oauth", refresh: "test", access: "test", expires: Date.now() + 60_000 } as const)
+              : undefined,
+          ),
     all: () => Effect.succeed({}),
     set: () => Effect.void,
     remove: () => Effect.void,
@@ -83,7 +88,13 @@ function output(text: string, chunks = [text]) {
   }
 }
 
-function reset(text = '{"decision":"allow"}') {
+const reviewText = (outcome: "allow" | "ask" | "deny", rationale = "bounded rationale") =>
+  JSON.stringify({ risk_level: "low", user_authorization: "explicit", outcome, rationale })
+
+const obviousReviewText = () =>
+  JSON.stringify({ outcome: "allow", reason_code: "routine_or_low_impact", safer_alternative: "none" })
+
+function reset(text = reviewText("allow")) {
   resolved = ProviderTest.model({
     id: alias,
     api: { id: "gpt-5.6-luna", url: "https://example.com", npm: "@ai-sdk/openai" },
@@ -99,6 +110,7 @@ function reset(text = '{"decision":"allow"}') {
   failModelLookup = false
   requireRuntimeMarker = false
   failAuth = false
+  oauth = true
   modelRequests.length = 0
 }
 
@@ -130,8 +142,25 @@ it.effect("accepts the configured Luna alias and makes one isolated tool-less OA
     expect(call.prompt).toHaveLength(1)
     expect(call.prompt[0]?.role).toBe("user")
     expect(call.responseFormat).toMatchObject({ type: "json" })
+    expect(JSON.stringify(call.responseFormat)).not.toContain("maxLength")
     expect(call.providerOptions?.openai).toMatchObject({ reasoningEffort: "low", store: false })
     expect(call.providerOptions?.openai?.instructions).toContain("isolated permission reviewer")
+  }),
+)
+
+it.effect("disables storage for non-OAuth OpenAI requests", () =>
+  Effect.gen(function* () {
+    reset()
+    oauth = false
+    language = new MockLanguageModelV3({ doStream: () => Promise.resolve(output(reviewText("ask"))) })
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } }),
+    ).toEqual({ decision: "ask" })
+
+    const call = language.doStreamCalls[0]!
+    expect(call.maxOutputTokens).toBe(256)
+    expect(call.providerOptions?.openai).toEqual({ store: false })
   }),
 )
 
@@ -148,7 +177,7 @@ it.effect("shapes a valid streaming structured OpenAI Responses request at the a
             {
               type: "response.output_text.delta",
               item_id: "review",
-              delta: '{"decision":"ask"}',
+              delta: reviewText("ask"),
             },
             {
               type: "response.completed",
@@ -171,8 +200,13 @@ it.effect("shapes a valid streaming structured OpenAI Responses request at the a
         { preconnect: fetch.preconnect },
       ),
     })
-    const decision = Schema.Struct({ decision: Schema.Literals(["allow", "ask", "deny"]) })
-    const schema = Object.assign(Schema.toStandardSchemaV1(decision), Schema.toStandardJSONSchemaV1(decision))
+    const review = Schema.Struct({
+      risk_level: Schema.Literals(["low", "medium", "high", "critical"]),
+      user_authorization: Schema.Literals(["explicit", "implicit", "none", "conflicting"]),
+      outcome: Schema.Literals(["allow", "ask", "deny"]),
+      rationale: Schema.String,
+    })
+    const schema = Object.assign(Schema.toStandardSchemaV1(review), Schema.toStandardJSONSchemaV1(review))
     const result = streamText({
       model: openai.responses("gpt-5.6-luna"),
       messages: [{ role: "user", content: "fixed untrusted data wrapper" }],
@@ -187,7 +221,7 @@ it.effect("shapes a valid streaming structured OpenAI Responses request at the a
       if (chunk.type === "text-delta") text += chunk.text
     }
 
-    expect(text).toBe('{"decision":"ask"}')
+    expect(text).toBe(reviewText("ask"))
     expect(requestBody).toMatchObject({
       model: "gpt-5.6-luna",
       stream: true,
@@ -201,7 +235,7 @@ it.effect("shapes a valid streaming structured OpenAI Responses request at the a
   }),
 )
 
-it.effect("does not auto-allow a shell operation whose redacted semantics are not fully classified", () =>
+it.effect("preserves exact action semantics in the isolated snapshot", () =>
   Effect.gen(function* () {
     reset()
     const reviewer = yield* PermissionReviewer.Service
@@ -214,12 +248,12 @@ it.effect("does not auto-allow a shell operation whose redacted semantics are no
       }),
     ).toEqual({ decision: "ask" })
     expect(language.doStreamCalls).toHaveLength(1)
-    expect(promptText(0)).not.toContain("alice")
-    expect(promptText(0)).not.toContain("private-script")
+    expect(promptText(0)).toContain("alice")
+    expect(promptText(0)).toContain("private-script")
   }),
 )
 
-it.effect("preserves Luna's proposed allow for audit-only observation", () =>
+it.effect("maps Luna allow to ask even in audit-only mode", () =>
   Effect.gen(function* () {
     reset()
     const reviewer = yield* PermissionReviewer.Service
@@ -230,7 +264,93 @@ it.effect("preserves Luna's proposed allow for audit-only observation", () =>
         origin: "tool",
         arguments: { command: "git status" },
       }),
-    ).toEqual({ decision: "allow" })
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("exposes the strict assessment internally without weakening production allow gating", () =>
+  Effect.gen(function* () {
+    reset()
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.assess({
+        config: { ...config, mode: "audit-only" },
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({
+      assessment: { risk_level: "low", user_authorization: "explicit", outcome: "allow" },
+    })
+
+    reset()
+    expect(
+      yield* reviewer.review({
+        config: { ...config, mode: "audit-only" },
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("uses the fixed obvious-risk policy contract without exposing an ungated reviewer allow", () =>
+  Effect.gen(function* () {
+    reset(obviousReviewText())
+    const reviewer = yield* PermissionReviewer.Service
+    const obvious = {
+      mode: "enforce",
+      model: `openai/${alias}`,
+      policy: "obvious-risk-only-v1",
+      automatic_allow: "policy-gated",
+      automatic_rewrite: "never",
+    } as const
+    expect(
+      yield* reviewer.assess({
+        config: obvious,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({
+      assessment: { outcome: "allow", reason_code: "routine_or_low_impact", safer_alternative: "none" },
+    })
+    expect(language.doStreamCalls[0]?.providerOptions?.openai?.instructions).toContain(
+      "fixed obvious-risk-only-v1 profile",
+    )
+    expect(JSON.stringify(language.doStreamCalls[0]?.responseFormat)).not.toContain("rationale")
+
+    reset(obviousReviewText())
+    expect(
+      yield* reviewer.review({
+        config: obvious,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("keeps audit-only observational even if an unvalidated caller supplies automatic settings", () =>
+  Effect.gen(function* () {
+    reset(obviousReviewText())
+    const reviewer = yield* PermissionReviewer.Service
+    expect(
+      yield* reviewer.review({
+        config: {
+          mode: "audit-only",
+          model: `openai/${alias}`,
+          policy: "obvious-risk-only-v1",
+          automatic_allow: "policy-gated",
+          automatic_rewrite: "once-per-turn",
+        },
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
   }),
 )
 
@@ -274,15 +394,18 @@ it.effect("preserves instance references in supervised reviewer work", () =>
   }),
 )
 
-it.effect("strictly rejects malformed decisions and extra keys", () =>
+it.effect("strictly rejects malformed structured reviews and extra keys", () =>
   Effect.gen(function* () {
     const reviewer = yield* PermissionReviewer.Service
     for (const text of [
       "",
       '{"decision":"approve"}',
       '{"decision":"allow","rationale":"safe"}',
-      '{"decision":"deny","decision":"allow"}',
-      '```json {"decision":"allow"} ```',
+      '{"risk_level":"low","user_authorization":"explicit","outcome":"allow","rationale":"safe","extra":true}',
+      '{"risk_level":"unknown","user_authorization":"explicit","outcome":"allow","rationale":"safe"}',
+      '{"risk_level":"low","user_authorization":"explicit","outcome":"allow","rationale":"line one\\nline two"}',
+      reviewText("allow", "x".repeat(513)),
+      '```json {"risk_level":"low","user_authorization":"explicit","outcome":"allow","rationale":"safe"} ```',
     ]) {
       reset(text)
       const result = yield* reviewer.review({
@@ -294,7 +417,7 @@ it.effect("strictly rejects malformed decisions and extra keys", () =>
       expect("failure" in result).toBe(true)
     }
 
-    reset(`${" ".repeat(257)}{"decision":"allow"}`)
+    reset(`${" ".repeat(2_049)}${reviewText("allow")}`)
     expect(
       yield* reviewer.review({ config, permission: "bash", origin: "tool", arguments: { command: "git status" } }),
     ).toEqual({ failure: "size" })
@@ -313,7 +436,7 @@ it.effect("rejects unsupported reasoning output instead of ignoring it", () =>
               { type: "reasoning-delta" as const, id: "reasoning", delta: "hidden" },
               { type: "reasoning-end" as const, id: "reasoning" },
               { type: "text-start" as const, id: "review" },
-              { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+              { type: "text-delta" as const, id: "review", delta: reviewText("allow") },
               { type: "text-end" as const, id: "review" },
               { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
             ],
@@ -338,7 +461,7 @@ it.effect("accepts an empty reasoning envelope emitted by Responses reasoning mo
               { type: "reasoning-start" as const, id: "reasoning" },
               { type: "reasoning-end" as const, id: "reasoning" },
               { type: "text-start" as const, id: "review" },
-              { type: "text-delta" as const, id: "review", delta: '{"decision":"ask"}' },
+              { type: "text-delta" as const, id: "review", delta: reviewText("ask") },
               { type: "text-end" as const, id: "review" },
               { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
             ],
@@ -365,7 +488,7 @@ it.effect("rejects malformed empty reasoning envelopes", () =>
         { type: "reasoning-end" as const, id: "nested" },
         { type: "reasoning-end" as const, id: "reasoning" },
         { type: "text-start" as const, id: "review" },
-        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-delta" as const, id: "review", delta: reviewText("allow") },
         { type: "text-end" as const, id: "review" },
         { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
       ],
@@ -373,14 +496,14 @@ it.effect("rejects malformed empty reasoning envelopes", () =>
         { type: "reasoning-start" as const, id: "reasoning" },
         { type: "reasoning-end" as const, id: "different" },
         { type: "text-start" as const, id: "review" },
-        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-delta" as const, id: "review", delta: reviewText("allow") },
         { type: "text-end" as const, id: "review" },
         { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
       ],
       [
         { type: "reasoning-start" as const, id: "reasoning" },
         { type: "text-start" as const, id: "review" },
-        { type: "text-delta" as const, id: "review", delta: '{"decision":"allow"}' },
+        { type: "text-delta" as const, id: "review", delta: reviewText("allow") },
         { type: "text-end" as const, id: "review" },
         { type: "reasoning-end" as const, id: "reasoning" },
         { type: "finish" as const, finishReason: { unified: "stop" as const, raw: undefined }, usage },
@@ -404,14 +527,14 @@ it.effect("rejects malformed empty reasoning envelopes", () =>
   }),
 )
 
-it.effect("aborts and rejects as soon as streamed raw output exceeds 256 bytes", () =>
+it.effect("aborts and rejects as soon as streamed raw output exceeds 2 KiB", () =>
   Effect.gen(function* () {
     reset()
     let signal: AbortSignal | undefined
     language = new MockLanguageModelV3({
       doStream: (call) => {
         signal = call.abortSignal
-        return Promise.resolve(output("", ["x".repeat(200), "y".repeat(57), '{"decision":"allow"}']))
+        return Promise.resolve(output("", ["x".repeat(1_800), "y".repeat(249), reviewText("allow")]))
       },
     })
     const reviewer = yield* PermissionReviewer.Service
@@ -422,15 +545,10 @@ it.effect("aborts and rejects as soon as streamed raw output exceeds 256 bytes",
   }),
 )
 
-it.effect("rejects unclassifiable and oversized input before generation", () =>
+it.effect("bounds oversized input before generation", () =>
   Effect.gen(function* () {
     reset()
     const reviewer = yield* PermissionReviewer.Service
-    expect(
-      yield* reviewer.review({ config, permission: "edit", origin: "tool", arguments: { filePath: "/x" } }),
-    ).toEqual({
-      failure: "input",
-    })
     expect(
       yield* reviewer.review({
         config,
@@ -438,8 +556,10 @@ it.effect("rejects unclassifiable and oversized input before generation", () =>
         origin: "tool",
         arguments: { command: "x".repeat(256 * 1024 + 1) },
       }),
-    ).toEqual({ failure: "input" })
-    expect(language.doStreamCalls).toHaveLength(0)
+    ).toEqual({ decision: "ask" })
+    expect(language.doStreamCalls).toHaveLength(1)
+    expect(promptText(0)).toContain("[OMITTED]")
+    expect(Buffer.byteLength(promptText(0), "utf8")).toBeLessThan(100 * 1024)
   }),
 )
 
@@ -629,7 +749,7 @@ it.effect("retains settlement separately when generation ignores abort", () =>
     expect(signal.aborted).toBe(true)
     expect(run.isSettled()).toBe(false)
     expect(settled.pollUnsafe()).toBeUndefined()
-    resolveStream(output('{"decision":"allow"}'))
+    resolveStream(output(reviewText("allow")))
     yield* Fiber.join(settled)
     expect(run.isSettled()).toBe(true)
   }),
@@ -693,7 +813,7 @@ it.effect("keeps ignored-abort work globally bounded until actual native settlem
     expect(rejected.admitted).toBe(false)
     expect(yield* rejected.result).toEqual({ failure: "capacity" })
 
-    for (const resolve of resolvers) resolve(output('{"decision":"allow"}'))
+    for (const resolve of resolvers) resolve(output(reviewText("allow")))
     yield* Effect.all(runs.map((run) => run.settled))
     expect(runs.every((run) => run.isSettled())).toBe(true)
 
@@ -705,7 +825,7 @@ it.effect("keeps ignored-abort work globally bounded until actual native settlem
     })
     expect(admitted.admitted).toBe(true)
     while (resolvers.length < PermissionReviewer.CAPACITY + 1) yield* Effect.yieldNow
-    resolvers.at(-1)!(output('{"decision":"allow"}'))
+    resolvers.at(-1)!(output(reviewText("allow")))
     yield* admitted.result
   }),
 )
@@ -739,7 +859,7 @@ it.effect("aborts layer-owned work without falsely marking native settlement", (
     expect(signal.aborted).toBe(true)
     expect(run.isSettled()).toBe(false)
 
-    resolveStream(output('{"decision":"allow"}'))
+    resolveStream(output(reviewText("allow")))
     yield* run.settled
     expect(run.isSettled()).toBe(true)
   }),

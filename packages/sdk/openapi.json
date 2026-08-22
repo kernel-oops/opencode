@@ -15953,6 +15953,26 @@
           }
         ]
       },
+      "PermissionReviewAdmission": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "number",
+            "enum": [1]
+          },
+          "text": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "complete": {
+            "type": "boolean"
+          }
+        },
+        "required": ["version", "text", "complete"],
+        "additionalProperties": false
+      },
       "UserMessage": {
         "type": "object",
         "properties": {
@@ -16028,6 +16048,16 @@
             "additionalProperties": {
               "type": "boolean"
             }
+          },
+          "permissionReview": {
+            "type": "object",
+            "properties": {
+              "admission": {
+                "$ref": "#/components/schemas/PermissionReviewAdmission"
+              }
+            },
+            "required": ["admission"],
+            "additionalProperties": false
           }
         },
         "required": ["id", "sessionID", "role", "time", "agent", "model"],
@@ -21085,10 +21115,183 @@
           "model": {
             "type": "string",
             "minLength": 1
+          },
+          "policy": {
+            "type": "string",
+            "enum": ["conservative-v1", "obvious-risk-only-v1"]
+          },
+          "automatic_allow": {
+            "type": "string",
+            "enum": ["never", "policy-gated"]
+          },
+          "automatic_rewrite": {
+            "type": "string",
+            "enum": ["never", "once-per-turn"]
           }
         },
         "required": ["mode", "model"],
         "additionalProperties": false
+      },
+      "BashPermissionEvaluatorConfig": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["disabled"]
+              }
+            },
+            "required": ["mode"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["audit-only"]
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "policy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "executable_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "policy_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "expected": {
+                "type": "object",
+                "properties": {
+                  "implementation": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "commit": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "protocol": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "platform": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["implementation", "version", "commit", "protocol", "platform"],
+                "additionalProperties": false
+              },
+              "timeout_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 30
+              },
+              "capacity": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "max_input_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 262144
+              },
+              "max_output_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 4096
+              }
+            },
+            "required": ["mode", "executable", "policy", "executable_sha256", "policy_sha256", "expected"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["enforce"]
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "policy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "executable_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "policy_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "expected": {
+                "type": "object",
+                "properties": {
+                  "implementation": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "commit": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "protocol": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "platform": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["implementation", "version", "commit", "protocol", "platform"],
+                "additionalProperties": false
+              },
+              "timeout_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 30
+              },
+              "capacity": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "max_input_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 262144
+              },
+              "max_output_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 4096
+              }
+            },
+            "required": ["mode", "executable", "policy", "executable_sha256", "policy_sha256", "expected"],
+            "additionalProperties": false
+          }
+        ]
       },
       "ImageAttachmentConfig": {
         "type": "object",
@@ -21479,6 +21682,9 @@
           },
           "permission_reviewer": {
             "$ref": "#/components/schemas/PermissionReviewerConfig"
+          },
+          "bash_permission_evaluator": {
+            "$ref": "#/components/schemas/BashPermissionEvaluatorConfig"
           },
           "tools": {
             "type": "object",

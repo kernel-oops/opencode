@@ -6,6 +6,7 @@ import { ConfigExperimental } from "../../config/experimental"
 import { ConfigReference } from "../../config/reference"
 import { ConfigAgentV1 } from "./agent"
 import { ConfigAttachmentV1 } from "./attachment"
+import { ConfigBashPermissionEvaluatorV1 } from "./bash-permission-evaluator"
 import { ConfigCommandV1 } from "./command"
 import { ConfigFormatterV1 } from "./formatter"
 import { ConfigLayoutV1 } from "./layout"
@@ -129,6 +130,9 @@ export const Info = Schema.Struct({
   permission: Schema.optional(ConfigPermissionV1.Info),
   permission_reviewer: Schema.optional(ConfigPermissionReviewerV1.Info).annotate({
     description: "Built-in isolated permission reviewer configuration",
+  }),
+  bash_permission_evaluator: Schema.optional(ConfigBashPermissionEvaluatorV1.Info).annotate({
+    description: "External deterministic Bash permission evaluator configuration",
   }),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
   attachment: Schema.optional(ConfigAttachmentV1.Info).annotate({

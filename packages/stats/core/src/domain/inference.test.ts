@@ -24,6 +24,7 @@ describe("inference stat normalization", () => {
     expect(modelAuthor("kimi-k2.6")).toBe("moonshot")
     expect(modelAuthor("mimo-v2-omni")).toBe("xiaomi")
     expect(modelAuthor("minimax-m2.7")).toBe("minimax")
+    expect(modelAuthor("muse-spark-1.2-contributor")).toBe("meta")
     expect(modelAuthor("nemotron-3-super-free")).toBe("nvidia")
     expect(modelAuthor("qwen3.7-max")).toBe("qwen")
     expect(modelAuthor("alpha-gpt-next")).toBeUndefined()
@@ -38,6 +39,17 @@ describe("inference stat normalization", () => {
     expect(statProvider("big-pickle", "gpt-5", "opencode")).toBe("openai")
     expect(statProvider("big-pickle", "", "opencode")).toBe("unknown")
     expect(statProvider("unknown", "", "custom-provider")).toBe("custom-provider")
+  })
+
+  test("merges renamed models under their current name", () => {
+    expect(statModel("x-preview-f", "")).toBe("ox-alpha")
+    expect(statModel("xiaomi/mimo-v2.5", "")).toBe("mimo-v2.5")
+    expect(toModelAggregate(aggregate("x-preview-f", "openai"))).toMatchObject([
+      {
+        provider: "openai",
+        model: "ox-alpha",
+      },
+    ])
   })
 
   test("model aggregates prefer provider.model and use normalized model", () => {
@@ -67,6 +79,9 @@ describe("inference stat normalization", () => {
       { provider: "openai" },
     ])
     expect(toProviderAggregate(aggregate("big-pickle", "opencode"))).toMatchObject([{ provider: "unknown" }])
+    expect(toProviderAggregate(aggregate("muse-spark-1.2-contributor", "unknown"))).toMatchObject([
+      { provider: "meta" },
+    ])
   })
 
   test("geo aggregates never keep opencode or big-pickle dimensions", () => {

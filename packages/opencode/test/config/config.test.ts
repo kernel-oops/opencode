@@ -8,6 +8,7 @@ import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable
 import { Config } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
 import { ConfigParse } from "../../src/config/parse"
+import { generateConfigSchema } from "../../script/schema"
 import { Npm } from "@opencode-ai/core/npm"
 
 import { InstanceRef } from "../../src/effect/instance-ref"
@@ -2044,17 +2045,161 @@ test("permission_reviewer accepts only the strict configured shape", () => {
     ),
     source,
   )
-  expect(valid.permission_reviewer).toEqual({ mode: "audit-only", model: "openai/gpt-5.6-luna-oauth" })
+  expect(valid.permission_reviewer).toEqual({
+    mode: "audit-only",
+    model: "openai/gpt-5.6-luna-oauth",
+    policy: "conservative-v1",
+    automatic_allow: "never",
+    automatic_rewrite: "never",
+  })
+
+  const policy = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({
+        permission_reviewer: {
+          mode: "enforce",
+          model: "openai/gpt-5.6-luna-oauth",
+          automatic_allow: "never",
+        },
+      }),
+      source,
+    ),
+    source,
+  )
+  expect(policy.permission_reviewer?.automatic_allow).toBe("never")
+
+  const automatic = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({
+        permission_reviewer: {
+          mode: "enforce",
+          model: "openai/gpt-5.6-luna-oauth",
+          policy: "obvious-risk-only-v1",
+          automatic_allow: "policy-gated",
+          automatic_rewrite: "once-per-turn",
+        },
+      }),
+      source,
+    ),
+    source,
+  )
+  expect(automatic.permission_reviewer).toMatchObject({
+    policy: "obvious-risk-only-v1",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  })
 
   for (const permission_reviewer of [
     { mode: "audit", model: "openai/gpt-5.6-luna-oauth" },
     { mode: "enforce" },
     { model: "openai/gpt-5.6-luna-oauth" },
     { mode: "enforce", model: "" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_allow: "always" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", policy: "custom" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_rewrite: "always" },
+    { mode: "enforce", model: "openai/gpt-5.6-luna-oauth", automatic_allow: "policy-gated" },
+    {
+      mode: "enforce",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "conservative-v1",
+      automatic_rewrite: "once-per-turn",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "obvious-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "obvious-risk-only-v1",
+      automatic_rewrite: "once-per-turn",
+    },
   ]) {
     expect(() =>
       ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(JSON.stringify({ permission_reviewer }), source), source),
     ).toThrow()
+  }
+})
+
+test("bash_permission_evaluator accepts only strict fail-closed configurations", () => {
+  const source = "test:bash-permission-evaluator"
+  const hash = "a".repeat(64)
+  const expected = {
+    implementation: "example",
+    version: "1.0.0",
+    commit: "abcdef",
+    protocol: "opencode-bash-v1",
+    platform: "linux",
+  }
+  const active = {
+    mode: "enforce" as const,
+    executable: "/opt/evaluator",
+    policy: "/etc/opencode/policy.json",
+    executable_sha256: hash,
+    policy_sha256: hash,
+    expected,
+  }
+  const parse = (bash_permission_evaluator: unknown) =>
+    ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(JSON.stringify({ bash_permission_evaluator }), source), source)
+      .bash_permission_evaluator
+
+  expect(parse({ mode: "disabled" })).toEqual({ mode: "disabled" })
+  expect(parse(active)).toEqual({
+    ...active,
+    timeout_seconds: 2,
+    capacity: 4,
+    max_input_bytes: 256 * 1024,
+    max_output_bytes: 4 * 1024,
+  })
+  expect(parse({ ...active, mode: "audit-only", timeout_seconds: 1, capacity: 2 })).toMatchObject({
+    mode: "audit-only",
+    timeout_seconds: 1,
+    capacity: 2,
+  })
+
+  for (const invalid of [
+    { mode: "disabled", executable: "/bin/true" },
+    { ...active, mode: "audit" },
+    { ...active, executable: "relative" },
+    { ...active, policy: "relative" },
+    { ...active, executable_sha256: hash.toUpperCase() },
+    { ...active, policy_sha256: "a".repeat(63) },
+    { ...active, expected: { ...expected, protocol: "" } },
+    { ...active, expected: { ...expected, extra: "unexpected" } },
+    { ...active, extra: "unexpected" },
+    { ...active, timeout_seconds: 0 },
+    { ...active, capacity: 0 },
+    { ...active, max_input_bytes: 256 * 1024 + 1 },
+    { ...active, max_output_bytes: 4 * 1024 + 1 },
+  ]) {
+    expect(() => parse(invalid)).toThrow()
+  }
+})
+
+test("generated schema closes every bash permission evaluator object", () => {
+  const schema = generateConfigSchema() as {
+    $defs: {
+      BashPermissionEvaluatorConfig: {
+        anyOf: Array<{
+          additionalProperties?: boolean
+          properties: {
+            mode: { const?: string; enum?: string[] }
+            expected?: { additionalProperties?: boolean }
+          }
+        }>
+      }
+    }
+  }
+  const branches = schema.$defs.BashPermissionEvaluatorConfig.anyOf
+  const mode = (branch: (typeof branches)[number]) => branch.properties.mode.const ?? branch.properties.mode.enum?.[0]
+  expect(branches.map(mode).sort()).toEqual(["audit-only", "disabled", "enforce"])
+  for (const branch of branches) {
+    expect(branch.additionalProperties).toBe(false)
+    if (mode(branch) !== "disabled") expect(branch.properties.expected?.additionalProperties).toBe(false)
   }
 })
 

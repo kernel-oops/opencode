@@ -5,6 +5,7 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import { InstanceStore } from "@/project/instance-store"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -103,12 +104,14 @@ const layer = Layer.effect(
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
 
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
+      const result = yield* Effect.ensuring(
+        InstanceStore.suspendCurrentLeases(Deferred.await(deferred)),
         Effect.sync(() => {
           pending.delete(id)
         }),
       )
+      if (!result.resumed) return yield* new RejectedError()
+      return result.value
     })
 
     const reply = Effect.fn("Question.reply")(function* (input: {
