@@ -30,9 +30,10 @@ readonly PATCH_BRANCHES=(
   "reviewer-context-fix"
   "reviewer-stream-fix"
   "shell-classifier-fix"
-  "review-pipeline"
+  "review-pipeline-v21"
   "evaluator-contract-fix"
   "luna-policy-gate"
+  "release-compat-v21"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -43,9 +44,10 @@ readonly PATCH_IDS=(
   "b3238c230f1aa12173a58af1c1b90e81ed8eb3c5"
   "4b5e8f1cbbb0a9382f4153ce50df98567d55f82b"
   "eaeee8050336276bddf64d8a98cd5b6def379a3c"
-  "e18a0e461cc5c077ee40c04d34762eb9b6c74335"
+  "9b08e4d4e1ad8b496e09ff8c5ce1ccd60b46d118"
   "8e6ab9b0a308c9bb5b5153c7af8124b89e782531"
   "05b11db331352eaab7c178fc91af52a4114ebf5b"
+  "cbe4834b37db0088970a21343e99f301f5f6494d"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -56,9 +58,10 @@ readonly PATCH_TIPS=(
   "48b090a66190d25a3eccdbd65d86060507d960a6"
   "03f9f95247d8dc118114d5d039b98c3e8257a868"
   "590ad2822dbd8a1eb517a2bbba9ea75ce48423de"
-  "97cb7f2f7ca1af615d417783c22871283054418d"
+  "f91fd9d2cea117759266bc28fecb9eade8604fcb"
   "fa8ff68b0328497d88399b79a7ea7712dfb8ff70"
   "7c4ff70252edd64b036f0285e8cb64bbab76fd32"
+  "9b674dafede57433c099c566675938bfc90f09f0"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
@@ -74,8 +77,10 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/permission/replay-oauth.test.ts"
   "packages/opencode/test/permission/reviewer-input.test.ts"
   "packages/opencode/test/permission/reviewer.test.ts"
+  "packages/opencode/test/plugin/codex.test.ts"
   "packages/opencode/test/plugin/trigger.test.ts"
   "packages/opencode/test/project/instance.test.ts"
+  "packages/opencode/test/question/question.test.ts"
   "packages/opencode/test/server/httpapi-event.test.ts"
   "packages/opencode/test/server/httpapi-instance-context.test.ts"
   "packages/opencode/test/server/httpapi-instance.test.ts"
@@ -491,7 +496,8 @@ verify() {
   isolated_home="$(mktemp -d "${RUNNER_TEMP:-/tmp}/release-sync-home.XXXXXX")"
   export HOME="$isolated_home" XDG_CONFIG_HOME="$isolated_home/.config"
   export OPENCODE_LOCAL_STATE_ROOT="$isolated_home/.local/state/opencode"
-  unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR
+  unset OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT
+  unset OPENCODE_EXPERIMENTAL_INSTANCE_IDLE_TIMEOUT_MS OPENCODE_BIN OPENCODE_PID OPENCODE_SYNC_ROOT
 
   mapfile -d '' -t formatted_files < <(git -C "$repo" diff --name-only -z "$upstream_sha" "$head_sha" -- \
     '*.ts' '*.tsx' '*.js' '*.json' '*.md' '*.yml' '*.yaml')
