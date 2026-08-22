@@ -51,11 +51,27 @@ interface Lease {
   readonly directory: string
   readonly entry: ActiveEntry
   active: boolean
+  readonly release: () => Effect.Effect<void>
+  readonly reacquire: () => Effect.Effect<boolean>
 }
 
 const CurrentLeases = Context.Reference<readonly Lease[]>("~opencode/InstanceStore/CurrentLeases", {
   defaultValue: () => [],
 })
+
+// A terminal wait must not deadlock explicit instance disposal. Successful
+// waits reacquire their leases before the caller resumes work.
+export const suspendCurrentLeases = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const leases = (yield* CurrentLeases).filter((lease) => lease.active)
+      yield* Effect.forEach(leases, (lease) => lease.release(), { discard: true })
+      const exit = yield* restore(effect).pipe(Effect.exit)
+      const resumed = (yield* Effect.forEach(leases, (lease) => lease.reacquire())).every(Boolean)
+      if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause)
+      return { value: exit.value, resumed }
+    }),
+  )
 
 interface DisposingEntry {
   readonly state: "disposing"
@@ -215,6 +231,20 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         const inactive = lease.entry.inactive
         lease.entry.inactive = undefined
         if (inactive) yield* Deferred.succeed(inactive, undefined)
+      })
+
+    const reacquireLease = (lease: Lease) =>
+      Effect.gen(function* () {
+        if (lease.active) return true
+        const now = yield* Clock.currentTimeMillis
+        return yield* Effect.sync(() => {
+          if (cache.get(lease.directory) !== lease.entry) return false
+          if (lease.entry.active === 0) lease.entry.inactive = Deferred.makeUnsafe<void>()
+          lease.entry.active++
+          touch(lease.entry, now)
+          lease.active = true
+          return true
+        })
       })
 
     const releaseOwnedLeases = (directory: string, entry: ActiveEntry) =>
@@ -475,7 +505,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
           return Effect.gen(function* () {
             const entry = yield* acquire()
-            const lease: Lease = { directory, entry, active: true }
+            const lease: Lease = {
+              directory,
+              entry,
+              active: true,
+              release: () => releaseLease(lease),
+              reacquire: () => reacquireLease(lease),
+            }
             const leases = yield* CurrentLeases
             return yield* restore(
               Deferred.await(entry.deferred).pipe(
