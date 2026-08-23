@@ -1,14 +1,22 @@
 import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
-import { validateObviousRiskAssessment, type ObviousRiskAssessment } from "./reviewer-assessment"
+import {
+  validateExceptionalRiskAssessment,
+  validateObviousRiskAssessment,
+  type RiskPolicyAssessment,
+} from "./reviewer-assessment"
 
 export function isObviousRiskCandidate(input: {
   readonly settled: boolean
   readonly permission: string
-  readonly assessment: ObviousRiskAssessment
+  readonly assessment: RiskPolicyAssessment
   readonly snapshot: PermissionReviewSnapshot
+  readonly policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
 }) {
   const action = input.snapshot.action
-  const validated = validateObviousRiskAssessment(input.assessment)
+  const validated =
+    input.policy === "exceptional-risk-only-v1"
+      ? validateExceptionalRiskAssessment(input.assessment)
+      : validateObviousRiskAssessment(input.assessment)
   const cwdComplete =
     action.cwd_status === "not_applicable" ||
     (action.cwd_status === "exact" && typeof action.cwd === "string" && action.cwd.length > 0)
@@ -36,7 +44,7 @@ const rewriteFeedback = {
   avoid_persistence_or_public_effect: "Retry without persistence or a public side effect.",
 } as const
 
-export function obviousRiskRewriteFeedback(alternative: ObviousRiskAssessment["safer_alternative"]) {
+export function obviousRiskRewriteFeedback(alternative: RiskPolicyAssessment["safer_alternative"]) {
   if (alternative === "none" || alternative === "request_specific_authorisation") return
   return rewriteFeedback[alternative]
 }

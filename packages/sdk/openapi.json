@@ -21118,7 +21118,7 @@
           },
           "policy": {
             "type": "string",
-            "enum": ["conservative-v1", "obvious-risk-only-v1"]
+            "enum": ["conservative-v1", "obvious-risk-only-v1", "exceptional-risk-only-v1"]
           },
           "automatic_allow": {
             "type": "string",

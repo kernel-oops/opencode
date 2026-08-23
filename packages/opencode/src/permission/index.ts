@@ -764,20 +764,23 @@ const layer = Layer.effect(
       const pluginPermits = pluginResult === undefined || pluginResult === "allow"
       const evaluatorPermits = !evaluatorEnforcing || evaluatorDecision === "allow" || evaluatorDecision === "noop"
       const otherSourcesPermit = pluginPermits && evaluatorPermits
-      const obviousRiskConfig =
-        reviewerConfig?.mode === "enforce" && (reviewerConfig.policy ?? "conservative-v1") === "obvious-risk-only-v1"
-      const obviousRiskAssessment =
+      const riskPolicy = reviewerConfig?.policy ?? "conservative-v1"
+      const automaticRiskConfig =
+        reviewerConfig?.mode === "enforce" &&
+        (riskPolicy === "obvious-risk-only-v1" || riskPolicy === "exceptional-risk-only-v1")
+      const riskPolicyAssessment =
         builtinResult && "assessment" in builtinResult && "reason_code" in builtinResult.assessment
           ? builtinResult.assessment
           : undefined
-      const obviousRiskCandidate =
-        obviousRiskConfig &&
-        obviousRiskAssessment !== undefined &&
+      const automaticRiskCandidate =
+        automaticRiskConfig &&
+        riskPolicyAssessment !== undefined &&
         PermissionReviewer.isObviousRiskCandidate({
           settled: builtin?.run.isSettled() ?? false,
           permission: info.permission,
-          assessment: obviousRiskAssessment,
+          assessment: riskPolicyAssessment,
           snapshot,
+          policy: riskPolicy,
         })
 
       if (pluginResult === "deny") result = "deny"
@@ -785,25 +788,25 @@ const layer = Layer.effect(
       else if (pluginResult === "ask") result = "ask"
       else if (evaluatorEnforcing && !evaluatorPermits) result = "ask"
       else if (builtinResult && "failure" in builtinResult) result = "ask"
-      else if (obviousRiskAssessment) {
+      else if (riskPolicyAssessment) {
         if (
-          obviousRiskAssessment.outcome === "allow" &&
+          riskPolicyAssessment.outcome === "allow" &&
           reviewerConfig?.automatic_allow === "policy-gated" &&
-          obviousRiskCandidate &&
+          automaticRiskCandidate &&
           otherSourcesPermit
         ) {
           result = "allow"
         } else if (
-          obviousRiskAssessment.outcome === "rewrite" &&
+          riskPolicyAssessment.outcome === "rewrite" &&
           reviewerConfig?.automatic_rewrite === "once-per-turn" &&
-          obviousRiskCandidate &&
+          automaticRiskCandidate &&
           otherSourcesPermit &&
           turn.rootSessionID === info.sessionID &&
           turn.directPromptAdmission &&
           turn.turnID.length > 0 &&
           turn.rewrite.status === "available"
         ) {
-          correctionFeedback = PermissionReviewer.obviousRiskRewriteFeedback(obviousRiskAssessment.safer_alternative)
+          correctionFeedback = PermissionReviewer.obviousRiskRewriteFeedback(riskPolicyAssessment.safer_alternative)
           result = correctionFeedback ? "rewrite" : "ask"
         } else result = "ask"
       } else if (builtinResult && "assessment" in builtinResult) {

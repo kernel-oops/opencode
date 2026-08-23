@@ -40,6 +40,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
 import { auditCorrelationKey } from "../../src/permission/audit-correlation"
+import { PermissionReviewer } from "../../src/permission/reviewer"
 
 const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
 const reviewerModel = ProviderTest.model({
@@ -398,6 +399,7 @@ const withReviewerAndPlugins = (mode: "audit-only" | "enforce", ...sources: stri
 const withObviousReviewer = (
   input: {
     mode: "audit-only" | "enforce"
+    policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
     automatic_allow?: "never" | "policy-gated"
     automatic_rewrite?: "never" | "once-per-turn"
   },
@@ -421,7 +423,7 @@ const withObviousReviewer = (
           permission_reviewer: {
             mode: input.mode,
             model: `openai/${reviewerAlias}`,
-            policy: "obvious-risk-only-v1",
+            policy: input.policy ?? "obvious-risk-only-v1",
             automatic_allow: input.automatic_allow ?? "never",
             automatic_rewrite: input.automatic_rewrite ?? "never",
           },
@@ -3037,7 +3039,7 @@ it.instance(
         doStream: () => new Promise((resolve) => resolvers.push(resolve)),
       })
 
-      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
         yield* reviewerAsk({
           sessionID: SessionID.make(`session_audit_capacity_${index}`),
           permission: "bash",
@@ -3057,7 +3059,7 @@ it.instance(
         always: [],
         ruleset: [],
       })
-      expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+      expect(resolvers).toHaveLength(PermissionReviewer.CAPACITY)
       while (
         !(yield* TestConsole.logLines).some((line) => {
           const text = JSON.stringify(line)
@@ -3206,7 +3208,7 @@ it.instance(
         reviewerLanguage = new MockLanguageModelV3({
           doStream: () => new Promise((resolve) => resolvers.push(resolve)),
         })
-        for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
           yield* reviewerAsk({
             sessionID: SessionID.make(`session_blocked_logger_capacity_${index}`),
             permission: "bash",
@@ -3225,7 +3227,7 @@ it.instance(
           always: [],
           ruleset: [],
         })
-        expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+        expect(resolvers).toHaveLength(PermissionReviewer.CAPACITY)
         for (const resolve of resolvers) resolve(reviewerOutput("allow"))
       }),
     ),
@@ -3488,7 +3490,7 @@ it.instance(
 )
 
 it.instance(
-  "reviewer - enforces the four-request built-in review capacity",
+  "reviewer - admits eight built-in Luna reviews and sends the ninth to human review",
   () =>
     Effect.gen(function* () {
       const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
@@ -3496,7 +3498,8 @@ it.instance(
         doStream: () => new Promise((resolve) => resolvers.push(resolve)),
       })
       const fibers = []
-      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      expect(PermissionReviewer.CAPACITY).toBe(8)
+      for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
         fibers.push(
           yield* reviewerAsk({
             sessionID: SessionID.make(`session_capacity_${index}`),
@@ -3508,7 +3511,7 @@ it.instance(
           }).pipe(Effect.forkScoped),
         )
       }
-      while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+      while (resolvers.length < PermissionReviewer.CAPACITY) yield* Effect.yieldNow
 
       const overflow = yield* reviewerAsk({
         id: PermissionV1.ID.make("per_builtin_capacity"),
@@ -3522,7 +3525,7 @@ it.instance(
       expect((yield* waitForPending(1))[0]?.id).toBe(PermissionV1.ID.make("per_builtin_capacity"))
 
       for (const resolve of resolvers) resolve(reviewerOutput("allow"))
-      expect(yield* waitForPending(Permission.REVIEW_CAPACITY + 1)).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+      expect(yield* waitForPending(PermissionReviewer.CAPACITY + 1)).toHaveLength(PermissionReviewer.CAPACITY + 1)
       yield* rejectAll()
       for (const fiber of fibers) yield* Fiber.await(fiber)
       yield* Fiber.await(overflow)
@@ -3624,6 +3627,26 @@ it.instance(
       expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - enforce eligibility matches obvious-risk",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "destructive_or_irreversible", "none"),
+      })
+      yield* reviewerAsk(bashRequest("session_exceptional_allow", test.directory))
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+  }),
   15_000,
 )
 
@@ -3995,7 +4018,7 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       doStream: () => new Promise((resolve) => resolvers.push(resolve)),
     })
     const fibers = []
-    for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+    for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
       fibers.push(
         yield* reviewerAsk({
           sessionID: SessionID.make(`session_settlement_${index}`),
@@ -4007,10 +4030,10 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
         }).pipe(Effect.forkScoped),
       )
     }
-    while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    while (resolvers.length < PermissionReviewer.CAPACITY) yield* Effect.yieldNow
 
     yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
-    expect(yield* waitForPending(Permission.REVIEW_CAPACITY)).toHaveLength(Permission.REVIEW_CAPACITY)
+    expect(yield* waitForPending(PermissionReviewer.CAPACITY)).toHaveLength(PermissionReviewer.CAPACITY)
     const overflow = yield* reviewerAsk({
       sessionID: SessionID.make("session_settlement_overflow"),
       permission: "bash",
@@ -4019,14 +4042,14 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       always: [],
       ruleset: [],
     }).pipe(Effect.forkScoped)
-    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 1) yield* Effect.yieldNow
-    expect(yield* list()).toHaveLength(Permission.REVIEW_CAPACITY + 1)
-    expect(reviewerLanguage.doStreamCalls).toHaveLength(Permission.REVIEW_CAPACITY)
+    while ((yield* list()).length < PermissionReviewer.CAPACITY + 1) yield* Effect.yieldNow
+    expect(yield* list()).toHaveLength(PermissionReviewer.CAPACITY + 1)
+    expect(reviewerLanguage.doStreamCalls).toHaveLength(PermissionReviewer.CAPACITY)
 
     for (const resolve of resolvers) resolve(reviewerOutput("allow"))
     while (
       (yield* TestConsole.logLines).filter((line) => JSON.stringify(line).includes("permission review settled"))
-        .length < 4
+        .length < PermissionReviewer.CAPACITY
     ) {
       yield* Effect.yieldNow
     }
@@ -4038,9 +4061,9 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       always: [],
       ruleset: [],
     }).pipe(Effect.forkScoped)
-    while (resolvers.length === Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    while (resolvers.length === PermissionReviewer.CAPACITY) yield* Effect.yieldNow
     resolvers.at(-1)!(reviewerOutput("allow"))
-    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 2) yield* Effect.yieldNow
+    while ((yield* list()).length < PermissionReviewer.CAPACITY + 2) yield* Effect.yieldNow
 
     yield* rejectAll()
     for (const fiber of fibers) yield* Fiber.await(fiber)

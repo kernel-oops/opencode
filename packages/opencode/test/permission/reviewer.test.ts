@@ -94,6 +94,9 @@ const reviewText = (outcome: "allow" | "ask" | "deny", rationale = "bounded rati
 const obviousReviewText = () =>
   JSON.stringify({ outcome: "allow", reason_code: "routine_or_low_impact", safer_alternative: "none" })
 
+const exceptionalReviewText = () =>
+  JSON.stringify({ outcome: "allow", reason_code: "destructive_or_irreversible", safer_alternative: "none" })
+
 function reset(text = reviewText("allow")) {
   resolved = ProviderTest.model({
     id: alias,
@@ -328,6 +331,44 @@ it.effect("uses the fixed obvious-risk policy contract without exposing an ungat
         permission: "bash",
         origin: "tool",
         arguments: { command: "git status" },
+      }),
+    ).toEqual({ decision: "ask" })
+  }),
+)
+
+it.effect("uses the fixed exceptional-risk policy contract without changing authority", () =>
+  Effect.gen(function* () {
+    reset(exceptionalReviewText())
+    const reviewer = yield* PermissionReviewer.Service
+    const exceptional = {
+      mode: "audit-only",
+      model: `openai/${alias}`,
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "never",
+      automatic_rewrite: "never",
+    } as const
+    expect(
+      yield* reviewer.assess({
+        config: exceptional,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "rm -rf staging && sudo systemctl restart api" },
+      }),
+    ).toEqual({
+      assessment: { outcome: "allow", reason_code: "destructive_or_irreversible", safer_alternative: "none" },
+    })
+    expect(language.doStreamCalls[0]?.providerOptions?.openai?.instructions).toContain(
+      "fixed exceptional-risk-only-v1 profile",
+    )
+    expect(JSON.stringify(language.doStreamCalls[0]?.responseFormat)).not.toContain("rationale")
+
+    reset(exceptionalReviewText())
+    expect(
+      yield* reviewer.review({
+        config: exceptional,
+        permission: "bash",
+        origin: "tool",
+        arguments: { command: "rm -rf staging && sudo systemctl restart api" },
       }),
     ).toEqual({ decision: "ask" })
   }),
@@ -779,9 +820,10 @@ it.effect("preserves interruption and cooperatively aborts generation", () =>
   }),
 )
 
-it.effect("keeps ignored-abort work globally bounded until actual native settlement", () =>
+it.effect("admits eight Luna reviews, rejects the ninth, and retains capacity until native settlement", () =>
   Effect.gen(function* () {
     reset()
+    expect(PermissionReviewer.CAPACITY).toBe(8)
     const resolvers: Array<(value: ReturnType<typeof output>) => void> = []
     language = new MockLanguageModelV3({
       doStream: () =>

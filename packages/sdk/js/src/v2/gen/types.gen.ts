@@ -1884,7 +1884,7 @@ export type LayoutConfig = "auto" | "stretch"
 export type PermissionReviewerConfig = {
   mode: "audit-only" | "enforce"
   model: string
-  policy?: "conservative-v1" | "obvious-risk-only-v1"
+  policy?: "conservative-v1" | "obvious-risk-only-v1" | "exceptional-risk-only-v1"
   automatic_allow?: "never" | "policy-gated"
   automatic_rewrite?: "never" | "once-per-turn"
 }
