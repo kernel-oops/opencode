@@ -34,6 +34,8 @@ readonly PATCH_BRANCHES=(
   "evaluator-contract-fix"
   "luna-policy-gate"
   "release-compat-v21"
+  "audit-correlation-log"
+  "exceptional-risk-policy"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -48,6 +50,8 @@ readonly PATCH_IDS=(
   "8e6ab9b0a308c9bb5b5153c7af8124b89e782531"
   "05b11db331352eaab7c178fc91af52a4114ebf5b"
   "cbe4834b37db0088970a21343e99f301f5f6494d"
+  "2962ce77cc0e89955e2dc952f6f5bd941e56465c"
+  "8d5352767402a5c6c1278eb0bc3f632462e9a1c9"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -62,6 +66,8 @@ readonly PATCH_TIPS=(
   "fa8ff68b0328497d88399b79a7ea7712dfb8ff70"
   "7c4ff70252edd64b036f0285e8cb64bbab76fd32"
   "9b674dafede57433c099c566675938bfc90f09f0"
+  "f009e4a9e73e23daa98e410b0865cfbe95c5f357"
+  "f4d5e64be105ccf3bb71f98ec1ca49719c3cd96c"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
@@ -72,6 +78,8 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/permission/admission.test.ts"
   "packages/opencode/test/permission/advisory-gate.test.ts"
   "packages/opencode/test/permission/bash-evaluator.test.ts"
+  "packages/opencode/test/permission/audit-correlation.test.ts"
+  "packages/opencode/test/permission/exceptional-risk-policy.test.ts"
   "packages/opencode/test/permission/next.test.ts"
   "packages/opencode/test/permission/obvious-risk-policy.test.ts"
   "packages/opencode/test/permission/replay-oauth.test.ts"
