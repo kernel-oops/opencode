@@ -24,6 +24,7 @@ import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
 import { InstanceRef } from "@/effect/instance-ref"
 import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type EvidenceInput } from "./reviewer-input"
+import { auditCorrelationKey } from "./audit-correlation"
 
 export const Event = PermissionV1.Event
 
@@ -113,6 +114,17 @@ type BuiltinResult = PermissionReviewer.AssessmentResult
 function safeReviewString(value: string) {
   const result = safeReviewValue(value)
   return typeof result === "string" ? result : "[UNREADABLE]"
+}
+
+function correlation(info: PermissionV1.Request, origin: PermissionReviewContext["origin"]) {
+  if (!info.tool) return
+  return auditCorrelationKey({
+    sessionID: info.sessionID,
+    messageID: info.tool.messageID,
+    callID: info.tool.callID,
+    permission: info.permission,
+    origin,
+  })
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -327,15 +339,23 @@ const layer = Layer.effect(
       })
     })
 
-    const lineage = Effect.fn("Permission.lineage")(function* (sessionID: PermissionV1.Request["sessionID"]) {
+    const lineage = Effect.fn("Permission.lineage")(function* (
+      info: PermissionV1.Request,
+      origin: PermissionReviewContext["origin"],
+    ) {
       const fallback = {
-        lineage: [sessionID],
+        lineage: [info.sessionID],
         complete: false,
         reason: "missing_current" as const,
       }
-      const first = yield* sessions.get(sessionID).pipe(Effect.exit)
+      const first = yield* sessions.get(info.sessionID).pipe(Effect.exit)
       if (Exit.isFailure(first)) {
-        yield* Effect.logWarning("permission review session context unavailable", { sessionID })
+        const auditCorrelationKey = correlation(info, origin)
+        yield* Effect.logWarning("permission review session context unavailable", {
+          permission: info.permission,
+          origin,
+          ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
+        })
         return fallback
       }
 
@@ -355,11 +375,16 @@ const layer = Layer.effect(
       dispositionAuthority?: "observational" | "automatic_allow" | "automatic_rewrite" | "deny" | "human" | "plugin"
     }) {
       const assessment = input.assessment
+      const auditCorrelationKey = correlation(input.info, input.review.origin)
       const outcome =
         assessment?.outcome ??
         (["allow", "ask", "deny", "rewrite", "human_review"].includes(input.result) ? input.result : undefined)
       if (input.source === "builtin") {
         yield* Effect.logInfo("permission review", {
+          source: "builtin",
+          permission: input.info.permission,
+          origin: input.review.origin,
+          ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
           policy: input.policy,
           outcome,
           reasonCode: assessment && "reason_code" in assessment ? assessment.reason_code : undefined,
@@ -379,12 +404,18 @@ const layer = Layer.effect(
     })
 
     const auditEvaluator = Effect.fn("Permission.auditEvaluator")(function* (input: {
+      info: PermissionV1.Request
+      review: PermissionReviewContext
       result: BashPermissionEvaluator.Decision | BashPermissionEvaluator.Failure | "interrupted"
       latencyMs: number
       authoritative: boolean
     }) {
+      const auditCorrelationKey = correlation(input.info, input.review.origin)
       yield* Effect.logInfo("bash permission evaluator", {
         source: "bash_evaluator",
+        permission: input.info.permission,
+        origin: input.review.origin,
+        ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
         result: input.result,
         latencyMs: input.latencyMs,
         authoritative: input.authoritative,
@@ -440,7 +471,7 @@ const layer = Layer.effect(
       }
       const sessionContext = source?.session
         ? { ...source.session, lineage: [...source.session.lineage] }
-        : yield* lineage(info.sessionID)
+        : yield* lineage(info, source?.origin ?? "unknown")
       const turn = current.turns.get(info.sessionID) ?? {
         trusted: [],
         untrusted: [],
@@ -607,6 +638,8 @@ const layer = Layer.effect(
             Clock.currentTimeMillis.pipe(
               Effect.flatMap((now) =>
                 auditEvaluator({
+                  info,
+                  review,
                   result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
                   latencyMs: now - started,
                   authoritative: false,
@@ -620,6 +653,8 @@ const layer = Layer.effect(
               : Clock.currentTimeMillis.pipe(
                   Effect.flatMap((now) =>
                     auditEvaluator({
+                      info,
+                      review,
                       result: Cause.hasInterrupts(cause) ? "interrupted" : "process",
                       latencyMs: now - started,
                       authoritative: false,
@@ -638,6 +673,8 @@ const layer = Layer.effect(
                 Clock.currentTimeMillis.pipe(
                   Effect.flatMap((now) =>
                     auditEvaluator({
+                      info,
+                      review,
                       result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
                       latencyMs: now - started,
                       authoritative: true,
@@ -899,9 +936,11 @@ const layer = Layer.effect(
       }
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
+      const auditCorrelationKey = correlation(info, review.origin)
       yield* Effect.logInfo("asking", {
-        id,
         permission: info.permission,
+        origin: review.origin,
+        ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
         patternCount: info.patterns.length,
       })
       return yield* Effect.acquireUseRelease(

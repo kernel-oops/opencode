@@ -39,6 +39,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
 import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
+import { auditCorrelationKey } from "../../src/permission/audit-correlation"
 
 const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
 const reviewerModel = ProviderTest.model({
@@ -295,6 +296,7 @@ const bashAction = (directory: string, complete = true) => ({
 
 const bashRequest = (session: string, directory: string, complete = true) => ({
   sessionID: SessionID.make(session),
+  tool: { messageID: `message_${session}`, callID: `call_${session}` },
   permission: "bash",
   patterns: ["git status"],
   metadata: {},
@@ -1533,6 +1535,13 @@ it.instance(
         yield* Effect.promise(() => Bun.file(path.join(test.directory, "lineage.json")).text()),
       )
       expect(context).toEqual({ lineage: [sessionID], complete: false, reason: "missing_current" })
+      const logs = yield* TestConsole.logLines
+      const warning = logs.find(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "origin" in line && !("source" in line) && !("patternCount" in line),
+      )
+      expect(warning).toEqual({ permission: "bash", origin: "unknown" })
+      expect(JSON.stringify(logs)).not.toContain(sessionID)
     }),
   withPlugins(
     permissionHook(
@@ -1542,6 +1551,166 @@ it.instance(
       ].join("\n"),
     ),
   ),
+)
+
+it.instance(
+  "ask - missing session context log correlates without leaking identifiers or payload",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.make("ses_private_context")
+      const requestID = PermissionV1.ID.make("per_private_context")
+      const messageID = "private-message-context"
+      const callID = "private-call-context"
+      yield* ask({
+        id: requestID,
+        sessionID,
+        tool: { messageID, callID },
+        permission: "bash",
+        patterns: ["private-pattern-context"],
+        metadata: { secret: "private-metadata-context" },
+        always: ["private-always-context"],
+        ruleset: [],
+        review: {
+          ...bashAction(test.directory),
+          arguments: { secret: "private-arguments-context" },
+        },
+      })
+
+      const logs = yield* TestConsole.logLines
+      const warning = logs.find(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "origin" in line && !("source" in line) && !("patternCount" in line),
+      )
+      expect(warning).toEqual({
+        permission: "bash",
+        origin: "tool",
+        auditCorrelationKey: auditCorrelationKey({
+          sessionID,
+          messageID,
+          callID,
+          permission: "bash",
+          origin: "tool",
+        }),
+      })
+      const rendered = JSON.stringify(logs)
+      for (const privateValue of [
+        requestID,
+        sessionID,
+        messageID,
+        callID,
+        "private-pattern-context",
+        "private-metadata-context",
+        "private-always-context",
+        "private-arguments-context",
+      ]) {
+        expect(rendered).not.toContain(privateValue)
+      }
+    }),
+  withPlugins(permissionHook('    output.status = "allow"')),
+)
+
+it.instance("ask - asking log correlates tool requests without leaking identifiers or payload", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const sessionID = SessionID.make("ses_private_asking_tool")
+    const requestID = PermissionV1.ID.make("per_private_asking_tool")
+    const messageID = "private-message-asking-tool"
+    const callID = "private-call-asking-tool"
+    const fiber = yield* ask({
+      id: requestID,
+      sessionID,
+      tool: { messageID, callID },
+      permission: "bash",
+      patterns: ["private-pattern-asking-tool"],
+      metadata: { secret: "private-metadata-asking-tool" },
+      always: ["private-always-asking-tool"],
+      ruleset: [],
+      review: {
+        ...bashAction(test.directory),
+        arguments: { secret: "private-arguments-asking-tool" },
+        session: { lineage: [sessionID], complete: true },
+      },
+    }).pipe(Effect.forkScoped)
+
+    expect((yield* waitForPending(1))[0]?.id).toBe(requestID)
+    const logs = yield* TestConsole.logLines
+    const asking = logs.find(
+      (line): line is Record<string, unknown> =>
+        !!line && typeof line === "object" && "origin" in line && "patternCount" in line,
+    )
+    expect(asking).toEqual({
+      permission: "bash",
+      origin: "tool",
+      auditCorrelationKey: auditCorrelationKey({
+        sessionID,
+        messageID,
+        callID,
+        permission: "bash",
+        origin: "tool",
+      }),
+      patternCount: 1,
+    })
+    const rendered = JSON.stringify(logs)
+    for (const privateValue of [
+      requestID,
+      sessionID,
+      messageID,
+      callID,
+      "private-pattern-asking-tool",
+      "private-metadata-asking-tool",
+      "private-always-asking-tool",
+      "private-arguments-asking-tool",
+    ]) {
+      expect(rendered).not.toContain(privateValue)
+    }
+    yield* rejectAll()
+    yield* Fiber.await(fiber)
+  }),
+)
+
+it.instance("ask - asking log omits correlation when the trusted tool tuple is unavailable", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const sessionID = SessionID.make("ses_private_asking_no_tool")
+    const requestID = PermissionV1.ID.make("per_private_asking_no_tool")
+    const fiber = yield* ask({
+      id: requestID,
+      sessionID,
+      permission: "bash",
+      patterns: ["private-pattern-asking-no-tool"],
+      metadata: { secret: "private-metadata-asking-no-tool" },
+      always: ["private-always-asking-no-tool"],
+      ruleset: [],
+      review: {
+        ...bashAction(test.directory),
+        arguments: { secret: "private-arguments-asking-no-tool" },
+        session: { lineage: [sessionID], complete: true },
+      },
+    }).pipe(Effect.forkScoped)
+
+    expect((yield* waitForPending(1))[0]?.id).toBe(requestID)
+    const logs = yield* TestConsole.logLines
+    const asking = logs.find(
+      (line): line is Record<string, unknown> =>
+        !!line && typeof line === "object" && "origin" in line && "patternCount" in line,
+    )
+    expect(asking).toEqual({ permission: "bash", origin: "tool", patternCount: 1 })
+    expect(asking).not.toHaveProperty("auditCorrelationKey")
+    const rendered = JSON.stringify(logs)
+    for (const privateValue of [
+      requestID,
+      sessionID,
+      "private-pattern-asking-no-tool",
+      "private-metadata-asking-no-tool",
+      "private-always-asking-no-tool",
+      "private-arguments-asking-no-tool",
+    ]) {
+      expect(rendered).not.toContain(privateValue)
+    }
+    yield* rejectAll()
+    yield* Fiber.await(fiber)
+  }),
 )
 
 it.instance(
@@ -2827,6 +2996,12 @@ it.instance(
       const logs = JSON.stringify(yield* TestConsole.logLines)
       expect(logs).toContain('"policy":"conservative-v1"')
       expect(logs).toContain('"outcome":"deny"')
+      const builtinLogs = (yield* TestConsole.logLines).filter(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "source" in line && line.source === "builtin" && "policy" in line,
+      )
+      expect(builtinLogs).toHaveLength(1)
+      expect(builtinLogs[0]).not.toHaveProperty("auditCorrelationKey")
     }),
   withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
   15_000,
@@ -3368,8 +3543,10 @@ it.instance(
       let index = 0
       reviewerLanguage = new MockLanguageModelV3({ doStream: () => Promise.resolve(outputs[index++]!) })
       for (let request = 0; request < outputs.length; request++) {
+        const sessionID = `session_obvious_audit_${request}`
         yield* reviewerAsk({
-          sessionID: SessionID.make(`session_obvious_audit_${request}`),
+          sessionID: SessionID.make(sessionID),
+          tool: { messageID: `private-message-${request}`, callID: `private-call-${request}` },
           permission: "bash",
           patterns: [`private-command-${request}`],
           metadata: { secret: `private-value-${request}` },
@@ -3399,16 +3576,33 @@ it.instance(
           "outcome" in line,
       )
       expect(builtinLogs).toHaveLength(3)
-      for (const line of builtinLogs) {
+      for (const [index, line] of builtinLogs.entries()) {
         expect(Object.keys(line).sort()).toEqual([
+          "auditCorrelationKey",
           "dispositionAuthority",
           "failure",
           "latencyMs",
+          "origin",
           "outcome",
+          "permission",
           "policy",
           "reasonCode",
           "saferAlternative",
+          "source",
         ])
+        expect(line.auditCorrelationKey).toBe(
+          auditCorrelationKey({
+            sessionID: `session_obvious_audit_${index}`,
+            messageID: `private-message-${index}`,
+            callID: `private-call-${index}`,
+            permission: "bash",
+            origin: "tool",
+          }),
+        )
+        const rendered = JSON.stringify(line)
+        expect(rendered).not.toContain(`session_obvious_audit_${index}`)
+        expect(rendered).not.toContain(`private-message-${index}`)
+        expect(rendered).not.toContain(`private-call-${index}`)
       }
       expect(yield* list()).toHaveLength(0)
     }),
@@ -3919,10 +4113,28 @@ it.instance(
           !!item && typeof item === "object" && "source" in item && item.source === "bash_evaluator",
       )
       expect(evaluatorLogs).toHaveLength(1)
-      expect(Object.keys(evaluatorLogs[0]!).sort()).toEqual(["authoritative", "latencyMs", "result", "source"])
+      expect(Object.keys(evaluatorLogs[0]!).sort()).toEqual([
+        "auditCorrelationKey",
+        "authoritative",
+        "latencyMs",
+        "origin",
+        "permission",
+        "result",
+        "source",
+      ])
+      expect(evaluatorLogs[0]?.auditCorrelationKey).toBe(
+        auditCorrelationKey({
+          sessionID: "session_evaluator_allow_zero",
+          messageID: "message_session_evaluator_allow_zero",
+          callID: "call_session_evaluator_allow_zero",
+          permission: "bash",
+          origin: "tool",
+        }),
+      )
       expect(JSON.stringify(evaluatorLogs)).not.toContain("git status")
       expect(JSON.stringify(evaluatorLogs)).not.toContain("never log this secret reason")
       expect(JSON.stringify(evaluatorLogs)).not.toContain(test.directory)
+      expect(JSON.stringify(evaluatorLogs)).not.toContain("session_evaluator_allow_zero")
     }),
   withBashEvaluator({ mode: "enforce", policy: { decision: "allow" } }),
   15_000,
