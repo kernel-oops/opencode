@@ -2091,6 +2091,51 @@ test("permission_reviewer accepts only the strict configured shape", () => {
     automatic_rewrite: "once-per-turn",
   })
 
+  const exceptionalAudit = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({
+        permission_reviewer: {
+          mode: "audit-only",
+          model: "openai/gpt-5.6-luna-oauth",
+          policy: "exceptional-risk-only-v1",
+          automatic_allow: "never",
+          automatic_rewrite: "never",
+        },
+      }),
+      source,
+    ),
+    source,
+  )
+  expect(exceptionalAudit.permission_reviewer).toMatchObject({
+    mode: "audit-only",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "never",
+    automatic_rewrite: "never",
+  })
+
+  const exceptionalEnforce = ConfigParse.schema(
+    ConfigV1.Info,
+    ConfigParse.jsonc(
+      JSON.stringify({
+        permission_reviewer: {
+          mode: "enforce",
+          model: "openai/gpt-5.6-luna-oauth",
+          policy: "exceptional-risk-only-v1",
+          automatic_allow: "policy-gated",
+          automatic_rewrite: "once-per-turn",
+        },
+      }),
+      source,
+    ),
+    source,
+  )
+  expect(exceptionalEnforce.permission_reviewer).toMatchObject({
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  })
+
   for (const permission_reviewer of [
     { mode: "audit", model: "openai/gpt-5.6-luna-oauth" },
     { mode: "enforce" },
@@ -2116,6 +2161,18 @@ test("permission_reviewer accepts only the strict configured shape", () => {
       mode: "audit-only",
       model: "openai/gpt-5.6-luna-oauth",
       policy: "obvious-risk-only-v1",
+      automatic_rewrite: "once-per-turn",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+    {
+      mode: "audit-only",
+      model: "openai/gpt-5.6-luna-oauth",
+      policy: "exceptional-risk-only-v1",
       automatic_rewrite: "once-per-turn",
     },
   ]) {

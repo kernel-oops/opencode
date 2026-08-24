@@ -548,7 +548,7 @@
             }
           }
         },
-        "description": "Upgrade opencode to the specified version or latest if not specified.",
+        "description": "Upgrade opencode to the specified version.",
         "summary": "Upgrade opencode",
         "requestBody": {
           "content": {
@@ -560,6 +560,7 @@
                     "type": "string"
                   }
                 },
+                "required": ["target"],
                 "additionalProperties": false
               }
             }
@@ -21118,7 +21119,7 @@
           },
           "policy": {
             "type": "string",
-            "enum": ["conservative-v1", "obvious-risk-only-v1"]
+            "enum": ["conservative-v1", "obvious-risk-only-v1", "exceptional-risk-only-v1"]
           },
           "automatic_allow": {
             "type": "string",

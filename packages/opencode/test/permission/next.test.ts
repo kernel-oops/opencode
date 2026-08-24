@@ -39,6 +39,8 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
 import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
+import { auditCorrelationKey } from "../../src/permission/audit-correlation"
+import { PermissionReviewer } from "../../src/permission/reviewer"
 
 const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
 const reviewerModel = ProviderTest.model({
@@ -295,6 +297,7 @@ const bashAction = (directory: string, complete = true) => ({
 
 const bashRequest = (session: string, directory: string, complete = true) => ({
   sessionID: SessionID.make(session),
+  tool: { messageID: `message_${session}`, callID: `call_${session}` },
   permission: "bash",
   patterns: ["git status"],
   metadata: {},
@@ -396,6 +399,7 @@ const withReviewerAndPlugins = (mode: "audit-only" | "enforce", ...sources: stri
 const withObviousReviewer = (
   input: {
     mode: "audit-only" | "enforce"
+    policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
     automatic_allow?: "never" | "policy-gated"
     automatic_rewrite?: "never" | "once-per-turn"
   },
@@ -419,7 +423,7 @@ const withObviousReviewer = (
           permission_reviewer: {
             mode: input.mode,
             model: `openai/${reviewerAlias}`,
-            policy: "obvious-risk-only-v1",
+            policy: input.policy ?? "obvious-risk-only-v1",
             automatic_allow: input.automatic_allow ?? "never",
             automatic_rewrite: input.automatic_rewrite ?? "never",
           },
@@ -1533,6 +1537,13 @@ it.instance(
         yield* Effect.promise(() => Bun.file(path.join(test.directory, "lineage.json")).text()),
       )
       expect(context).toEqual({ lineage: [sessionID], complete: false, reason: "missing_current" })
+      const logs = yield* TestConsole.logLines
+      const warning = logs.find(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "origin" in line && !("source" in line) && !("patternCount" in line),
+      )
+      expect(warning).toEqual({ permission: "bash", origin: "unknown" })
+      expect(JSON.stringify(logs)).not.toContain(sessionID)
     }),
   withPlugins(
     permissionHook(
@@ -1542,6 +1553,166 @@ it.instance(
       ].join("\n"),
     ),
   ),
+)
+
+it.instance(
+  "ask - missing session context log correlates without leaking identifiers or payload",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.make("ses_private_context")
+      const requestID = PermissionV1.ID.make("per_private_context")
+      const messageID = "private-message-context"
+      const callID = "private-call-context"
+      yield* ask({
+        id: requestID,
+        sessionID,
+        tool: { messageID, callID },
+        permission: "bash",
+        patterns: ["private-pattern-context"],
+        metadata: { secret: "private-metadata-context" },
+        always: ["private-always-context"],
+        ruleset: [],
+        review: {
+          ...bashAction(test.directory),
+          arguments: { secret: "private-arguments-context" },
+        },
+      })
+
+      const logs = yield* TestConsole.logLines
+      const warning = logs.find(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "origin" in line && !("source" in line) && !("patternCount" in line),
+      )
+      expect(warning).toEqual({
+        permission: "bash",
+        origin: "tool",
+        auditCorrelationKey: auditCorrelationKey({
+          sessionID,
+          messageID,
+          callID,
+          permission: "bash",
+          origin: "tool",
+        }),
+      })
+      const rendered = JSON.stringify(logs)
+      for (const privateValue of [
+        requestID,
+        sessionID,
+        messageID,
+        callID,
+        "private-pattern-context",
+        "private-metadata-context",
+        "private-always-context",
+        "private-arguments-context",
+      ]) {
+        expect(rendered).not.toContain(privateValue)
+      }
+    }),
+  withPlugins(permissionHook('    output.status = "allow"')),
+)
+
+it.instance("ask - asking log correlates tool requests without leaking identifiers or payload", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const sessionID = SessionID.make("ses_private_asking_tool")
+    const requestID = PermissionV1.ID.make("per_private_asking_tool")
+    const messageID = "private-message-asking-tool"
+    const callID = "private-call-asking-tool"
+    const fiber = yield* ask({
+      id: requestID,
+      sessionID,
+      tool: { messageID, callID },
+      permission: "bash",
+      patterns: ["private-pattern-asking-tool"],
+      metadata: { secret: "private-metadata-asking-tool" },
+      always: ["private-always-asking-tool"],
+      ruleset: [],
+      review: {
+        ...bashAction(test.directory),
+        arguments: { secret: "private-arguments-asking-tool" },
+        session: { lineage: [sessionID], complete: true },
+      },
+    }).pipe(Effect.forkScoped)
+
+    expect((yield* waitForPending(1))[0]?.id).toBe(requestID)
+    const logs = yield* TestConsole.logLines
+    const asking = logs.find(
+      (line): line is Record<string, unknown> =>
+        !!line && typeof line === "object" && "origin" in line && "patternCount" in line,
+    )
+    expect(asking).toEqual({
+      permission: "bash",
+      origin: "tool",
+      auditCorrelationKey: auditCorrelationKey({
+        sessionID,
+        messageID,
+        callID,
+        permission: "bash",
+        origin: "tool",
+      }),
+      patternCount: 1,
+    })
+    const rendered = JSON.stringify(logs)
+    for (const privateValue of [
+      requestID,
+      sessionID,
+      messageID,
+      callID,
+      "private-pattern-asking-tool",
+      "private-metadata-asking-tool",
+      "private-always-asking-tool",
+      "private-arguments-asking-tool",
+    ]) {
+      expect(rendered).not.toContain(privateValue)
+    }
+    yield* rejectAll()
+    yield* Fiber.await(fiber)
+  }),
+)
+
+it.instance("ask - asking log omits correlation when the trusted tool tuple is unavailable", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const sessionID = SessionID.make("ses_private_asking_no_tool")
+    const requestID = PermissionV1.ID.make("per_private_asking_no_tool")
+    const fiber = yield* ask({
+      id: requestID,
+      sessionID,
+      permission: "bash",
+      patterns: ["private-pattern-asking-no-tool"],
+      metadata: { secret: "private-metadata-asking-no-tool" },
+      always: ["private-always-asking-no-tool"],
+      ruleset: [],
+      review: {
+        ...bashAction(test.directory),
+        arguments: { secret: "private-arguments-asking-no-tool" },
+        session: { lineage: [sessionID], complete: true },
+      },
+    }).pipe(Effect.forkScoped)
+
+    expect((yield* waitForPending(1))[0]?.id).toBe(requestID)
+    const logs = yield* TestConsole.logLines
+    const asking = logs.find(
+      (line): line is Record<string, unknown> =>
+        !!line && typeof line === "object" && "origin" in line && "patternCount" in line,
+    )
+    expect(asking).toEqual({ permission: "bash", origin: "tool", patternCount: 1 })
+    expect(asking).not.toHaveProperty("auditCorrelationKey")
+    const rendered = JSON.stringify(logs)
+    for (const privateValue of [
+      requestID,
+      sessionID,
+      "private-pattern-asking-no-tool",
+      "private-metadata-asking-no-tool",
+      "private-always-asking-no-tool",
+      "private-arguments-asking-no-tool",
+    ]) {
+      expect(rendered).not.toContain(privateValue)
+    }
+    yield* rejectAll()
+    yield* Fiber.await(fiber)
+  }),
 )
 
 it.instance(
@@ -2827,6 +2998,12 @@ it.instance(
       const logs = JSON.stringify(yield* TestConsole.logLines)
       expect(logs).toContain('"policy":"conservative-v1"')
       expect(logs).toContain('"outcome":"deny"')
+      const builtinLogs = (yield* TestConsole.logLines).filter(
+        (line): line is Record<string, unknown> =>
+          !!line && typeof line === "object" && "source" in line && line.source === "builtin" && "policy" in line,
+      )
+      expect(builtinLogs).toHaveLength(1)
+      expect(builtinLogs[0]).not.toHaveProperty("auditCorrelationKey")
     }),
   withReviewerAndPlugins("audit-only", permissionHook('    output.status = "allow"')),
   15_000,
@@ -2862,7 +3039,7 @@ it.instance(
         doStream: () => new Promise((resolve) => resolvers.push(resolve)),
       })
 
-      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
         yield* reviewerAsk({
           sessionID: SessionID.make(`session_audit_capacity_${index}`),
           permission: "bash",
@@ -2882,7 +3059,7 @@ it.instance(
         always: [],
         ruleset: [],
       })
-      expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+      expect(resolvers).toHaveLength(PermissionReviewer.CAPACITY)
       while (
         !(yield* TestConsole.logLines).some((line) => {
           const text = JSON.stringify(line)
@@ -3031,7 +3208,7 @@ it.instance(
         reviewerLanguage = new MockLanguageModelV3({
           doStream: () => new Promise((resolve) => resolvers.push(resolve)),
         })
-        for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+        for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
           yield* reviewerAsk({
             sessionID: SessionID.make(`session_blocked_logger_capacity_${index}`),
             permission: "bash",
@@ -3050,7 +3227,7 @@ it.instance(
           always: [],
           ruleset: [],
         })
-        expect(resolvers).toHaveLength(Permission.REVIEW_CAPACITY)
+        expect(resolvers).toHaveLength(PermissionReviewer.CAPACITY)
         for (const resolve of resolvers) resolve(reviewerOutput("allow"))
       }),
     ),
@@ -3313,7 +3490,7 @@ it.instance(
 )
 
 it.instance(
-  "reviewer - enforces the four-request built-in review capacity",
+  "reviewer - admits eight built-in Luna reviews and sends the ninth to human review",
   () =>
     Effect.gen(function* () {
       const resolvers: Array<(value: ReturnType<typeof reviewerOutput>) => void> = []
@@ -3321,7 +3498,8 @@ it.instance(
         doStream: () => new Promise((resolve) => resolvers.push(resolve)),
       })
       const fibers = []
-      for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+      expect(PermissionReviewer.CAPACITY).toBe(8)
+      for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
         fibers.push(
           yield* reviewerAsk({
             sessionID: SessionID.make(`session_capacity_${index}`),
@@ -3333,7 +3511,7 @@ it.instance(
           }).pipe(Effect.forkScoped),
         )
       }
-      while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+      while (resolvers.length < PermissionReviewer.CAPACITY) yield* Effect.yieldNow
 
       const overflow = yield* reviewerAsk({
         id: PermissionV1.ID.make("per_builtin_capacity"),
@@ -3347,7 +3525,7 @@ it.instance(
       expect((yield* waitForPending(1))[0]?.id).toBe(PermissionV1.ID.make("per_builtin_capacity"))
 
       for (const resolve of resolvers) resolve(reviewerOutput("allow"))
-      expect(yield* waitForPending(Permission.REVIEW_CAPACITY + 1)).toHaveLength(Permission.REVIEW_CAPACITY + 1)
+      expect(yield* waitForPending(PermissionReviewer.CAPACITY + 1)).toHaveLength(PermissionReviewer.CAPACITY + 1)
       yield* rejectAll()
       for (const fiber of fibers) yield* Fiber.await(fiber)
       yield* Fiber.await(overflow)
@@ -3368,8 +3546,10 @@ it.instance(
       let index = 0
       reviewerLanguage = new MockLanguageModelV3({ doStream: () => Promise.resolve(outputs[index++]!) })
       for (let request = 0; request < outputs.length; request++) {
+        const sessionID = `session_obvious_audit_${request}`
         yield* reviewerAsk({
-          sessionID: SessionID.make(`session_obvious_audit_${request}`),
+          sessionID: SessionID.make(sessionID),
+          tool: { messageID: `private-message-${request}`, callID: `private-call-${request}` },
           permission: "bash",
           patterns: [`private-command-${request}`],
           metadata: { secret: `private-value-${request}` },
@@ -3399,16 +3579,33 @@ it.instance(
           "outcome" in line,
       )
       expect(builtinLogs).toHaveLength(3)
-      for (const line of builtinLogs) {
+      for (const [index, line] of builtinLogs.entries()) {
         expect(Object.keys(line).sort()).toEqual([
+          "auditCorrelationKey",
           "dispositionAuthority",
           "failure",
           "latencyMs",
+          "origin",
           "outcome",
+          "permission",
           "policy",
           "reasonCode",
           "saferAlternative",
+          "source",
         ])
+        expect(line.auditCorrelationKey).toBe(
+          auditCorrelationKey({
+            sessionID: `session_obvious_audit_${index}`,
+            messageID: `private-message-${index}`,
+            callID: `private-call-${index}`,
+            permission: "bash",
+            origin: "tool",
+          }),
+        )
+        const rendered = JSON.stringify(line)
+        expect(rendered).not.toContain(`session_obvious_audit_${index}`)
+        expect(rendered).not.toContain(`private-message-${index}`)
+        expect(rendered).not.toContain(`private-call-${index}`)
       }
       expect(yield* list()).toHaveLength(0)
     }),
@@ -3430,6 +3627,26 @@ it.instance(
       expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - enforce eligibility matches obvious-risk",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "destructive_or_irreversible", "none"),
+      })
+      yield* reviewerAsk(bashRequest("session_exceptional_allow", test.directory))
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+  }),
   15_000,
 )
 
@@ -3801,7 +4018,7 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       doStream: () => new Promise((resolve) => resolvers.push(resolve)),
     })
     const fibers = []
-    for (let index = 0; index < Permission.REVIEW_CAPACITY; index++) {
+    for (let index = 0; index < PermissionReviewer.CAPACITY; index++) {
       fibers.push(
         yield* reviewerAsk({
           sessionID: SessionID.make(`session_settlement_${index}`),
@@ -3813,10 +4030,10 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
         }).pipe(Effect.forkScoped),
       )
     }
-    while (resolvers.length < Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    while (resolvers.length < PermissionReviewer.CAPACITY) yield* Effect.yieldNow
 
     yield* TestClock.adjust(Permission.REVIEW_TIMEOUT)
-    expect(yield* waitForPending(Permission.REVIEW_CAPACITY)).toHaveLength(Permission.REVIEW_CAPACITY)
+    expect(yield* waitForPending(PermissionReviewer.CAPACITY)).toHaveLength(PermissionReviewer.CAPACITY)
     const overflow = yield* reviewerAsk({
       sessionID: SessionID.make("session_settlement_overflow"),
       permission: "bash",
@@ -3825,14 +4042,14 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       always: [],
       ruleset: [],
     }).pipe(Effect.forkScoped)
-    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 1) yield* Effect.yieldNow
-    expect(yield* list()).toHaveLength(Permission.REVIEW_CAPACITY + 1)
-    expect(reviewerLanguage.doStreamCalls).toHaveLength(Permission.REVIEW_CAPACITY)
+    while ((yield* list()).length < PermissionReviewer.CAPACITY + 1) yield* Effect.yieldNow
+    expect(yield* list()).toHaveLength(PermissionReviewer.CAPACITY + 1)
+    expect(reviewerLanguage.doStreamCalls).toHaveLength(PermissionReviewer.CAPACITY)
 
     for (const resolve of resolvers) resolve(reviewerOutput("allow"))
     while (
       (yield* TestConsole.logLines).filter((line) => JSON.stringify(line).includes("permission review settled"))
-        .length < 4
+        .length < PermissionReviewer.CAPACITY
     ) {
       yield* Effect.yieldNow
     }
@@ -3844,9 +4061,9 @@ it.effect("reviewer - retains built-in capacity until timed-out generation actua
       always: [],
       ruleset: [],
     }).pipe(Effect.forkScoped)
-    while (resolvers.length === Permission.REVIEW_CAPACITY) yield* Effect.yieldNow
+    while (resolvers.length === PermissionReviewer.CAPACITY) yield* Effect.yieldNow
     resolvers.at(-1)!(reviewerOutput("allow"))
-    while ((yield* list()).length < Permission.REVIEW_CAPACITY + 2) yield* Effect.yieldNow
+    while ((yield* list()).length < PermissionReviewer.CAPACITY + 2) yield* Effect.yieldNow
 
     yield* rejectAll()
     for (const fiber of fibers) yield* Fiber.await(fiber)
@@ -3919,10 +4136,28 @@ it.instance(
           !!item && typeof item === "object" && "source" in item && item.source === "bash_evaluator",
       )
       expect(evaluatorLogs).toHaveLength(1)
-      expect(Object.keys(evaluatorLogs[0]!).sort()).toEqual(["authoritative", "latencyMs", "result", "source"])
+      expect(Object.keys(evaluatorLogs[0]!).sort()).toEqual([
+        "auditCorrelationKey",
+        "authoritative",
+        "latencyMs",
+        "origin",
+        "permission",
+        "result",
+        "source",
+      ])
+      expect(evaluatorLogs[0]?.auditCorrelationKey).toBe(
+        auditCorrelationKey({
+          sessionID: "session_evaluator_allow_zero",
+          messageID: "message_session_evaluator_allow_zero",
+          callID: "call_session_evaluator_allow_zero",
+          permission: "bash",
+          origin: "tool",
+        }),
+      )
       expect(JSON.stringify(evaluatorLogs)).not.toContain("git status")
       expect(JSON.stringify(evaluatorLogs)).not.toContain("never log this secret reason")
       expect(JSON.stringify(evaluatorLogs)).not.toContain(test.directory)
+      expect(JSON.stringify(evaluatorLogs)).not.toContain("session_evaluator_allow_zero")
     }),
   withBashEvaluator({ mode: "enforce", policy: { decision: "allow" } }),
   15_000,

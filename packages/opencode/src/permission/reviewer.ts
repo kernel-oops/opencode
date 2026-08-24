@@ -11,8 +11,10 @@ import {
   type Assessment,
   type AssessmentResult,
   type Decision,
+  type ExceptionalRiskAssessment,
   type Failure,
   type ObviousRiskAssessment,
+  type RiskPolicyAssessment,
   type Review,
   type ReviewerAssessment,
 } from "./reviewer-assessment"
@@ -23,8 +25,10 @@ export {
   type Assessment,
   type AssessmentResult,
   type Decision,
+  type ExceptionalRiskAssessment,
   type Failure,
   type ObviousRiskAssessment,
+  type RiskPolicyAssessment,
   type Review,
   type ReviewerAssessment,
 }
@@ -218,7 +222,7 @@ export const layer = Layer.effect(
           Effect.map((result): Result => {
             if ("failure" in result) return result
             if (input.config.mode !== "enforce") return { decision: "ask" }
-            if ((input.config.policy ?? "conservative-v1") === "obvious-risk-only-v1") {
+            if ((input.config.policy ?? "conservative-v1") !== "conservative-v1") {
               return { decision: "ask" }
             }
             if (result.assessment.outcome === "allow") return { decision: "ask" }
