@@ -224,7 +224,7 @@ exec /usr/bin/env -u PWD -u SHLVL ${process.execPath} -e '${evaluatorCode.replac
 const evaluatorDigest = (value: string) => createHash("sha256").update(value).digest("hex")
 
 const withBashEvaluator = (input: {
-  mode: "audit-only" | "enforce"
+  mode: "audit-only" | "permit-only" | "enforce"
   policy: Record<string, unknown>
   plugins?: string[]
   reviewer?:
@@ -4105,6 +4105,125 @@ it.instance(
       expect(calls).toBe(0)
     }),
   withReviewer("enforce"),
+  15_000,
+)
+
+const evaluatorModeMatrix = ["audit-only", "enforce", "permit-only"] as const
+const evaluatorResultMatrix = ["allow", "ask", "noop", "deny", "failure"] as const
+
+for (const mode of evaluatorModeMatrix) {
+  for (const evaluatorResult of evaluatorResultMatrix) {
+    const invokesReviewer =
+      mode === "audit-only" ||
+      (mode === "enforce" && evaluatorResult === "noop") ||
+      (mode === "permit-only" &&
+        (evaluatorResult === "ask" || evaluatorResult === "noop" || evaluatorResult === "failure"))
+    const disposition =
+      mode !== "audit-only" && evaluatorResult === "allow"
+        ? "allow"
+        : mode !== "audit-only" && evaluatorResult === "deny"
+          ? "deny"
+          : "ask"
+    const policy =
+      evaluatorResult === "failure"
+        ? { raw: '{"decision":"allow","reason":"ok","extra":"invalid"}' }
+        : { decision: evaluatorResult }
+
+    it.instance(
+      `bash evaluator matrix - ${mode} ${evaluatorResult}`,
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+          const request = bashRequest(`session_evaluator_matrix_${mode}_${evaluatorResult}`, test.directory)
+
+          if (disposition === "allow") {
+            yield* reviewerAsk(request)
+            expect(yield* list()).toHaveLength(0)
+          } else if (disposition === "deny") {
+            const error = yield* fail(reviewerAsk(request))
+            expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+            expect(yield* list()).toHaveLength(0)
+          } else {
+            const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+            expect(yield* waitForPending(1)).toHaveLength(1)
+            if (invokesReviewer) {
+              while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+            }
+            yield* rejectAll()
+            yield* Fiber.await(fiber)
+          }
+
+          expect(reviewerLanguage.doStreamCalls).toHaveLength(invokesReviewer ? 1 : 0)
+        }),
+      withBashEvaluator({ mode, policy }),
+      15_000,
+    )
+  }
+}
+
+it.instance(
+  "bash evaluator - permit-only allow remains subject to plugin ask",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk(bashRequest("session_permit_only_plugin_ask", test.directory)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "allow" },
+    plugins: [permissionHook('    output.status = "ask"')],
+  }),
+  15_000,
+)
+
+it.instance(
+  "bash evaluator - permit-only allow remains subject to plugin deny",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const error = yield* fail(reviewerAsk(bashRequest("session_permit_only_plugin_deny", test.directory)))
+      expect(error).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "allow" },
+    plugins: [permissionHook('    output.status = "deny"')],
+  }),
+  15_000,
+)
+
+it.instance(
+  "bash evaluator - permit-only uncertainty cannot authorise through audit Luna and plugin allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const fiber = yield* reviewerAsk(bashRequest("session_permit_only_uncertain", test.directory)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      while (reviewerLanguage.doStreamCalls.length === 0) yield* Effect.yieldNow
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { raw: '{"decision":"allow","reason":"ok","extra":"invalid"}' },
+    plugins: [permissionHook('    output.status = "allow"')],
+    reviewer: "audit-only",
+  }),
   15_000,
 )
 

@@ -85,7 +85,7 @@ describe("instance HttpApi", () => {
           }
         }
       ).components.schemas.BashPermissionEvaluatorConfig
-      expect(schema.anyOf).toHaveLength(3)
+      expect(schema.anyOf).toHaveLength(4)
       for (const branch of schema.anyOf) {
         expect(branch.additionalProperties).toBe(false)
         if (branch.properties?.expected) expect(branch.properties.expected.additionalProperties).toBe(false)

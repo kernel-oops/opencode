@@ -2217,6 +2217,11 @@ test("bash_permission_evaluator accepts only strict fail-closed configurations",
     timeout_seconds: 1,
     capacity: 2,
   })
+  expect(parse({ ...active, mode: "permit-only" })).toMatchObject({
+    mode: "permit-only",
+    timeout_seconds: 2,
+    capacity: 4,
+  })
 
   for (const invalid of [
     { mode: "disabled", executable: "/bin/true" },
@@ -2253,7 +2258,7 @@ test("generated schema closes every bash permission evaluator object", () => {
   }
   const branches = schema.$defs.BashPermissionEvaluatorConfig.anyOf
   const mode = (branch: (typeof branches)[number]) => branch.properties.mode.const ?? branch.properties.mode.enum?.[0]
-  expect(branches.map(mode).sort()).toEqual(["audit-only", "disabled", "enforce"])
+  expect(branches.map(mode).sort()).toEqual(["audit-only", "disabled", "enforce", "permit-only"])
   for (const branch of branches) {
     expect(branch.additionalProperties).toBe(false)
     if (mode(branch) !== "disabled") expect(branch.properties.expected?.additionalProperties).toBe(false)

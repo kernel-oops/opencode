@@ -64,7 +64,7 @@ const ActiveKeys = new Set([
   "max_input_bytes",
   "max_output_bytes",
 ])
-const active = (mode: "audit-only" | "enforce") => {
+const active = (mode: "audit-only" | "permit-only" | "enforce") => {
   const output = Schema.Struct({ mode: Schema.Literal(mode), ...Active })
   const input = Schema.StructWithRest(output, [Schema.Record(Schema.String, Schema.Unknown)]).check(
     Schema.makeFilter(
@@ -79,7 +79,7 @@ const active = (mode: "audit-only" | "enforce") => {
   )
 }
 
-export const Info = Schema.Union([Disabled, active("audit-only"), active("enforce")]).annotate({
+export const Info = Schema.Union([Disabled, active("audit-only"), active("permit-only"), active("enforce")]).annotate({
   identifier: "BashPermissionEvaluatorConfig",
 })
 
@@ -96,7 +96,7 @@ function generatedObject(value: unknown): value is GeneratedSchema {
 // so runtime strictness needs the explicit filters above. Its JSON generator cannot
 // represent those filters; close only the validated evaluator shape during generation.
 export function closeGeneratedSchema(value: unknown) {
-  if (!generatedObject(value) || !Array.isArray(value.anyOf) || value.anyOf.length !== 3) {
+  if (!generatedObject(value) || !Array.isArray(value.anyOf) || value.anyOf.length !== 4) {
     throw new Error("generated Bash evaluator schema has an unexpected union")
   }
 
@@ -123,7 +123,13 @@ export function closeGeneratedSchema(value: unknown) {
     expected.additionalProperties = false
   }
 
-  if (!modes.has("disabled") || !modes.has("audit-only") || !modes.has("enforce") || modes.size !== 3) {
+  if (
+    !modes.has("disabled") ||
+    !modes.has("audit-only") ||
+    !modes.has("permit-only") ||
+    !modes.has("enforce") ||
+    modes.size !== 4
+  ) {
     throw new Error("generated Bash evaluator schema has unexpected modes")
   }
 }
