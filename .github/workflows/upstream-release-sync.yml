@@ -14,6 +14,11 @@ on:
         required: false
         default: false
         type: boolean
+      rebuild_current:
+        description: "Rebuild the tracked current stable tag after custom patch-stack changes"
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
@@ -32,6 +37,7 @@ jobs:
       latest_tag: ${{ steps.prepare.outputs.latest_tag }}
       previous_tag: ${{ steps.prepare.outputs.previous_tag }}
       dry_run: ${{ steps.prepare.outputs.dry_run }}
+      rebuild_current: ${{ steps.prepare.outputs.rebuild_current }}
       base_sha: ${{ steps.prepare.outputs.base_sha }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
       candidate_tree: ${{ steps.prepare.outputs.candidate_tree }}
@@ -50,6 +56,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LATEST_TAG_OVERRIDE: ${{ inputs.latest_tag }}
           DRY_RUN: ${{ inputs.dry_run || false }}
+          REBUILD_CURRENT: ${{ inputs.rebuild_current || false }}
         run: .github/scripts/upstream-release-sync.sh prepare "$RUNNER_TEMP/release-sync-artifact"
       - name: Upload immutable candidate bundle and metadata
         id: upload

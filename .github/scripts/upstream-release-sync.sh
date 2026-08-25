@@ -215,8 +215,9 @@ patch_id_for_commit() {
 write_metadata() {
   local file="$1" bundle_digest="$2" base_sha="$3" tag="$4" upstream_sha="$5"
   local candidate_sha="$6" candidate_tree="$7" head_sha="$8" patch_file="$9"
+  local rebuild_current="${10}"
   jq -n -S \
-    --argjson schema 1 \
+    --argjson schema 2 \
     --arg repository "$EXPECTED_REPOSITORY" \
     --arg base_branch "$BASE_BRANCH" \
     --arg generated_ref "$GENERATED_REF" \
@@ -229,12 +230,14 @@ write_metadata() {
     --arg head_tree "$candidate_tree" \
     --arg bundle_sha256 "$bundle_digest" \
     --argjson dry_run "${DRY_RUN:-false}" \
+    --argjson rebuild_current "$rebuild_current" \
     --slurpfile patches "$patch_file" \
     '{schema: $schema, repository: $repository, base_branch: $base_branch,
       generated_ref: $generated_ref, base_sha: $base_sha, upstream_tag: $upstream_tag,
       upstream_sha: $upstream_sha, candidate_sha: $candidate_sha,
       candidate_tree: $candidate_tree, head_sha: $head_sha, head_tree: $head_tree,
-      bundle_sha256: $bundle_sha256, dry_run: $dry_run, patches: $patches}' >"$file"
+      bundle_sha256: $bundle_sha256, dry_run: $dry_run,
+      rebuild_current: $rebuild_current, patches: $patches}' >"$file"
 }
 
 prepare() {
@@ -243,6 +246,7 @@ prepare() {
   local tag marker comparison upstream_sha base_sha candidate_dir candidate_sha candidate_tree head_sha
   local index branch tip parent_line parent_count actual_patch_id classification disposition
   local patch_file bundle bundle_digest metadata_digest applied=0 skipped=0
+  local rebuild_current="${REBUILD_CURRENT:-false}"
 
   require_command git
   require_command gh
@@ -255,6 +259,14 @@ prepare() {
   artifact_name="release-sync-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
   output artifact_name "$artifact_name"
   [[ "${DRY_RUN:-false}" == "true" || "${DRY_RUN:-false}" == "false" ]] || die "DRY_RUN must be true or false"
+  [[ "$rebuild_current" == "true" || "$rebuild_current" == "false" ]] ||
+    die "REBUILD_CURRENT must be true or false"
+  if [[ "$rebuild_current" == "true" ]]; then
+    [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]] ||
+      die "REBUILD_CURRENT=true is allowed only for workflow_dispatch"
+    [[ -z "${LATEST_TAG_OVERRIDE:-}" ]] ||
+      die "REBUILD_CURRENT=true cannot be combined with a tag override"
+  fi
   fetch_inputs
   base_sha="$(git rev-parse "${BASE_REF}^{commit}")"
   marker="$(git show "${base_sha}:${MARKER_FILE}")" || die "missing release marker on ${BASE_BRANCH}"
@@ -269,6 +281,7 @@ prepare() {
   output latest_tag "$tag"
   output previous_tag "$marker"
   output dry_run "${DRY_RUN:-false}"
+  output rebuild_current "$rebuild_current"
   summary "## Upstream release preparation"
   summary "- Base: \`${BASE_BRANCH}@${base_sha}\`"
   summary "- Tracked release: \`${marker}\`"
@@ -277,8 +290,13 @@ prepare() {
   if [[ -z "${LATEST_TAG_OVERRIDE:-}" ]]; then
     ((comparison >= 0)) || die "refusing upstream rollback from $marker to $tag"
     if ((comparison == 0)); then
-      summary "- Result: clean no-op"
-      return
+      if [[ "$rebuild_current" == "false" ]]; then
+        summary "- Result: clean no-op"
+        return
+      fi
+      summary "- Current-tag rebuild: explicitly requested by workflow dispatch"
+    elif [[ "$rebuild_current" == "true" ]]; then
+      die "REBUILD_CURRENT=true requires the latest upstream tag to equal the tracked marker ($marker); got $tag"
     fi
   elif ((comparison == 0)); then
     summary "- Result: dry-run override equals the marker; clean no-op"
@@ -355,12 +373,14 @@ prepare() {
     "$BUNDLE_BASE_REF" "$BUNDLE_UPSTREAM_REF" "$BUNDLE_CANDIDATE_REF" "$BUNDLE_HEAD_REF"
   bundle_digest="$(sha256sum "$bundle" | awk '{print $1}')"
   write_metadata "$artifact_dir/metadata.json" "$bundle_digest" "$base_sha" "$tag" \
-    "$upstream_sha" "$candidate_sha" "$candidate_tree" "$head_sha" "$patch_file"
+    "$upstream_sha" "$candidate_sha" "$candidate_tree" "$head_sha" "$patch_file" \
+    "$rebuild_current"
   metadata_digest="$(sha256sum "$artifact_dir/metadata.json" | awk '{print $1}')"
 
   output state update
   output latest_tag "$tag"
   output dry_run "${DRY_RUN:-false}"
+  output rebuild_current "$rebuild_current"
   output base_sha "$base_sha"
   output head_sha "$head_sha"
   output candidate_tree "$candidate_tree"
@@ -385,9 +405,10 @@ validate_metadata() {
     --argjson patch_tips "$(printf '%s\n' "${PATCH_TIPS[@]}" | jq -R . | jq -s .)" '
       (keys | sort) == (["base_branch", "base_sha", "bundle_sha256", "candidate_sha",
         "candidate_tree", "dry_run", "generated_ref", "head_sha", "head_tree", "patches",
-        "repository", "schema", "upstream_sha", "upstream_tag"] | sort) and
-      .schema == 1 and .repository == $repository and .base_branch == $base_branch and
+        "rebuild_current", "repository", "schema", "upstream_sha", "upstream_tag"] | sort) and
+      .schema == 2 and .repository == $repository and .base_branch == $base_branch and
       .generated_ref == $generated_ref and (.dry_run | type) == "boolean" and
+      (.rebuild_current | type) == "boolean" and
       (.upstream_tag | test("^v(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})$")) and
       ([.base_sha, .upstream_sha, .candidate_sha, .candidate_tree, .head_sha, .head_tree,
         .bundle_sha256] | all(test("^[0-9a-f]{40}$") or test("^[0-9a-f]{64}$"))) and
@@ -431,7 +452,8 @@ metadata_value() {
 import_artifact() {
   local artifact_dir="$1" repo="$2"
   local metadata="$artifact_dir/metadata.json" bundle="$artifact_dir/candidate.bundle"
-  local base_sha upstream_sha candidate_sha candidate_tree head_sha head_tree ref
+  local base_sha base_marker upstream_sha upstream_tag candidate_sha candidate_tree head_sha head_tree
+  local rebuild_current ref
   validate_artifact "$artifact_dir"
   git bundle verify "$bundle" >/dev/null
   git init -q "$repo"
@@ -441,7 +463,9 @@ import_artifact() {
     "$BUNDLE_CANDIDATE_REF:$BUNDLE_CANDIDATE_REF" \
     "$BUNDLE_HEAD_REF:$BUNDLE_HEAD_REF"
   base_sha="$(metadata_value "$metadata" .base_sha)"
+  rebuild_current="$(metadata_value "$metadata" '.rebuild_current | tostring')"
   upstream_sha="$(metadata_value "$metadata" .upstream_sha)"
+  upstream_tag="$(metadata_value "$metadata" .upstream_tag)"
   candidate_sha="$(metadata_value "$metadata" .candidate_sha)"
   candidate_tree="$(metadata_value "$metadata" .candidate_tree)"
   head_sha="$(metadata_value "$metadata" .head_sha)"
@@ -456,8 +480,19 @@ import_artifact() {
   [[ "$candidate_tree" == "$head_tree" ]] || die "tested and generated trees differ"
   [[ "$(git -C "$repo" rev-list --parents -n 1 "$head_sha")" == "$head_sha $base_sha" ]] ||
     die "generated head does not have exactly the recorded base parent"
-  [[ "$(git -C "$repo" show "${head_sha}:${MARKER_FILE}")" == "$(metadata_value "$metadata" .upstream_tag)" ]] ||
+  [[ "$(git -C "$repo" show "${head_sha}:${MARKER_FILE}")" == "$upstream_tag" ]] ||
     die "candidate marker does not match metadata"
+  base_marker="$(git -C "$repo" show "${base_sha}:${MARKER_FILE}")" ||
+    die "recorded base is missing its release marker"
+  if [[ "$rebuild_current" == "true" ]]; then
+    [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]] ||
+      die "current-tag rebuild artifacts are valid only for workflow_dispatch"
+    [[ "$upstream_tag" == "$base_marker" ]] ||
+      die "current-tag rebuild metadata does not match the base marker"
+  else
+    [[ "$upstream_tag" != "$base_marker" ]] ||
+      die "non-rebuild artifact unexpectedly retains the base marker"
+  fi
   if git -C "$repo" ls-tree -r --name-only "$head_sha" -- "$WORKFLOW_FILE" "$HELPER_FILE" | grep -q .; then
     die "candidate contains dev-only automation files"
   fi
