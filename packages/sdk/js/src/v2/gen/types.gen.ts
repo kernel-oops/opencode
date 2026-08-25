@@ -1912,6 +1912,24 @@ export type BashPermissionEvaluatorConfig =
       max_output_bytes?: number
     }
   | {
+      mode: "permit-only"
+      executable: string
+      policy: string
+      executable_sha256: string
+      policy_sha256: string
+      expected: {
+        implementation: string
+        version: string
+        commit: string
+        protocol: string
+        platform: string
+      }
+      timeout_seconds?: number
+      capacity?: number
+      max_input_bytes?: number
+      max_output_bytes?: number
+    }
+  | {
       mode: "enforce"
       executable: string
       policy: string

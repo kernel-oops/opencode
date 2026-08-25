@@ -21224,6 +21224,79 @@
             "properties": {
               "mode": {
                 "type": "string",
+                "enum": ["permit-only"]
+              },
+              "executable": {
+                "type": "string",
+                "minLength": 1
+              },
+              "policy": {
+                "type": "string",
+                "minLength": 1
+              },
+              "executable_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "policy_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "expected": {
+                "type": "object",
+                "properties": {
+                  "implementation": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "commit": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "protocol": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "platform": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["implementation", "version", "commit", "protocol", "platform"],
+                "additionalProperties": false
+              },
+              "timeout_seconds": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 30
+              },
+              "capacity": {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              "max_input_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 262144
+              },
+              "max_output_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 4096
+              }
+            },
+            "required": ["mode", "executable", "policy", "executable_sha256", "policy_sha256", "expected"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
                 "enum": ["enforce"]
               },
               "executable": {

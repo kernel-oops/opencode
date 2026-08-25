@@ -667,9 +667,9 @@ const layer = Layer.effect(
       }
 
       const evaluator =
-        evaluatorConfig?.mode === "enforce" && waitEvaluator
+        (evaluatorConfig?.mode === "enforce" || evaluatorConfig?.mode === "permit-only") && waitEvaluator
           ? yield* waitEvaluator.pipe(
-              Effect.tap(({ reviewResult }) =>
+              Effect.tap(({ run, reviewResult }) =>
                 Clock.currentTimeMillis.pipe(
                   Effect.flatMap((now) =>
                     auditEvaluator({
@@ -677,7 +677,11 @@ const layer = Layer.effect(
                       review,
                       result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
                       latencyMs: now - started,
-                      authoritative: true,
+                      authoritative:
+                        evaluatorConfig.mode === "enforce" ||
+                        (run?.isSettled() === true &&
+                          "decision" in reviewResult &&
+                          (reviewResult.decision === "allow" || reviewResult.decision === "deny")),
                     }),
                   ),
                 ),
@@ -688,8 +692,13 @@ const layer = Layer.effect(
       const remaining = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
 
       const evaluatorEnforcing = evaluatorConfig?.mode === "enforce"
+      const evaluatorPermitOnly = evaluatorConfig?.mode === "permit-only"
       const evaluatorDecision = evaluatorResult && "decision" in evaluatorResult ? evaluatorResult.decision : undefined
-      const needsReviewer = !evaluatorEnforcing || evaluatorDecision === "noop"
+      const evaluatorPermitDecision = evaluator?.run?.isSettled() ? evaluatorDecision : undefined
+      const needsReviewer =
+        (!evaluatorEnforcing && !evaluatorPermitOnly) ||
+        (evaluatorEnforcing && evaluatorDecision === "noop") ||
+        (evaluatorPermitOnly && evaluatorPermitDecision !== "allow" && evaluatorPermitDecision !== "deny")
       if (reviewerConfig?.mode === "audit-only" && needsReviewer && remaining > 0) {
         yield* waitReviewer(remaining).pipe(
           Effect.flatMap(({ run, reviewResult }) =>
@@ -784,7 +793,11 @@ const layer = Layer.effect(
         })
 
       if (pluginResult === "deny") result = "deny"
-      else if (evaluatorEnforcing && evaluatorDecision === "deny") result = "deny"
+      else if (
+        (evaluatorEnforcing && evaluatorDecision === "deny") ||
+        (evaluatorPermitOnly && evaluatorPermitDecision === "deny")
+      )
+        result = "deny"
       else if (pluginResult === "ask") result = "ask"
       else if (evaluatorEnforcing && !evaluatorPermits) result = "ask"
       else if (builtinResult && "failure" in builtinResult) result = "ask"
@@ -811,8 +824,19 @@ const layer = Layer.effect(
         } else result = "ask"
       } else if (builtinResult && "assessment" in builtinResult) {
         result = builtinResult.assessment.outcome === "deny" ? "deny" : "ask"
-      } else if (evaluatorEnforcing && evaluatorDecision === "allow" && pluginPermits) result = "allow"
-      else if (reviewerConfig?.mode !== "enforce" && !evaluatorEnforcing && pluginResult === "allow") result = "allow"
+      } else if (
+        ((evaluatorEnforcing && evaluatorDecision === "allow") ||
+          (evaluatorPermitOnly && evaluatorPermitDecision === "allow")) &&
+        pluginPermits
+      )
+        result = "allow"
+      else if (
+        reviewerConfig?.mode !== "enforce" &&
+        !evaluatorEnforcing &&
+        !evaluatorPermitOnly &&
+        pluginResult === "allow"
+      )
+        result = "allow"
       else result = "ask"
 
       const latencyMs = (yield* Clock.currentTimeMillis) - started

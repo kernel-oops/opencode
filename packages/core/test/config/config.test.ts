@@ -63,7 +63,7 @@ it.effect("bash evaluator JSON schema forbids additional properties", () =>
         properties?: { expected?: { additionalProperties?: unknown } }
       }>
     }
-    expect(closed.anyOf).toHaveLength(3)
+    expect(closed.anyOf).toHaveLength(4)
     for (const branch of closed.anyOf) {
       expect(branch.additionalProperties).toBe(false)
       if (branch.properties?.expected) expect(branch.properties.expected.additionalProperties).toBe(false)
