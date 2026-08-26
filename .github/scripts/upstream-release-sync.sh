@@ -37,6 +37,7 @@ readonly PATCH_BRANCHES=(
   "audit-correlation-log"
   "exceptional-risk-policy"
   "permit-only-evaluator"
+  "generic-reviewer"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -54,6 +55,7 @@ readonly PATCH_IDS=(
   "2962ce77cc0e89955e2dc952f6f5bd941e56465c"
   "8d5352767402a5c6c1278eb0bc3f632462e9a1c9"
   "c300b3afd3a5e82dd4b1540db2e2301c95612613"
+  "032ef160bac34596b3587a4a6c7cc1959ae8075f"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -71,6 +73,7 @@ readonly PATCH_TIPS=(
   "f009e4a9e73e23daa98e410b0865cfbe95c5f357"
   "f4d5e64be105ccf3bb71f98ec1ca49719c3cd96c"
   "525a5f583c5a41c2ce511846e5a7418f9f9d40fa"
+  "1a48976f27ecc4278ed3469eda1addd805bf84d5"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
