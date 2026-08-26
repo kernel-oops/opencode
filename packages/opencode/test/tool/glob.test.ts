@@ -1,6 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
 import path from "path"
+import fs from "node:fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { GlobTool } from "../../src/tool/glob"
@@ -22,6 +23,10 @@ import type * as Tool from "../../src/tool/tool"
 import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
 import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
 
+type ReviewRequest = Omit<PermissionV1.Request, "id" | "sessionID" | "tool"> & {
+  readonly action?: PermissionV1.ReviewAction
+}
+
 const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
     LayerNode.group([CrossSpawnSpawner.node, FSUtil.node, Ripgrep.node, Truncate.node, Agent.node, Git.node]),
@@ -42,7 +47,7 @@ const ctx = {
 }
 
 const asks = () => {
-  const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  const items: ReviewRequest[] = []
   return {
     items,
     next: {
@@ -88,7 +93,7 @@ const git = Effect.fn("GlobToolTest.git")(function* (cwd: string, args: string[]
 })
 
 describe("tool.glob", () => {
-  it.instance("keeps an omitted path complete and JSON-safe for generic review", () =>
+  it.instance("keeps an omitted path human-authorised because descendant mounts are not pinned", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
@@ -108,6 +113,7 @@ describe("tool.glob", () => {
         identity: "glob",
         arguments: args,
         directory: test.directory,
+        requested: request.action,
       })
       const snapshot = buildPermissionReviewSnapshot({
         permission: request.permission,
@@ -119,7 +125,7 @@ describe("tool.glob", () => {
         untrusted: [],
         contextSafeForGate: true,
       })
-      expect(snapshot.action.complete).toBe(true)
+      expect(snapshot.action.complete).toBe(false)
       expect(
         isGenericRiskAllowCandidate({
           settled: true,
@@ -131,7 +137,7 @@ describe("tool.glob", () => {
           },
           snapshot,
         }),
-      ).toBe(true)
+      ).toBe(false)
 
       const pending = [
         {
@@ -146,7 +152,7 @@ describe("tool.glob", () => {
     }),
   )
 
-  it.instance("keeps an explicit path incomplete for generic review", () =>
+  it.instance("keeps an explicit exact-root path human-authorised", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const captured = asks()
@@ -162,6 +168,7 @@ describe("tool.glob", () => {
         identity: "glob",
         arguments: args,
         directory: test.directory,
+        requested: captured.items[0]?.action,
       })
       const snapshot = buildPermissionReviewSnapshot({
         permission: "glob",
@@ -174,6 +181,90 @@ describe("tool.glob", () => {
         contextSafeForGate: true,
       })
       expect(action.complete).toBe(false)
+      expect(snapshot.action.complete).toBe(false)
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "glob",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(false)
+    }),
+  )
+
+  it.instance("keeps an omitted-path search on the directory pinned before permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const test = yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const moved = `${test.directory}.pinned-glob`
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "inside-marker.ts"), "inside\n"))
+      yield* Effect.promise(() => Bun.write(path.join(outside, "outside-sentinel.ts"), "outside\n"))
+      let replaced = false
+      const next = {
+        ...ctx,
+        ask: () =>
+          Effect.promise(async () => {
+            await fs.rename(test.directory, moved)
+            await fs.symlink(outside, test.directory, "dir")
+            replaced = true
+          }),
+      }
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+
+      const result = yield* glob.execute({ pattern: "*.ts" }, next).pipe(
+        Effect.ensuring(
+          Effect.promise(async () => {
+            if (!replaced) return
+            await fs.rm(test.directory)
+            await fs.rename(moved, test.directory)
+          }),
+        ),
+      )
+
+      expect(result.output).toContain(path.join(test.directory, "inside-marker.ts"))
+      expect(result.output).not.toContain("outside-sentinel")
+      expect(result.output).not.toContain("/proc/self/fd")
+    }),
+  )
+
+  it.instance("keeps an explicit child directory outside the generic root contract", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const child = path.join(test.directory, "child")
+      yield* Effect.promise(() => fs.mkdir(child))
+      const captured = asks()
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const args = { pattern: "*.ts", path: child }
+
+      yield* glob.execute(args, captured.next)
+
+      const request = captured.items.at(-1)
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "glob",
+        arguments: args,
+        directory: test.directory,
+        requested: request?.action,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: "glob",
+        origin: "tool",
+        patterns: request?.patterns,
+        metadata: request?.metadata,
+        action,
+        trusted: [{ source: "human", text: "Find TypeScript files" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(action.cwd).toBe(child)
       expect(snapshot.action.complete).toBe(false)
       expect(
         isGenericRiskAllowCandidate({

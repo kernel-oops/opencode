@@ -41,6 +41,7 @@ import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
 import { and, eq } from "drizzle-orm"
 import { auditCorrelationKey } from "../../src/permission/audit-correlation"
 import { PermissionReviewer } from "../../src/permission/reviewer"
+import { LITERAL_GREP_LIMITS } from "../../src/tool/grep-bound-files"
 
 const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
 const reviewerModel = ProviderTest.model({
@@ -324,6 +325,39 @@ const genericGlobRequest = (sessionID: SessionID, turnID: MessageID, directory: 
     },
   },
 })
+
+const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
+  const pattern = "Calendar apps choose when to refresh|refreshes every 6 hours|PUBLISHED-TTL|REFRESH-INTERVAL"
+  return {
+    sessionID,
+    tool: { messageID: turnID, callID: `call_${sessionID}` },
+    permission: "grep",
+    patterns: [pattern],
+    metadata: { pattern, path: directory },
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: {
+        identity: "grep",
+        arguments: {
+          pattern,
+          path: directory,
+          literals: pattern.split("|"),
+          mode: "pinned-project-literal-grep-v4",
+          executor: "literal-utf8-lf-lines-v1",
+          bindingId: "0".repeat(32),
+          fileCount: 2,
+          totalBytes: 1024,
+          limits: LITERAL_GREP_LIMITS,
+          effects: [],
+        },
+        cwd: directory,
+        complete: true,
+      },
+    },
+  }
+}
 
 const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn")(function* (input: {
   sessionID: SessionID
@@ -3663,7 +3697,7 @@ it.instance(
 )
 
 it.instance(
-  "generic reviewer - trusted glob reaches Luna and bypasses the Bash-only evaluator",
+  "generic reviewer - trusted glob stays human when descendant traversal is not pinned",
   () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -3674,13 +3708,15 @@ it.instance(
         doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
 
-      yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory))
+      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
 
       expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
-      expect(yield* list()).toHaveLength(0)
       const logs = JSON.stringify(yield* TestConsole.logLines)
       expect(logs).not.toContain('"source":"bash_evaluator"')
-      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).not.toContain('"dispositionAuthority":"automatic_allow"')
     }),
   withBashEvaluator({
     mode: "permit-only",
@@ -3691,6 +3727,26 @@ it.instance(
       automatic_allow: "policy-gated",
     },
   }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - descriptor-bound literal grep can be automatically allowed",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Generic literal grep allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(genericLiteralGrepRequest(sessionID, turnID, test.directory))
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
   15_000,
 )
 

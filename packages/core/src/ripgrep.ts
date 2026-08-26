@@ -54,6 +54,10 @@ export interface FindInput {
   readonly limit: number
   readonly hidden?: boolean
   readonly follow?: boolean
+  readonly oneFileSystem?: boolean
+  readonly strict?: boolean
+  readonly preservePath?: boolean
+  readonly nullSeparated?: boolean
   readonly signal?: AbortSignal
   readonly onEntry?: (entry: Entry) => Effect.Effect<void>
 }
@@ -64,6 +68,7 @@ export interface GlobInput {
   readonly limit: number
   readonly hidden?: boolean
   readonly follow?: boolean
+  readonly oneFileSystem?: boolean
   readonly signal?: AbortSignal
 }
 
@@ -101,6 +106,7 @@ const layer = Layer.effect(
       readonly limit: number
       readonly signal?: AbortSignal
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
+      readonly nullSeparated?: boolean
       readonly pattern?: string
       readonly onItem?: (item: A) => Effect.Effect<void>
     }) => {
@@ -114,8 +120,25 @@ const layer = Layer.effect(
             Effect.forkScoped,
           )
           let observed = 0
-          const rows = yield* Stream.decodeText(handle.stdout).pipe(
-            Stream.splitLines,
+          let unterminated = false
+          const records = input.nullSeparated
+            ? Stream.decodeText(handle.stdout).pipe(
+                Stream.mapAccumArray(
+                  () => "",
+                  (remainder, chunk) => {
+                    const records = `${remainder}${chunk.join("")}`.split("\0")
+                    return [records.pop() ?? "", records]
+                  },
+                  {
+                    onHalt: (remainder) => {
+                      unterminated = remainder.length > 0
+                      return []
+                    },
+                  },
+                ),
+              )
+            : Stream.decodeText(handle.stdout).pipe(Stream.splitLines)
+          const rows = yield* records.pipe(
             Stream.filter((line) => line.length > 0),
             Stream.mapEffect(input.parse),
             Stream.filter((row): row is A => row !== undefined),
@@ -132,6 +155,7 @@ const layer = Layer.effect(
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
+          if (unterminated) return yield* failure("ripgrep emitted an incomplete record")
           if (input.pattern && code === 2 && isInvalidPattern(stderr)) {
             return yield* new InvalidPatternError({ pattern: input.pattern, message: stderr.trim() })
           }
@@ -162,6 +186,7 @@ const layer = Layer.effect(
             "--files",
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
+            ...(input.oneFileSystem ? ["--one-file-system"] : []),
             `--glob=${input.pattern}`,
             "--glob=!**/.git/**",
             ".",
@@ -194,25 +219,29 @@ const layer = Layer.effect(
             "--files",
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
+            ...(input.oneFileSystem ? ["--one-file-system"] : []),
+            ...(input.nullSeparated ? ["--null"] : []),
             ...(input.pattern === "*" ? [] : [`--glob=${input.pattern}`]),
             "--glob=!**/.git/**",
             ".",
           ],
           parse: (line) => {
-            const relative = line
-              .replace(/^(?:\.[\\/])+/u, "")
-              .replace(/^[\\/]+/u, "")
-              .replaceAll("\\", "/")
+            const relative = line.replace(/^(?:\.[\\/])+/u, "").replace(/^[\\/]+/u, "")
             return Effect.succeed(
               Entry.make({
-                path: RelativePath.make(relative),
+                path: RelativePath.make(input.preservePath ? relative : relative.replaceAll("\\", "/")),
                 type: "file",
               }),
             )
           },
+          nullSeparated: input.nullSeparated,
           onItem: input.onEntry,
         }).pipe(
-          Effect.map((result) => result.items),
+          Effect.flatMap((result) =>
+            input.strict && (result.partial || result.truncated)
+              ? Effect.fail(failure("ripgrep file enumeration was incomplete"))
+              : Effect.succeed(result.items),
+          ),
           Effect.catchTag("Ripgrep.InvalidPatternError", (cause) => Effect.fail(failure(cause.message, cause))),
         ),
       grep: (input) =>

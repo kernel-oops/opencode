@@ -1,8 +1,10 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
+import { createHash } from "node:crypto"
+import fs from "node:fs/promises"
 import { Agent } from "../../src/agent/agent"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -15,9 +17,22 @@ import { Permission } from "../../src/permission"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { Instruction } from "../../src/session/instruction"
 import { ReadTool } from "../../src/tool/read"
+import {
+  bindProjectTextFile,
+  closeBoundProjectTextFile,
+  readBoundProjectTextFile,
+  supportsInstructionWatchFilesystem,
+} from "../../src/tool/read-bound-file"
+import { generation } from "../../src/tool/bound-generation"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
 import { Filesystem } from "@/util/filesystem"
+import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
+import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
+
+type ReviewRequest = Omit<PermissionV1.Request, "id" | "sessionID" | "tool"> & {
+  readonly action?: PermissionV1.ReviewAction
+}
 import {
   disposeAllInstances,
   provideInstance,
@@ -134,8 +149,16 @@ const load = Effect.fn("ReadToolTest.load")(function* (p: string) {
   const fs = yield* FSUtil.Service
   return yield* fs.readFileString(p)
 })
+async function inotifyWatchCount() {
+  let count = 0
+  for (const fd of await fs.readdir("/proc/self/fd")) {
+    const info = await fs.readFile(`/proc/self/fdinfo/${fd}`, "utf8").catch(() => "")
+    count += info.match(/^inotify wd:/gmu)?.length ?? 0
+  }
+  return count
+}
 const asks = () => {
-  const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  const items: ReviewRequest[] = []
   return {
     items,
     next: {
@@ -147,6 +170,566 @@ const asks = () => {
     },
   }
 }
+
+describe("tool.read pinned project text review", () => {
+  it.live("fails instruction watching closed on an unsupported filesystem", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const supported = yield* Effect.acquireRelease(
+        Effect.promise(() => fs.open(dir, "r")),
+        (file) => Effect.promise(() => file.close()),
+      )
+      const unsupported = yield* Effect.acquireRelease(
+        Effect.promise(() => fs.open("/proc", "r")),
+        (file) => Effect.promise(() => file.close()),
+      )
+      expect(yield* Effect.promise(() => supportsInstructionWatchFilesystem(supported.fd))).toBe(true)
+      expect(yield* Effect.promise(() => supportsInstructionWatchFilesystem(unsupported.fd))).toBe(false)
+    }),
+  )
+
+  it.live("closes a directory descriptor when watcher creation fails synchronously", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "WatcherFailure.php")
+      yield* put(filepath, "<?php\n// watcher failure\n")
+
+      const bound = yield* Effect.promise(() =>
+        bindProjectTextFile(dir, filepath, {
+          createWatcher: () => {
+            throw new Error("simulated synchronous watcher creation failure")
+          },
+        }),
+      )
+
+      expect(bound).toBeUndefined()
+      const links = yield* Effect.promise(async () =>
+        Promise.all(
+          (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+        ),
+      )
+      expect(links.filter((item) => item === dir || item.startsWith(`${dir}${path.sep}`))).toHaveLength(0)
+    }),
+  )
+
+  it.live("allows the exact bounded PHP read shape with a truthful action", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "CalendarController.php")
+      yield* put(filepath, "<?php\nfinal class CalendarController {}\n")
+      const captured = asks()
+      const args = { filePath: filepath, offset: 1, limit: 20 }
+
+      const result = yield* exec(dir, args, captured.next)
+      const request = captured.items.at(-1)
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "read",
+        arguments: args,
+        directory: dir,
+        requested: request?.action,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: "read",
+        origin: "tool",
+        patterns: request?.patterns,
+        metadata: request?.metadata,
+        action,
+        trusted: [{ source: "human", text: "Read the calendar refresh implementation" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+
+      expect(result.output).toContain("CalendarController")
+      expect(action).toMatchObject({
+        identity: "read",
+        cwd: dir,
+        complete: true,
+        arguments: {
+          filePath: filepath,
+          offset: 1,
+          limit: 20,
+          target: "CalendarController.php",
+          mode: "pinned-project-text-v4",
+          bindingId: expect.stringMatching(/^[0-9a-f]{32}$/u),
+          instructionFilesAbsent: true,
+          instructionWatch: "linux-inotify-v1",
+          effects: [],
+        },
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "read",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(true)
+    }),
+  )
+
+  it.live("keeps four ordinary Calendar PHP reads on the committed generic path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const names = ["CalendarController.php", "CalendarRefresh.php", "PushUpdates.php", "CalendarConfig.php"]
+      for (const name of names) yield* put(path.join(dir, name), `<?php\n// ${name}\n`)
+
+      for (const name of names) {
+        const captured = asks()
+        const args = { filePath: path.join(dir, name), offset: 1, limit: 20 }
+        const result = yield* exec(dir, args, captured.next)
+        const action = resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: args,
+          directory: dir,
+          requested: captured.items.at(-1)?.action,
+        })
+        expect(result.output).toContain(name)
+        expect(action.complete).toBe(true)
+        expect(action.arguments).toMatchObject({
+          mode: "pinned-project-text-v4",
+          bindingId: expect.stringMatching(/^[0-9a-f]{32}$/u),
+          instructionWatch: "linux-inotify-v1",
+        })
+      }
+    }),
+  )
+
+  it.live("uses unlinkable opaque binding IDs without serialising content commitments", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "CalendarOpaque.php")
+      const content = "<?php\n// identical content\n"
+      yield* put(filepath, content)
+      const captured = asks()
+      const args = { filePath: filepath, offset: 1, limit: 20 }
+
+      yield* exec(dir, args, captured.next)
+      yield* exec(dir, args, captured.next)
+
+      const snapshots = captured.items
+        .filter((item) => item.permission === "read")
+        .map((request) =>
+          buildPermissionReviewSnapshot({
+            permission: "read",
+            origin: "tool",
+            patterns: request.patterns,
+            metadata: request.metadata,
+            action: resolveReviewAction({
+              builtin: true,
+              identity: "read",
+              arguments: args,
+              directory: dir,
+              requested: request.action,
+            }),
+            trusted: [{ source: "human", text: "Read the calendar implementation" }],
+            untrusted: [],
+            contextSafeForGate: true,
+          }),
+        )
+      const bindingIds = snapshots.map((snapshot) => {
+        const argumentsValue = snapshot.action.arguments
+        if (typeof argumentsValue !== "object" || argumentsValue === null || Array.isArray(argumentsValue))
+          throw new Error("read snapshot arguments were not captured")
+        return Reflect.get(argumentsValue, "bindingId")
+      })
+      const serialised = JSON.stringify(snapshots)
+      expect(bindingIds).toHaveLength(2)
+      expect(bindingIds[0]).toMatch(/^[0-9a-f]{32}$/u)
+      expect(bindingIds[1]).toMatch(/^[0-9a-f]{32}$/u)
+      expect(bindingIds[0]).not.toBe(bindingIds[1])
+      expect(serialised).not.toContain(createHash("sha256").update(content).digest("hex"))
+      expect(serialised).not.toMatch(
+        /contentDigest|generationDigest|directoryGenerationDigest|ctimeNs|mtimeNs|mountID/u,
+      )
+    }),
+  )
+
+  it.live("keeps a PHP read below nested instructions on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const nested = path.join(dir, "module")
+      yield* Effect.promise(() => fs.mkdir(nested))
+      yield* put(path.join(nested, "AGENTS.md"), "Nested instructions\n")
+      const filepath = path.join(nested, "Calendar.php")
+      yield* put(filepath, "<?php\n// nested\n")
+      const captured = asks()
+
+      yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+    }),
+  )
+
+  it.live("uses replacement decoding for invalid UTF-8 on the pinned path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Invalid.php")
+      yield* Effect.promise(() => fs.writeFile(filepath, Buffer.from([0x3c, 0x3f, 0x70, 0x68, 0x70, 0x0a, 0xff, 0x0a])))
+
+      const result = yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, asks().next)
+      expect(result.output).toContain("�")
+    }),
+  )
+
+  it.live("splits lone carriage returns on the pinned path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Carriage.php")
+      yield* put(filepath, "<?php\rfirst\rsecond\r")
+
+      const result = yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, asks().next)
+      expect(result.output).toContain("first")
+      expect(result.output).toContain("second")
+      expect(result.output).not.toContain("first\rsecond")
+    }),
+  )
+
+  it.live("fails closed when the validated path is replaced during permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Calendar.php")
+      const moved = path.join(dir, "Calendar.original.php")
+      yield* put(filepath, "<?php\n// pinned original\n")
+      const captured = asks()
+      const next = {
+        ...captured.next,
+        ask: (request: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) =>
+          Effect.promise(async () => {
+            captured.items.push(request)
+            await fs.rename(filepath, moved)
+            await Bun.write(filepath, "<?php\n// substituted content\n")
+          }),
+      }
+
+      const error = yield* fail(dir, { filePath: filepath, offset: 1, limit: 20 }, next)
+
+      expect(error.message).toMatch(/generation changed|instruction watch changed/u)
+      const links = yield* Effect.promise(async () =>
+        Promise.all(
+          (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+        ),
+      )
+      expect(links.some((item) => item.includes("Calendar.original.php"))).toBe(false)
+    }),
+  )
+
+  it.live("closes the pinned descriptor when permission fails", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "nested", "Denied.php")
+      const baseline = yield* Effect.promise(inotifyWatchCount)
+      yield* put(filepath, "<?php\n// denied\n")
+      const next = {
+        ...asks().next,
+        ask: () => Effect.die(new Error("permission denied")),
+      }
+
+      yield* Effect.exit(exec(dir, { filePath: filepath, offset: 1, limit: 20 }, next))
+      const links = yield* Effect.promise(async () =>
+        Promise.all(
+          (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+        ),
+      )
+      expect(links.some((item) => item.includes("Denied.php"))).toBe(false)
+      expect(yield* Effect.promise(inotifyWatchCount)).toBeLessThanOrEqual(baseline)
+    }),
+  )
+
+  it.live("returns to the fd baseline when a pinned read is cancelled", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "nested", "Cancelled.php")
+      const watchBaseline = yield* Effect.promise(inotifyWatchCount)
+      yield* put(filepath, "<?php\n// cancelled\n")
+      const entered = yield* Deferred.make<void>()
+      const next = {
+        ...asks().next,
+        ask: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      }
+
+      const fiber = yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, next).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+
+      const links = yield* Effect.promise(async () =>
+        Promise.all(
+          (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+        ),
+      )
+      expect(links.filter((item) => item === dir || item.startsWith(`${dir}${path.sep}`)).length).toBe(0)
+      expect(yield* Effect.promise(inotifyWatchCount)).toBeLessThanOrEqual(watchBaseline)
+    }),
+  )
+
+  it.live("keeps symlinked PHP files on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      const target = path.join(outside, "Secret.php")
+      const filepath = path.join(dir, "Linked.php")
+      yield* put(target, "<?php\n// outside\n")
+      yield* Effect.promise(() => fs.symlink(target, filepath))
+      const captured = asks()
+
+      yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
+
+      const read = captured.items.find((item) => item.permission === "read")
+      expect(read?.action).toBeUndefined()
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: { filePath: filepath, offset: 1, limit: 20 },
+          directory: dir,
+          requested: read?.action,
+        }).complete,
+      ).toBe(false)
+    }),
+  )
+
+  it.live("keeps PHP files below a symlinked directory on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      const target = path.join(outside, "Secret.php")
+      const linked = path.join(dir, "linked")
+      yield* put(target, "<?php\n// outside\n")
+      yield* Effect.promise(() => fs.symlink(outside, linked, "dir"))
+      const captured = asks()
+
+      yield* exec(dir, { filePath: path.join(linked, "Secret.php"), offset: 1, limit: 20 }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+    }),
+  )
+
+  it.live("keeps hard-linked PHP files on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform === "win32") return
+      const dir = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      const target = path.join(outside, "Secret.php")
+      const linked = path.join(dir, "Linked.php")
+      yield* put(target, "<?php\n// outside\n")
+      yield* Effect.promise(() => fs.link(target, linked))
+      const captured = asks()
+
+      yield* exec(dir, { filePath: linked, offset: 1, limit: 20 }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+    }),
+  )
+
+  it.live("keeps oversized PHP files on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Oversized.php")
+      yield* Effect.promise(() => Bun.write(filepath, Buffer.alloc(1024 * 1024 + 1, 0x61)))
+      const captured = asks()
+
+      yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+    }),
+  )
+
+  it.live("keeps descriptor consumption bounded if the file grows after permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Growing.php")
+      yield* put(filepath, "<?php\n// initially small\n")
+      const next = {
+        ...asks().next,
+        ask: () => Effect.promise(() => fs.truncate(filepath, 1024 * 1024 + 1)),
+      }
+
+      const error = yield* fail(dir, { filePath: filepath, offset: 1, limit: 20 }, next)
+
+      expect(error.message).toMatch(/generation changed|instruction watch changed/u)
+    }),
+  )
+
+  it.live("fails closed on same-size rewrites, shrink and link-generation changes", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const outside = yield* tmpdirScoped()
+      const cases: readonly [string, (filepath: string) => Promise<void>][] = [
+        [
+          "same-size rewrite",
+          async (filepath) => {
+            const current = await fs.readFile(filepath)
+            await fs.writeFile(filepath, Buffer.alloc(current.length, 0x78))
+          },
+        ],
+        ["shrink", (filepath) => fs.truncate(filepath, 3)],
+        [
+          "persistent hard link",
+          async (filepath) => {
+            await fs.link(filepath, path.join(outside, "persistent-hard-link.php"))
+          },
+        ],
+      ]
+      for (const [name, mutate] of cases) {
+        const filepath = path.join(dir, `${name.replaceAll(" ", "-")}.php`)
+        yield* put(filepath, "<?php\n// original content\n")
+        const error = yield* fail(
+          dir,
+          { filePath: filepath, offset: 1, limit: 20 },
+          {
+            ...asks().next,
+            ask: () => Effect.promise(() => mutate(filepath)),
+          },
+        )
+        expect(error.message).toMatch(/generation changed|instruction watch changed/u)
+      }
+      const filepath = path.join(dir, "temporary-hard-link.php")
+      yield* put(filepath, "<?php\n// original content\n")
+      const exit = yield* Effect.exit(
+        exec(
+          dir,
+          { filePath: filepath, offset: 1, limit: 20 },
+          {
+            ...asks().next,
+            ask: () =>
+              Effect.promise(async () => {
+                const alias = path.join(outside, "temporary-hard-link.php")
+                await fs.link(filepath, alias)
+                await fs.unlink(alias)
+              }),
+          },
+        ),
+      )
+      if (Exit.isSuccess(exit)) expect(exit.value.output).toContain("original content")
+      else expect(String(exit.cause)).toContain("generation changed")
+    }),
+  )
+
+  it.live("fails closed while a bound project file is being rewritten", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Concurrent.php")
+      yield* Effect.promise(() => fs.writeFile(filepath, Buffer.alloc(1024 * 1024, 0x61)))
+      const bound = yield* Effect.promise(() => bindProjectTextFile(dir, filepath))
+      expect(bound).toBeDefined()
+      if (!bound) return
+
+      const started = Promise.withResolvers<void>()
+      const writing = (async () => {
+        for (let count = 0; count < 16; count++) {
+          await fs.writeFile(filepath, Buffer.alloc(1024 * 1024, count % 2 ? 0x62 : 0x63))
+          if (count === 0) started.resolve()
+        }
+      })()
+      try {
+        yield* Effect.promise(() => started.promise)
+        const exit = yield* Effect.exit(Effect.promise(() => readBoundProjectTextFile(bound)))
+        expect(exit._tag).toBe("Failure")
+        if (exit._tag === "Failure") expect(String(exit.cause)).toMatch(/generation changed|instruction watch changed/u)
+      } finally {
+        yield* Effect.promise(() => writing.then(() => undefined))
+        yield* Effect.promise(() => closeBoundProjectTextFile(bound))
+      }
+    }),
+  )
+
+  it.live("content commitment catches a same-size rewrite when generation fields appear unchanged", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const filepath = path.join(dir, "Coarse.php")
+      yield* put(filepath, "original")
+      const bound = yield* Effect.promise(() => bindProjectTextFile(dir, filepath))
+      expect(bound).toBeDefined()
+      if (!bound) return
+      try {
+        yield* Effect.promise(() => fs.writeFile(filepath, "rewrite!"))
+        yield* Effect.promise(() => new Promise<void>((resolve) => setImmediate(() => setImmediate(resolve))))
+        bound.instructionWatch.dirty = false
+        const current = yield* Effect.promise(() => generation(bound.file))
+        const error = yield* Effect.exit(
+          Effect.promise(() => readBoundProjectTextFile({ ...bound, generation: current })),
+        )
+        expect(error._tag).toBe("Failure")
+        if (error._tag === "Failure") expect(String(error.cause)).toContain("content changed")
+      } finally {
+        yield* Effect.promise(() => closeBoundProjectTextFile(bound))
+      }
+    }),
+  )
+
+  it.live("fails closed when nested instruction state changes during permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      for (const temporary of [false, true]) {
+        const nested = path.join(dir, temporary ? "temporary" : "persistent")
+        const filepath = path.join(nested, "Calendar.php")
+        const instruction = path.join(nested, "AGENTS.md")
+        yield* put(filepath, "<?php\n// private implementation\n")
+        const error = yield* fail(
+          dir,
+          { filePath: filepath, offset: 1, limit: 20 },
+          {
+            ...asks().next,
+            ask: () =>
+              Effect.promise(async () => {
+                await fs.writeFile(instruction, "changed instructions\n")
+                if (temporary) await fs.unlink(instruction)
+              }),
+          },
+        )
+        expect(error.message).toContain("instruction watch changed")
+      }
+    }),
+  )
+
+  it.live("fails closed when a retained descendant directory is replaced during permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const nested = path.join(dir, "module")
+      const moved = path.join(dir, "module-original")
+      const filepath = path.join(nested, "Calendar.php")
+      yield* put(filepath, "<?php\n// original\n")
+      const error = yield* fail(
+        dir,
+        { filePath: filepath, offset: 1, limit: 20 },
+        {
+          ...asks().next,
+          ask: () =>
+            Effect.promise(async () => {
+              await fs.rename(nested, moved)
+              await fs.mkdir(nested)
+            }),
+        },
+      )
+      expect(error.message).toContain("instruction watch changed")
+    }),
+  )
+})
 
 describe("tool.read external_directory permission", () => {
   it.live("allows reading absolute path inside project directory", () =>

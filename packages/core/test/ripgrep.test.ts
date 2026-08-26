@@ -31,6 +31,27 @@ describe("Ripgrep", () => {
     ),
   )
 
+  it.live("preserves newlines in null-separated find results", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => fs.writeFile(path.join(tmp.path, "split\nname.txt"), "included\n"))
+
+          const files = yield* (yield* Ripgrep.Service).find({
+            cwd: tmp.path,
+            pattern: "*",
+            limit: 10,
+            nullSeparated: true,
+            preservePath: true,
+            strict: true,
+          })
+          expect(files.map((item) => item.path)).toEqual([RelativePath.make("split\nname.txt")])
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("never includes git metadata", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
