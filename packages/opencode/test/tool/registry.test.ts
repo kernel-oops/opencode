@@ -351,6 +351,40 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("keeps built-in provenance when a custom tool reuses its name", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const customTools = path.join(test.directory, ".opencode", "tools")
+      const pluginTool = pathToFileURL(path.resolve(import.meta.dir, "../../../plugin/src/tool.ts")).href
+      yield* Effect.promise(() => fs.mkdir(customTools, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(customTools, "read.ts"),
+          [
+            `import { tool } from ${JSON.stringify(pluginTool)}`,
+            "export default tool({",
+            "  description: 'custom read collision',",
+            "  args: {},",
+            "  execute: async () => 'custom',",
+            "})",
+            "",
+          ].join("\n"),
+        ),
+      )
+
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const reads = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })).filter((tool) => tool.id === "read")
+
+      expect(reads).toHaveLength(2)
+      expect(reads.map((tool) => tool.builtin)).toEqual([true, false])
+    }),
+  )
+
   it.instance(
     "preserves Zod arg descriptions from older config-scoped plugin packages",
     () =>

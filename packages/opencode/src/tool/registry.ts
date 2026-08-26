@@ -66,6 +66,7 @@ export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false
 
 type TaskDef = Tool.InferDef<typeof TaskTool>
 type ReadDef = Tool.InferDef<typeof ReadTool>
+export type Registered = Tool.Def & { readonly builtin: boolean }
 
 type State = {
   custom: Tool.Def[]
@@ -83,7 +84,7 @@ export interface Interface {
     modelID: ModelV2.ID
     agent: Agent.Info
     permission?: PermissionV1.Ruleset
-  }) => Effect.Effect<Tool.Def[]>
+  }) => Effect.Effect<Registered[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
@@ -289,6 +290,8 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      const registered = yield* InstanceState.get(state)
+      const builtin = new Set(registered.builtin)
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
@@ -333,6 +336,7 @@ const layer = Layer.effect(
             jsonSchema,
             execute: tool.execute,
             formatValidationError: tool.formatValidationError,
+            builtin: builtin.has(tool),
           }
         }),
         { concurrency: "unbounded" },
