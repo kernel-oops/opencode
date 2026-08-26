@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { GlobTool } from "../../src/tool/glob"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -19,6 +19,8 @@ import { Git } from "@/git"
 import { Filesystem } from "@/util/filesystem"
 import { Permission } from "../../src/permission"
 import type * as Tool from "../../src/tool/tool"
+import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
+import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
 
 const toolLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   LayerNode.compile(
@@ -86,6 +88,108 @@ const git = Effect.fn("GlobToolTest.git")(function* (cwd: string, args: string[]
 })
 
 describe("tool.glob", () => {
+  it.instance("keeps an omitted path complete and JSON-safe for generic review", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "a.ts"), "export const a = 1\n"))
+      const captured = asks()
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const args = { pattern: "*.ts" }
+
+      yield* glob.execute(args, captured.next)
+
+      expect(captured.items).toHaveLength(1)
+      const request = captured.items[0]
+      expect(request.metadata).toEqual({ pattern: "*.ts" })
+      expect(Object.hasOwn(request.metadata, "path")).toBe(false)
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "glob",
+        arguments: args,
+        directory: test.directory,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: request.permission,
+        origin: "tool",
+        patterns: request.patterns,
+        metadata: request.metadata,
+        action,
+        trusted: [{ source: "human", text: "Find TypeScript files" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(snapshot.action.complete).toBe(true)
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "glob",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(true)
+
+      const pending = [
+        {
+          ...request,
+          id: PermissionV1.ID.make("per_glob_json"),
+          sessionID: ctx.sessionID,
+          tool: { messageID: ctx.messageID, callID: "call_glob_json" },
+        },
+      ]
+      const encoded = Schema.encodeUnknownSync(Schema.Array(PermissionV1.Request))(pending)
+      expect(JSON.parse(JSON.stringify(encoded))).toEqual(encoded)
+    }),
+  )
+
+  it.instance("keeps an explicit path incomplete for generic review", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const captured = asks()
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const args = { pattern: "*.ts", path: test.directory }
+
+      yield* glob.execute(args, captured.next)
+
+      expect(captured.items[0]?.metadata).toEqual({ pattern: "*.ts", path: test.directory })
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "glob",
+        arguments: args,
+        directory: test.directory,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: "glob",
+        origin: "tool",
+        patterns: captured.items[0]?.patterns,
+        metadata: captured.items[0]?.metadata,
+        action,
+        trusted: [{ source: "human", text: "Find TypeScript files" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(action.complete).toBe(false)
+      expect(snapshot.action.complete).toBe(false)
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "glob",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(false)
+    }),
+  )
+
   it.instance("matches files from a directory path", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

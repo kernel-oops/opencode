@@ -17,6 +17,8 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { testEffect } from "../lib/effect"
 import { Permission } from "../../src/permission"
 import type * as Tool from "../../src/tool/tool"
+import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
+import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
 import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Git } from "@/git"
@@ -39,6 +41,20 @@ const ctx = {
   messages: [],
   metadata: () => Effect.void,
   ask: () => Effect.void,
+}
+
+const asks = () => {
+  const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+  return {
+    items,
+    next: {
+      ...ctx,
+      ask: (req: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">) =>
+        Effect.sync(() => {
+          items.push(req)
+        }),
+    } satisfies Tool.Context,
+  }
 }
 
 const root = path.join(__dirname, "../..")
@@ -77,6 +93,99 @@ const git = Effect.fn("GrepToolTest.git")(function* (cwd: string, args: string[]
 })
 
 describe("tool.grep", () => {
+  it.instance("keeps omitted optional fields complete for generic review", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "test.txt"), "needle"))
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const args = { pattern: "needle" }
+
+      yield* grep.execute(args, captured.next)
+
+      expect(captured.items).toHaveLength(1)
+      const request = captured.items[0]
+      expect(request.metadata).toEqual({ pattern: "needle" })
+      expect(Object.hasOwn(request.metadata, "path")).toBe(false)
+      expect(Object.hasOwn(request.metadata, "include")).toBe(false)
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "grep",
+        arguments: args,
+        directory: test.directory,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: request.permission,
+        origin: "tool",
+        patterns: request.patterns,
+        metadata: request.metadata,
+        action,
+        trusted: [{ source: "human", text: "Find needle" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(snapshot.action.complete).toBe(true)
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "grep",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(true)
+    }),
+  )
+
+  it.instance("keeps an explicit path incomplete for generic review", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "test.txt"), "needle"))
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const args = { pattern: "needle", path: test.directory }
+
+      yield* grep.execute(args, captured.next)
+
+      expect(captured.items[0]?.metadata).toEqual({ pattern: "needle", path: test.directory })
+      const action = resolveReviewAction({
+        builtin: true,
+        identity: "grep",
+        arguments: args,
+        directory: test.directory,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: "grep",
+        origin: "tool",
+        patterns: captured.items[0]?.patterns,
+        metadata: captured.items[0]?.metadata,
+        action,
+        trusted: [{ source: "human", text: "Find needle" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(action.complete).toBe(false)
+      expect(snapshot.action.complete).toBe(false)
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: "grep",
+          assessment: {
+            outcome: "allow",
+            reason_code: "routine_or_low_impact",
+            safer_alternative: "none",
+          },
+          snapshot,
+        }),
+      ).toBe(false)
+    }),
+  )
+
   rooted.live("basic search", () =>
     Effect.gen(function* () {
       const info = yield* GrepTool
