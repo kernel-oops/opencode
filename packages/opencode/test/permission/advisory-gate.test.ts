@@ -3,6 +3,7 @@ import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
 import { isAdvisoryAllowCandidate } from "../../src/permission/advisory-gate"
 import { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "../../src/permission/obvious-risk-gate"
 import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
+import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
 
 const snapshot = {
   version: "1",
@@ -142,6 +143,12 @@ describe("generic built-in risk allow gate", () => {
         identity: "glob",
         arguments: { pattern: "*.md" },
         directory: "/tmp/project",
+        requested: {
+          identity: "glob",
+          arguments: { pattern: "*.md" },
+          cwd: "/tmp/project",
+          complete: true,
+        },
       }),
     ).toEqual({
       identity: "glob",
@@ -155,13 +162,27 @@ describe("generic built-in risk allow gate", () => {
         identity: "grep",
         arguments: { pattern: "TODO" },
         directory: "/tmp/project",
+        requested: {
+          identity: "grep",
+          arguments: { pattern: "TODO" },
+          cwd: "/tmp/project",
+          complete: true,
+        },
       }),
     ).toEqual({
       identity: "grep",
       arguments: { pattern: "TODO" },
       cwd: "/tmp/project",
-      complete: true,
+      complete: false,
     })
+    expect(
+      resolveReviewAction({
+        builtin: true,
+        identity: "glob",
+        arguments: { pattern: "*.md" },
+        directory: "/tmp/project",
+      }).complete,
+    ).toBe(false)
     expect(
       resolveReviewAction({
         builtin: true,
@@ -222,7 +243,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("keeps glob and grep with any explicit path incomplete and human-gated", () => {
+  test("keeps unattested glob and grep explicit paths incomplete and human-gated", () => {
     for (const identity of ["glob", "grep"]) {
       for (const path of [".", "link-to-external"]) {
         const argumentsValue = { pattern: "*", path }
@@ -246,12 +267,175 @@ describe("generic built-in risk allow gate", () => {
                 identity,
                 permission: identity,
                 arguments: argumentsValue,
+                complete: false,
               },
             },
           }),
         ).toBe(false)
       }
     }
+  })
+
+  test("keeps search actions human-authorised even when attested at the exact session directory", () => {
+    for (const identity of ["glob", "grep"]) {
+      const argumentsValue = { pattern: "*", path: "/tmp/project" }
+      const action = resolveReviewAction({
+        builtin: true,
+        identity,
+        arguments: argumentsValue,
+        directory: "/tmp/project",
+        requested: { identity, arguments: argumentsValue, cwd: "/tmp/project", complete: true },
+      })
+      expect(action.complete).toBe(identity === "glob")
+      const exact = buildPermissionReviewSnapshot({
+        permission: identity,
+        origin: "tool",
+        patterns: ["*"],
+        metadata: {},
+        action,
+        trusted: [{ source: "human", text: "Search this project" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: identity,
+          assessment,
+          snapshot: exact,
+        }),
+      ).toBe(false)
+      const child = resolveReviewAction({
+        builtin: true,
+        identity,
+        arguments: argumentsValue,
+        directory: "/tmp/project",
+        requested: { identity, arguments: argumentsValue, cwd: "/tmp/project/child", complete: true },
+      })
+      const childSnapshot = buildPermissionReviewSnapshot({
+        permission: identity,
+        origin: "tool",
+        patterns: ["*"],
+        metadata: {},
+        action: child,
+        trusted: [{ source: "human", text: "Search this project" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: identity,
+          assessment,
+          snapshot: childSnapshot,
+        }),
+      ).toBe(false)
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          identity,
+          arguments: argumentsValue,
+          directory: "/tmp/project",
+          requested: {
+            identity,
+            arguments: { pattern: "different", path: "/tmp/project" },
+            cwd: "/tmp/project",
+            complete: true,
+          },
+        }).complete,
+      ).toBe(identity === "glob")
+    }
+  })
+
+  test("accepts only a truthful built-in pinned project text action", () => {
+    const input = { filePath: "/tmp/project/src/page.php", offset: 10, limit: 20 }
+    const action = {
+      identity: "read",
+      arguments: {
+        ...input,
+        target: "src/page.php",
+        mode: "pinned-project-text-v4",
+        bindingId: "1".repeat(32),
+        instructionFilesAbsent: true,
+        instructionWatch: "linux-inotify-v1",
+        effects: [],
+      },
+      cwd: "/tmp/project",
+      complete: true,
+    }
+    expect(
+      resolveReviewAction({
+        builtin: true,
+        identity: "read",
+        arguments: input,
+        directory: "/tmp/project",
+        requested: action,
+      }),
+    ).toBe(action)
+    expect(
+      isGenericRiskAllowCandidate({
+        settled: true,
+        permission: "read",
+        assessment,
+        snapshot: {
+          ...globSnapshot,
+          action: {
+            ...globSnapshot.action,
+            ...action,
+            permission: "read",
+            cwd_status: "exact",
+          },
+        },
+      }),
+    ).toBe(true)
+    for (const invalid of [
+      { ...action, arguments: { ...action.arguments, target: "../secret.php" } },
+      { ...action, arguments: { ...action.arguments, effects: ["lsp"] } },
+      { ...action, arguments: { ...action.arguments, limit: 21 } },
+      { ...action, arguments: { ...action.arguments, mode: "pinned-project-text-v1" } },
+      { ...action, arguments: { ...action.arguments, bindingId: "not-an-id" } },
+      { ...action, arguments: { ...action.arguments, instructionWatch: "none" } },
+    ]) {
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: input,
+          directory: "/tmp/project",
+          requested: invalid,
+        }).complete,
+      ).toBe(false)
+    }
+    expect(
+      resolveReviewAction({
+        builtin: false,
+        identity: "read",
+        arguments: input,
+        directory: "/tmp/project",
+        requested: action,
+      }).complete,
+    ).toBe(false)
+    let accessed = false
+    const accessor = { ...action.arguments }
+    Object.defineProperty(accessor, "target", {
+      enumerable: true,
+      get() {
+        accessed = true
+        return "src/page.php"
+      },
+    })
+    for (const argumentsValue of [accessor, new Proxy(action.arguments, {})]) {
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: input,
+          directory: "/tmp/project",
+          requested: { ...action, arguments: argumentsValue },
+        }).complete,
+      ).toBe(false)
+    }
+    expect(accessed).toBe(false)
   })
 
   test("rejects external-directory aliases and MCP list façades", () => {
@@ -351,6 +535,31 @@ describe("generic built-in risk allow gate", () => {
         },
       }),
     ).toEqual({ identity: "glob", arguments: { pattern: "*", path: "link-to-external" }, complete: false })
+    const grepArguments = { pattern: "PUBLISHED-TTL", path: "/tmp/project" }
+    expect(
+      resolveReviewAction({
+        builtin: false,
+        identity: "grep",
+        arguments: grepArguments,
+        directory: "/tmp/project",
+        requested: {
+          identity: "grep",
+          cwd: "/tmp/project",
+          complete: true,
+          arguments: {
+            ...grepArguments,
+            literals: ["PUBLISHED-TTL"],
+            mode: "pinned-project-literal-grep-v4",
+            executor: "literal-utf8-lf-lines-v1",
+            bindingId: "0".repeat(32),
+            fileCount: 1,
+            totalBytes: 1,
+            limits: { files: 4096, fileBytes: 8388608, totalBytes: 134217728, depth: 64 },
+            effects: [],
+          },
+        },
+      }),
+    ).toEqual({ identity: "grep", arguments: grepArguments, complete: false })
   })
 
   test("preserves explicit actions only for trusted built-ins", () => {
@@ -380,9 +589,9 @@ describe("generic built-in risk allow gate", () => {
     ).toEqual({ identity: "read", arguments: { filePath: "README.md" }, complete: false })
   })
 
-  test("accepts lossless glob actions rooted at the exact session directory", () => {
+  test("does not generically allow lossless glob actions rooted at the exact session directory", () => {
     expect(isGenericRiskAllowCandidate({ settled: true, permission: "glob", assessment, snapshot: globSnapshot })).toBe(
-      true,
+      false,
     )
     expect(
       isGenericRiskAllowCandidate({
@@ -399,7 +608,7 @@ describe("generic built-in risk allow gate", () => {
           },
         },
       }),
-    ).toBe(true)
+    ).toBe(false)
   })
 
   test("keeps unknown, mismatched, lossy, rewritten, or untrusted cases human", () => {
