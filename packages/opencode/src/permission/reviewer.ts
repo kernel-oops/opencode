@@ -34,6 +34,7 @@ export {
 }
 export { isAdvisoryAllowCandidate } from "./advisory-gate"
 export { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "./obvious-risk-gate"
+export { isGenericRiskAllowCandidate } from "./generic-review-action"
 export type Result = { decision: Decision } | { failure: Failure }
 
 export interface Input {

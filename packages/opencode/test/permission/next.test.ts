@@ -306,6 +306,55 @@ const bashRequest = (session: string, directory: string, complete = true) => ({
   review: bashAction(directory, complete),
 })
 
+const genericGlobRequest = (sessionID: SessionID, turnID: MessageID, directory: string, complete = true) => ({
+  sessionID,
+  tool: { messageID: turnID, callID: `call_${sessionID}` },
+  permission: "glob",
+  patterns: ["*.md"],
+  metadata: { pattern: "*.md" },
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: {
+      identity: "glob",
+      arguments: { pattern: "*.md" },
+      cwd: directory,
+      complete,
+    },
+  },
+})
+
+const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn")(function* (input: {
+  sessionID: SessionID
+  rootSessionID: SessionID
+}) {
+  const sessions = yield* Session.Service
+  const permission = yield* Permission.Service
+  const turnID = MessageID.ascending()
+  const message: SessionV1.User = {
+    id: turnID,
+    sessionID: input.sessionID,
+    role: "user",
+    time: { created: Date.now() },
+    agent: "build",
+    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+    permissionReview: {
+      admission: buildPermissionReviewAdmission([{ type: "text", text: "Find Markdown files" }]),
+    },
+  }
+  yield* sessions.updateMessage(message)
+  yield* permission.captureTurn({
+    sessionID: input.sessionID,
+    rootSessionID: input.rootSessionID,
+    turnID,
+    trusted: [{ source: "human", text: "Find Markdown files" }],
+    untrusted: [],
+    contextSafeForGate: true,
+  })
+  return turnID
+})
+
 const capturePersistedTurn = Effect.fn("test.capturePersistedTurn")(function* (input: {
   sessionID: SessionID
   rootSessionID: SessionID
@@ -3610,6 +3659,142 @@ it.instance(
       expect(yield* list()).toHaveLength(0)
     }),
   withObviousReviewer({ mode: "audit-only" }, permissionHook('    output.status = "allow"')),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - trusted glob reaches Luna and bypasses the Bash-only evaluator",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Generic glob allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory))
+
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).not.toContain('"source":"bash_evaluator"')
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "deny" },
+    reviewer: {
+      mode: "enforce",
+      policy: "obvious-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - malformed output, reviewer failure, and incomplete actions stay human",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Incomplete generic glob" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+
+      reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
+      const malformed = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(malformed))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider failure")
+        },
+      })
+      const failed = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(failed))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory, false)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - plugin ask remains authoritative over Luna allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Generic plugin ask" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer(
+    { mode: "enforce", automatic_allow: "policy-gated" },
+    permissionHook('    output.status = "ask"'),
+  ),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - rewrite output cannot use the Bash correction path",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const sessionID = (yield* sessions.create({ title: "Generic rewrite isolation" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
+      })
+
+      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+      const markers = yield* db
+        .select()
+        .from(PermissionReviewCorrectionTable)
+        .where(
+          and(
+            eq(PermissionReviewCorrectionTable.session_id, sessionID),
+            eq(PermissionReviewCorrectionTable.turn_id, turnID),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      expect(markers).toHaveLength(0)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  }),
   15_000,
 )
 

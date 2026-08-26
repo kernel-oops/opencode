@@ -611,8 +611,9 @@ const layer = Layer.effect(
           ),
         )
 
+      const evaluatorApplicable = info.permission === "bash" || source?.action?.identity === "bash"
       const waitEvaluator =
-        evaluatorConfig && evaluatorConfig.mode !== "disabled"
+        evaluatorApplicable && evaluatorConfig && evaluatorConfig.mode !== "disabled"
           ? Effect.uninterruptible(bashEvaluator.prepare({ config: evaluatorConfig, action: source?.action })).pipe(
               Effect.tap((run) => {
                 if (!run.admitted) return Effect.void
@@ -691,8 +692,8 @@ const layer = Layer.effect(
       const evaluatorResult = evaluator?.reviewResult
       const remaining = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
 
-      const evaluatorEnforcing = evaluatorConfig?.mode === "enforce"
-      const evaluatorPermitOnly = evaluatorConfig?.mode === "permit-only"
+      const evaluatorEnforcing = evaluatorApplicable && evaluatorConfig?.mode === "enforce"
+      const evaluatorPermitOnly = evaluatorApplicable && evaluatorConfig?.mode === "permit-only"
       const evaluatorDecision = evaluatorResult && "decision" in evaluatorResult ? evaluatorResult.decision : undefined
       const evaluatorPermitDecision = evaluator?.run?.isSettled() ? evaluatorDecision : undefined
       const needsReviewer =
@@ -781,10 +782,20 @@ const layer = Layer.effect(
         builtinResult && "assessment" in builtinResult && "reason_code" in builtinResult.assessment
           ? builtinResult.assessment
           : undefined
-      const automaticRiskCandidate =
+      const bashRiskCandidate =
         automaticRiskConfig &&
         riskPolicyAssessment !== undefined &&
         PermissionReviewer.isObviousRiskCandidate({
+          settled: builtin?.run.isSettled() ?? false,
+          permission: info.permission,
+          assessment: riskPolicyAssessment,
+          snapshot,
+          policy: riskPolicy,
+        })
+      const genericRiskAllowCandidate =
+        automaticRiskConfig &&
+        riskPolicyAssessment !== undefined &&
+        PermissionReviewer.isGenericRiskAllowCandidate({
           settled: builtin?.run.isSettled() ?? false,
           permission: info.permission,
           assessment: riskPolicyAssessment,
@@ -805,14 +816,14 @@ const layer = Layer.effect(
         if (
           riskPolicyAssessment.outcome === "allow" &&
           reviewerConfig?.automatic_allow === "policy-gated" &&
-          automaticRiskCandidate &&
+          (bashRiskCandidate || genericRiskAllowCandidate) &&
           otherSourcesPermit
         ) {
           result = "allow"
         } else if (
           riskPolicyAssessment.outcome === "rewrite" &&
           reviewerConfig?.automatic_rewrite === "once-per-turn" &&
-          automaticRiskCandidate &&
+          bashRiskCandidate &&
           otherSourcesPermit &&
           turn.rootSessionID === info.sessionID &&
           turn.directPromptAdmission &&
