@@ -40,6 +40,7 @@ readonly PATCH_BRANCHES=(
   "generic-reviewer"
   "generic-reviewer-fix"
   "routine-project-reads"
+  "routine-project-grep-binary-skip"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -60,6 +61,7 @@ readonly PATCH_IDS=(
   "032ef160bac34596b3587a4a6c7cc1959ae8075f"
   "f01f8b5de77f3146233e367e17235347fae5aded"
   "8394222a1695d1b719999bafc914e5772f4a038c"
+  "bf6203e316407b3aaaacfb83bca3763543ba1470"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -80,6 +82,7 @@ readonly PATCH_TIPS=(
   "1a48976f27ecc4278ed3469eda1addd805bf84d5"
   "813a52423317aa3184fa5900289ee2a63547754d"
   "6221301b6ca677641b8da37ce437f6ab93c32724"
+  "d44fe5b2bd6661b56c6f400346486661bbc4958c"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
