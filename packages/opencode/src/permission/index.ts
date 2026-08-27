@@ -802,6 +802,16 @@ const layer = Layer.effect(
           snapshot,
           policy: riskPolicy,
         })
+      const externalDirectoryAllowCandidate =
+        automaticRiskConfig &&
+        riskPolicyAssessment !== undefined &&
+        PermissionReviewer.isExternalDirectoryRiskAllowCandidate({
+          settled: builtin?.run.isSettled() ?? false,
+          permission: info.permission,
+          assessment: riskPolicyAssessment,
+          snapshot,
+          policy: riskPolicy,
+        })
       if (pluginResult === "deny") result = "deny"
       else if (
         (evaluatorEnforcing && evaluatorDecision === "deny") ||
@@ -815,7 +825,7 @@ const layer = Layer.effect(
         if (
           riskPolicyAssessment.outcome === "allow" &&
           reviewerConfig?.automatic_allow === "policy-gated" &&
-          (bashRiskCandidate || genericRiskCandidate) &&
+          (bashRiskCandidate || genericRiskCandidate || externalDirectoryAllowCandidate) &&
           otherSourcesPermit
         ) {
           result = "allow"

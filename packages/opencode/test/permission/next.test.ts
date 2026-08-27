@@ -349,6 +349,29 @@ const genericFallbackRequest = (sessionID: SessionID, turnID: MessageID, directo
   },
 })
 
+const externalReadRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => ({
+  sessionID,
+  tool: { messageID: turnID, callID: `call_${sessionID}` },
+  permission: "external_directory",
+  patterns: ["/tmp/external/*"],
+  metadata: { filepath: "/tmp/external/package.json", parentDir: "/tmp/external" },
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: {
+      identity: "read",
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: { filePath: "/tmp/external/package.json", offset: 1, limit: 40 },
+      },
+      cwd: directory,
+      complete: true,
+    },
+  },
+})
+
 const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
   const pattern = "Calendar apps choose when to refresh|refreshes every 6 hours|PUBLISHED-TTL|REFRESH-INTERVAL"
   return {
@@ -3897,6 +3920,38 @@ it.instance(
     mode: "enforce",
     policy: "exceptional-risk-only-v1",
     automatic_allow: "policy-gated",
+  }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - external read allows but is never rewrite eligible",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "External read allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      yield* reviewerAsk(externalReadRequest(sessionID, turnID, test.directory))
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
+      })
+      const fiber = yield* reviewerAsk(externalReadRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
   }),
   15_000,
 )
