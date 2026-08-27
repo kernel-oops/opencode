@@ -26,7 +26,10 @@ async function searchBoundSnapshot(snapshot: BoundGrepSnapshot, literals: readon
     const buffer = await readBoundGrepFile(item)
     totalBytes += buffer.length
     if (totalBytes > LITERAL_GREP_LIMITS.totalBytes) throw new Error("Pinned grep snapshot exceeded the size limit")
-    if (buffer.includes(0)) throw new Error("Pinned grep corpus contains a binary file")
+    // Match ripgrep's default binary-file behaviour: a NUL marks the file as binary,
+    // so it contributes no matching lines. Keep it in the bound snapshot and byte
+    // accounting so post-review mutation still fails closed.
+    if (buffer.includes(0)) continue
     documents.push({ target: item.target, text: new TextDecoder("utf-8", { fatal: true }).decode(buffer) })
   }
   if (totalBytes !== snapshot.totalBytes) throw new Error("Pinned grep snapshot size changed")

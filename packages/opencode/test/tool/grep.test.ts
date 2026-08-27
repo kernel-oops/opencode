@@ -451,7 +451,7 @@ describe("tool.grep", () => {
     }),
   )
 
-  it.instance("fails closed without disclosing matching binary files", () =>
+  it.instance("skips matching binary files without disclosing their contents", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(async () => {
@@ -461,12 +461,13 @@ describe("tool.grep", () => {
       const info = yield* GrepTool
       const grep = yield* info.init()
 
-      const exit = yield* Effect.exit(grep.execute({ pattern: "PUBLISHED-TTL", path: test.directory }, ctx))
-      expect(exit._tag).toBe("Failure")
-      if (exit._tag === "Failure") {
-        expect(String(exit.cause)).toContain("binary file")
-        expect(String(exit.cause)).not.toContain("visible")
-      }
+      const ripgrep = yield* Ripgrep.Service
+      const expected = yield* ripgrep.grep({ cwd: test.directory, pattern: "PUBLISHED-TTL", limit: 100 })
+      const result = yield* grep.execute({ pattern: "PUBLISHED-TTL", path: test.directory }, ctx)
+
+      expect(result.metadata.matches).toBe(expected.length)
+      expect(result.output).toContain("PUBLISHED-TTL visible")
+      expect(result.output).not.toContain("secret")
     }),
   )
 
