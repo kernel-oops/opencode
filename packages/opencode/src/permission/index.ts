@@ -792,17 +792,16 @@ const layer = Layer.effect(
           snapshot,
           policy: riskPolicy,
         })
-      const genericRiskAllowCandidate =
+      const genericRiskCandidate =
         automaticRiskConfig &&
         riskPolicyAssessment !== undefined &&
-        PermissionReviewer.isGenericRiskAllowCandidate({
+        PermissionReviewer.isGenericRiskCandidate({
           settled: builtin?.run.isSettled() ?? false,
           permission: info.permission,
           assessment: riskPolicyAssessment,
           snapshot,
           policy: riskPolicy,
         })
-
       if (pluginResult === "deny") result = "deny"
       else if (
         (evaluatorEnforcing && evaluatorDecision === "deny") ||
@@ -816,14 +815,14 @@ const layer = Layer.effect(
         if (
           riskPolicyAssessment.outcome === "allow" &&
           reviewerConfig?.automatic_allow === "policy-gated" &&
-          (bashRiskCandidate || genericRiskAllowCandidate) &&
+          (bashRiskCandidate || genericRiskCandidate) &&
           otherSourcesPermit
         ) {
           result = "allow"
         } else if (
           riskPolicyAssessment.outcome === "rewrite" &&
           reviewerConfig?.automatic_rewrite === "once-per-turn" &&
-          bashRiskCandidate &&
+          (bashRiskCandidate || genericRiskCandidate) &&
           otherSourcesPermit &&
           turn.rootSessionID === info.sessionID &&
           turn.directPromptAdmission &&
