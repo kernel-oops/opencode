@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test"
 import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
 import { isAdvisoryAllowCandidate } from "../../src/permission/advisory-gate"
 import { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "../../src/permission/obvious-risk-gate"
-import { isGenericRiskAllowCandidate, resolveReviewAction } from "../../src/permission/generic-review-action"
+import {
+  isGenericRiskAllowCandidate,
+  isGenericRiskCandidate,
+  resolveReviewAction,
+} from "../../src/permission/generic-review-action"
 import { buildPermissionReviewSnapshot } from "../../src/permission/reviewer-input"
 
 const snapshot = {
@@ -205,42 +209,169 @@ describe("generic built-in risk allow gate", () => {
       }),
     ).toEqual({
       identity: "write",
-      arguments: { filePath: "/tmp/file", content: "changed" },
-      complete: false,
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: { filePath: "/tmp/file", content: "changed" },
+      },
+      cwd: "/tmp/project",
+      complete: true,
     })
   })
 
-  test("keeps redirecting webfetch and symlink-following read actions incomplete and human-gated", () => {
-    const actions: ReadonlyArray<{ identity: string; arguments: Record<string, string> }> = [
-      { identity: "read", arguments: { filePath: "README.md" } },
-      { identity: "webfetch", arguments: { url: "https://example.com" } },
-    ]
-    for (const action of actions) {
-      expect(
-        resolveReviewAction({
-          builtin: true,
-          identity: action.identity,
-          arguments: action.arguments,
-          directory: "/tmp/project",
-        }),
-      ).toEqual({ ...action, complete: false })
-      expect(
-        isGenericRiskAllowCandidate({
-          settled: true,
-          permission: action.identity,
-          assessment,
-          snapshot: {
-            ...globSnapshot,
-            action: {
-              ...globSnapshot.action,
-              identity: action.identity,
-              permission: action.identity,
-              arguments: action.arguments,
-            },
+  test("keeps symlink-following read actions incomplete and human-gated", () => {
+    const action = { identity: "read", arguments: { filePath: "README.md" } }
+    expect(
+      resolveReviewAction({
+        builtin: true,
+        identity: action.identity,
+        arguments: action.arguments,
+        directory: "/tmp/project",
+      }),
+    ).toEqual({ ...action, complete: false })
+    expect(
+      isGenericRiskAllowCandidate({
+        settled: true,
+        permission: action.identity,
+        assessment,
+        snapshot: {
+          ...globSnapshot,
+          action: {
+            ...globSnapshot.action,
+            identity: action.identity,
+            permission: action.identity,
+            arguments: action.arguments,
           },
-        }),
-      ).toBe(false)
+        },
+      }),
+    ).toBe(false)
+  })
+
+  test("constructs lower-assurance exact invocation contracts for registered built-ins", () => {
+    const cases = [
+      ["apply_patch", "edit", "/tmp/project", { patchText: "*** Begin Patch" }],
+      ["edit", "edit", "/tmp/project", { filePath: "a.ts", oldString: "a", newString: "b" }],
+      ["lsp", "lsp", "/tmp/project", { operation: "hover", filePath: "a.ts", line: 1, character: 1 }],
+      ["skill", "skill", "/tmp/project", { name: "example" }],
+      ["task", "task", "/tmp/project", { description: "Inspect", prompt: "Inspect this", subagent_type: "Cat" }],
+      ["todowrite", "todowrite", null, { todos: [] }],
+      ["webfetch", "webfetch", null, { url: "https://example.com" }],
+      ["write", "edit", "/tmp/project", { filePath: "a.ts", content: "value" }],
+    ] as const
+    for (const [identity, permission, cwd, invocation] of cases) {
+      const action = resolveReviewAction({ builtin: true, identity, arguments: invocation, directory: "/tmp/project" })
+      expect(action).toEqual({
+        identity,
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation,
+        },
+        cwd,
+        complete: true,
+      })
+      const built = buildPermissionReviewSnapshot({
+        permission,
+        origin: "tool",
+        patterns: ["*"],
+        metadata: {},
+        action,
+        trusted: [{ source: "human", text: "Perform the requested routine operation" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(isGenericRiskAllowCandidate({ settled: true, permission, assessment, snapshot: built })).toBe(true)
     }
+  })
+
+  test("never upgrades explicit incomplete, custom, lossy, or mismatched fallback actions", () => {
+    const invocation = { filePath: "a.ts", content: "value" }
+    const requested = {
+      identity: "write",
+      arguments: invocation,
+      cwd: "/tmp/project",
+      complete: false,
+    } as const
+    expect(
+      resolveReviewAction({
+        builtin: true,
+        identity: "write",
+        arguments: invocation,
+        directory: "/tmp/project",
+        requested,
+      }).complete,
+    ).toBe(false)
+    expect(
+      resolveReviewAction({
+        builtin: false,
+        identity: "write",
+        arguments: invocation,
+        directory: "/tmp/project",
+      }).complete,
+    ).toBe(false)
+    expect(
+      resolveReviewAction({
+        builtin: true,
+        identity: "custom",
+        arguments: invocation,
+        directory: "/tmp/project",
+      }).complete,
+    ).toBe(false)
+
+    const action = resolveReviewAction({
+      builtin: true,
+      identity: "write",
+      arguments: invocation,
+      directory: "/tmp/project",
+    })
+    const built = buildPermissionReviewSnapshot({
+      permission: "edit",
+      origin: "tool",
+      patterns: ["*"],
+      metadata: {},
+      action,
+      trusted: [{ source: "human", text: "Write the file" }],
+      untrusted: [],
+      contextSafeForGate: true,
+    })
+    for (const snapshot of [
+      { ...built, action: { ...built.action, permission: "read" } },
+      { ...built, action: { ...built.action, omitted_items: 1 } },
+      { ...built, action: { ...built.action, omitted_bytes: 1 } },
+      { ...built, action: { ...built.action, complete: false } },
+    ]) {
+      expect(isGenericRiskAllowCandidate({ settled: true, permission: "edit", assessment, snapshot })).toBe(false)
+    }
+  })
+
+  test("makes an eligible generic rewrite candidate without treating it as an allow", () => {
+    const action = resolveReviewAction({
+      builtin: true,
+      identity: "webfetch",
+      arguments: { url: "https://example.com/install.sh" },
+      directory: "/tmp/project",
+    })
+    const built = buildPermissionReviewSnapshot({
+      permission: "webfetch",
+      origin: "tool",
+      patterns: ["*"],
+      metadata: {},
+      action,
+      trusted: [{ source: "human", text: "Inspect the installer safely" }],
+      untrusted: [],
+      contextSafeForGate: true,
+    })
+    const rewrite = {
+      outcome: "rewrite" as const,
+      reason_code: "untrusted_code_or_remote_payload" as const,
+      safer_alternative: "inspect_read_only" as const,
+    }
+    expect(
+      isGenericRiskCandidate({ settled: true, permission: "webfetch", assessment: rewrite, snapshot: built }),
+    ).toBe(true)
+    expect(
+      isGenericRiskAllowCandidate({ settled: true, permission: "webfetch", assessment: rewrite, snapshot: built }),
+    ).toBe(false)
   })
 
   test("keeps unattested glob and grep explicit paths incomplete and human-gated", () => {

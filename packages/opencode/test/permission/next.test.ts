@@ -326,6 +326,29 @@ const genericGlobRequest = (sessionID: SessionID, turnID: MessageID, directory: 
   },
 })
 
+const genericFallbackRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => ({
+  sessionID,
+  tool: { messageID: turnID, callID: `call_${sessionID}` },
+  permission: "webfetch",
+  patterns: ["https://example.com/install.sh"],
+  metadata: { url: "https://example.com/install.sh" },
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: {
+      identity: "webfetch",
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: { url: "https://example.com/install.sh" },
+      },
+      cwd: null,
+      complete: true,
+    },
+  },
+})
+
 const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
   const pattern = "Calendar apps choose when to refresh|refreshes every 6 hours|PUBLISHED-TTL|REFRESH-INTERVAL"
   return {
@@ -3817,7 +3840,7 @@ it.instance(
 )
 
 it.instance(
-  "generic reviewer - rewrite output cannot use the Bash correction path",
+  "generic reviewer - incomplete action cannot use the correction path",
   () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -3849,6 +3872,80 @@ it.instance(
   withObviousReviewer({
     mode: "enforce",
     automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - fallback action allows under the selected exceptional policy",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Generic fallback allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(genericFallbackRequest(sessionID, turnID, test.directory))
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+  }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - fallback action uses one durable correction per direct turn",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const sessionID = (yield* sessions.create({ title: "Generic rewrite admission" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("rewrite", "untrusted_code_or_remote_payload", "inspect_read_only"),
+      })
+
+      const first = yield* fail(reviewerAsk(genericFallbackRequest(sessionID, turnID, test.directory)))
+      expect(first).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
+      if (first instanceof PermissionV1.PolicyCorrectionError) {
+        expect(first.feedback).toBe("Use a read-only inspection instead of performing this action.")
+        expect(first.message).not.toContain("example.com")
+      }
+      expect(yield* list()).toHaveLength(0)
+
+      const marker = yield* db
+        .select()
+        .from(PermissionReviewCorrectionTable)
+        .where(
+          and(
+            eq(PermissionReviewCorrectionTable.session_id, sessionID),
+            eq(PermissionReviewCorrectionTable.turn_id, turnID),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      expect(marker).toMatchObject({ session_id: sessionID, turn_id: turnID })
+
+      yield* recapturePersistedTurn({ sessionID, rootSessionID: sessionID, turnID })
+      const second = yield* reviewerAsk(genericFallbackRequest(sessionID, turnID, test.directory)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(second)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
     automatic_rewrite: "once-per-turn",
   }),
   15_000,

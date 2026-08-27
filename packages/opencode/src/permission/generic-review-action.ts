@@ -11,7 +11,7 @@ import {
 interface Contract {
   readonly permissions: readonly string[]
   readonly cwd: "session" | "not_applicable"
-  readonly arguments: "project_text_file" | "project_literal_grep" | "mcp_resource" | "query"
+  readonly arguments: "project_text_file" | "project_literal_grep" | "mcp_resource" | "query" | "invocation"
   readonly requested?: boolean
 }
 
@@ -20,7 +20,17 @@ const contracts: Readonly<Record<string, Contract>> = {
   read: { permissions: ["read"], cwd: "session", arguments: "project_text_file", requested: true },
   websearch: { permissions: ["websearch"], cwd: "not_applicable", arguments: "query" },
   read_mcp_resource: { permissions: ["read"], cwd: "not_applicable", arguments: "mcp_resource" },
+  apply_patch: { permissions: ["edit"], cwd: "session", arguments: "invocation" },
+  edit: { permissions: ["edit"], cwd: "session", arguments: "invocation" },
+  lsp: { permissions: ["lsp"], cwd: "session", arguments: "invocation" },
+  skill: { permissions: ["skill"], cwd: "session", arguments: "invocation" },
+  task: { permissions: ["task"], cwd: "session", arguments: "invocation" },
+  todowrite: { permissions: ["todowrite"], cwd: "not_applicable", arguments: "invocation" },
+  webfetch: { permissions: ["webfetch"], cwd: "not_applicable", arguments: "invocation" },
+  write: { permissions: ["edit"], cwd: "session", arguments: "invocation" },
 }
+
+const invocationContract = "registered-builtin-invocation-v1"
 
 function argumentsComplete(contract: Contract, value: unknown) {
   if (!record(value)) return false
@@ -29,6 +39,13 @@ function argumentsComplete(contract: Contract, value: unknown) {
   if (contract.arguments === "project_literal_grep") return projectLiteralGrepArguments(input)
   if (contract.arguments === "query")
     return exactKeys(input, ["query"]) && typeof input.query === "string" && input.query.length > 0
+  if (contract.arguments === "invocation")
+    return (
+      exactKeys(input, ["contract", "effects_bound", "invocation"]) &&
+      input.contract === invocationContract &&
+      input.effects_bound === false &&
+      record(input.invocation)
+    )
   if (!exactKeys(input, ["server", "uri"])) return false
   return (
     typeof input.server === "string" && input.server.length > 0 && typeof input.uri === "string" && input.uri.length > 0
@@ -225,17 +242,22 @@ export function resolveReviewAction(input: {
     return input.requested
   }
   if (contract?.requested) return { identity: input.identity, arguments: input.arguments, complete: false }
-  if (!contract || !argumentsComplete(contract, input.arguments))
+  if (!contract) return { identity: input.identity, arguments: input.arguments, complete: false }
+  const arguments_ =
+    contract.arguments === "invocation"
+      ? { contract: invocationContract, effects_bound: false, invocation: input.arguments }
+      : input.arguments
+  if (!argumentsComplete(contract, arguments_))
     return { identity: input.identity, arguments: input.arguments, complete: false }
   return {
     identity: input.identity,
-    arguments: input.arguments,
+    arguments: arguments_,
     cwd: contract.cwd === "session" ? input.directory : null,
     complete: true,
   }
 }
 
-export function isGenericRiskAllowCandidate(input: {
+export function isGenericRiskCandidate(input: {
   readonly settled: boolean
   readonly permission: string
   readonly assessment: RiskPolicyAssessment
@@ -257,7 +279,6 @@ export function isGenericRiskAllowCandidate(input: {
   return (
     input.settled &&
     !("failure" in validated) &&
-    input.assessment.outcome === "allow" &&
     contract.permissions.includes(input.permission) &&
     action.permission === input.permission &&
     action.origin === "tool" &&
@@ -273,4 +294,8 @@ export function isGenericRiskAllowCandidate(input: {
     trusted.items.length > 0 &&
     trusted.items.every((item) => item.source === "human" && item.trusted)
   )
+}
+
+export function isGenericRiskAllowCandidate(input: Parameters<typeof isGenericRiskCandidate>[0]) {
+  return input.assessment.outcome === "allow" && isGenericRiskCandidate(input)
 }
