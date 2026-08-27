@@ -3,6 +3,7 @@ import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
 import { isAdvisoryAllowCandidate } from "../../src/permission/advisory-gate"
 import { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "../../src/permission/obvious-risk-gate"
 import {
+  isExternalDirectoryRiskAllowCandidate,
   isGenericRiskAllowCandidate,
   isGenericRiskCandidate,
   resolveReviewAction,
@@ -372,6 +373,83 @@ describe("generic built-in risk allow gate", () => {
     expect(
       isGenericRiskAllowCandidate({ settled: true, permission: "webfetch", assessment: rewrite, snapshot: built }),
     ).toBe(false)
+  })
+
+  test("allows only complete registered read, grep, and Bash external-directory actions", () => {
+    for (const [identity, invocation] of [
+      ["read", { filePath: "/tmp/external/a.ts", offset: 1, limit: 20 }],
+      ["grep", { pattern: "TODO", path: "/tmp/external" }],
+    ] as const) {
+      const action = resolveReviewAction({
+        builtin: true,
+        permission: "external_directory",
+        identity,
+        arguments: invocation,
+        directory: "/tmp/project",
+      })
+      const built = buildPermissionReviewSnapshot({
+        permission: "external_directory",
+        origin: "tool",
+        patterns: ["/tmp/external/*"],
+        metadata: {},
+        action,
+        trusted: [{ source: "human", text: "Inspect the external source checkout" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(
+        isExternalDirectoryRiskAllowCandidate({
+          settled: true,
+          permission: "external_directory",
+          assessment,
+          snapshot: built,
+        }),
+      ).toBe(true)
+      expect(
+        isGenericRiskCandidate({ settled: true, permission: "external_directory", assessment, snapshot: built }),
+      ).toBe(false)
+    }
+
+    const bashAction = {
+      identity: "bash",
+      arguments: { command: "git status", timeout: 30_000, workdir: "/tmp/project", shell: "/bin/bash" },
+      cwd: "/tmp/project",
+      complete: true,
+    }
+    const bash = buildPermissionReviewSnapshot({
+      permission: "external_directory",
+      origin: "tool",
+      patterns: ["/tmp/external/*"],
+      metadata: {},
+      action: bashAction,
+      trusted: [{ source: "human", text: "Inspect the external source checkout" }],
+      untrusted: [],
+      contextSafeForGate: true,
+    })
+    expect(
+      isExternalDirectoryRiskAllowCandidate({
+        settled: true,
+        permission: "external_directory",
+        assessment,
+        snapshot: bash,
+      }),
+    ).toBe(true)
+    for (const candidate of [
+      { ...bash, action: { ...bash.action, identity: "write" } },
+      { ...bash, action: { ...bash.action, complete: false } },
+      { ...bash, action: { ...bash.action, omitted_items: 1 } },
+      { ...bash, action: { ...bash.action, cwd: "relative/project" } },
+      { ...bash, trusted: { ...bash.trusted, complete: false } },
+    ]) {
+      expect(
+        isExternalDirectoryRiskAllowCandidate({
+          settled: true,
+          permission: "external_directory",
+          assessment,
+          snapshot: candidate,
+        }),
+      ).toBe(false)
+    }
   })
 
   test("keeps unattested glob and grep explicit paths incomplete and human-gated", () => {

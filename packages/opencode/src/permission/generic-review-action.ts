@@ -30,6 +30,11 @@ const contracts: Readonly<Record<string, Contract>> = {
   write: { permissions: ["edit"], cwd: "session", arguments: "invocation" },
 }
 
+const externalDirectoryContracts: Readonly<Record<string, Contract>> = {
+  grep: { permissions: ["external_directory"], cwd: "session", arguments: "invocation" },
+  read: { permissions: ["external_directory"], cwd: "session", arguments: "invocation" },
+}
+
 const invocationContract = "registered-builtin-invocation-v1"
 
 function argumentsComplete(contract: Contract, value: unknown) {
@@ -220,13 +225,15 @@ function requestedActionComplete(
 
 export function resolveReviewAction(input: {
   readonly builtin: boolean
+  readonly permission?: string
   readonly identity: string
   readonly arguments: unknown
   readonly directory: string
   readonly requested?: PermissionV1.ReviewAction
 }): PermissionV1.ReviewAction {
   if (!input.builtin) return { identity: input.identity, arguments: input.arguments, complete: false }
-  const contract = contracts[input.identity]
+  const contract =
+    input.permission === "external_directory" ? externalDirectoryContracts[input.identity] : contracts[input.identity]
   if (input.requested) {
     if (
       contract &&
@@ -298,4 +305,54 @@ export function isGenericRiskCandidate(input: {
 
 export function isGenericRiskAllowCandidate(input: Parameters<typeof isGenericRiskCandidate>[0]) {
   return input.assessment.outcome === "allow" && isGenericRiskCandidate(input)
+}
+
+function bashExternalArguments(value: unknown, cwd: unknown) {
+  if (!record(value) || !exactKeys(value, ["command", "shell", "timeout", "workdir"])) return false
+  return (
+    typeof value.command === "string" &&
+    value.command.length > 0 &&
+    typeof value.shell === "string" &&
+    value.shell.length > 0 &&
+    Number.isSafeInteger(value.timeout) &&
+    Number(value.timeout) > 0 &&
+    typeof value.workdir === "string" &&
+    value.workdir.length > 0 &&
+    value.workdir === cwd
+  )
+}
+
+export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof isGenericRiskCandidate>[0]) {
+  if (input.permission !== "external_directory" || input.assessment.outcome !== "allow") return false
+  const action = input.snapshot.action
+  const contract = externalDirectoryContracts[action.identity]
+  const validated =
+    input.policy === "exceptional-risk-only-v1"
+      ? validateExceptionalRiskAssessment(input.assessment)
+      : validateObviousRiskAssessment(input.assessment)
+  const trusted = input.snapshot.trusted
+  const argumentsValid = contract
+    ? argumentsComplete(contract, action.arguments)
+    : action.identity === "bash" && bashExternalArguments(action.arguments, action.cwd)
+  return (
+    input.settled &&
+    !("failure" in validated) &&
+    action.permission === "external_directory" &&
+    action.origin === "tool" &&
+    (action.identity === "read" || action.identity === "grep" || action.identity === "bash") &&
+    action.complete &&
+    action.omitted_items === 0 &&
+    action.omitted_bytes === 0 &&
+    argumentsValid &&
+    action.cwd_status === "exact" &&
+    typeof action.cwd === "string" &&
+    action.cwd.length > 0 &&
+    path.isAbsolute(action.cwd) &&
+    input.snapshot.context_safe_for_gate &&
+    trusted.complete &&
+    trusted.omitted_items === 0 &&
+    trusted.omitted_bytes === 0 &&
+    trusted.items.length > 0 &&
+    trusted.items.every((item) => item.source === "human" && item.trusted)
+  )
 }
