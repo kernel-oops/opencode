@@ -6,10 +6,11 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { LSP } from "@/lsp/lsp"
 import DESCRIPTION from "./read.txt"
 import { InstanceState } from "@/effect/instance-state"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, verifyExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
-import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { isBinaryFile, isReadAttachmentMime, isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 import { bindProjectTextFile, closeBoundProjectTextFile, readBoundProjectTextFile } from "./read-bound-file"
+import { closeBoundExternalTextFile, readBoundExternalTextFile } from "./external-read-bound-file"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -17,7 +18,6 @@ const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const MAX_BYTES = 50 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
 const SAMPLE_BYTES = 4096
-const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
 class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 
@@ -207,53 +207,6 @@ export const ReadTool = Tool.define<
       }
     }
 
-    const isBinaryFile = (filepath: string, bytes: Uint8Array) => {
-      const ext = path.extname(filepath).toLowerCase()
-      switch (ext) {
-        case ".zip":
-        case ".tar":
-        case ".gz":
-        case ".exe":
-        case ".dll":
-        case ".so":
-        case ".class":
-        case ".jar":
-        case ".war":
-        case ".7z":
-        case ".doc":
-        case ".docx":
-        case ".xls":
-        case ".xlsx":
-        case ".ppt":
-        case ".pptx":
-        case ".odt":
-        case ".ods":
-        case ".odp":
-        case ".bin":
-        case ".dat":
-        case ".obj":
-        case ".o":
-        case ".a":
-        case ".lib":
-        case ".wasm":
-        case ".pyc":
-        case ".pyo":
-          return true
-      }
-
-      if (bytes.length === 0) return false
-
-      let nonPrintableCount = 0
-      for (let i = 0; i < bytes.length; i++) {
-        if (bytes[i] === 0) return true
-        if (bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32)) {
-          nonPrintableCount++
-        }
-      }
-
-      return nonPrintableCount / bytes.length > 0.3
-    }
-
     const displayFile = (
       filepath: string,
       title: string,
@@ -326,95 +279,135 @@ export const ReadTool = Tool.define<
           ),
         )
 
-        yield* assertExternalDirectoryEffect(ctx, filepath, {
+        const external = yield* assertExternalDirectoryEffect(ctx, filepath, {
+          bindRead: true,
           bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
           kind: stat?.type === "Directory" ? "directory" : "file",
           tool: "read",
         })
+        return yield* Effect.acquireUseRelease(
+          Effect.succeed(external),
+          (verification) =>
+            Effect.gen(function* () {
+              const boundArguments =
+                verification && verification.readBinding && verification.boundRead
+                  ? {
+                      contract: "pinned-external-text-v1",
+                      mode: "bound",
+                      bindingId: verification.readBinding.bindingId,
+                      invocation: input,
+                      effects: [],
+                    }
+                  : undefined
+              yield* ctx.ask({
+                permission: "read",
+                patterns: [path.relative(instance.worktree, filepath)],
+                always: ["*"],
+                metadata: verification && verification.readBinding ? { readBinding: verification.readBinding } : {},
+                action: {
+                  identity: "read",
+                  arguments: boundArguments ?? input,
+                  cwd: stat?.type === "Directory" ? FSUtil.resolve(filepath) : path.dirname(FSUtil.resolve(filepath)),
+                  complete: Boolean(boundArguments),
+                },
+              })
 
-        yield* ctx.ask({
-          permission: "read",
-          patterns: [path.relative(instance.worktree, filepath)],
-          always: ["*"],
-          metadata: {},
-        })
+              if (!stat) return yield* miss(filepath)
 
-        if (!stat) return yield* miss(filepath)
+              yield* verifyExternalDirectoryEffect(verification)
+              if (verification && verification.boundRead) {
+                const bytes = yield* Effect.promise(() => readBoundExternalTextFile(verification.boundRead!))
+                const sample = bytes.subarray(0, SAMPLE_BYTES)
+                if (isBinaryFile(verification.boundRead.path, sample)) {
+                  return yield* Effect.fail(new Error(`Cannot read binary file: ${verification.boundRead.path}`))
+                }
+                const file = boundLines(bytes, {
+                  limit: input.limit ?? DEFAULT_READ_LIMIT,
+                  offset: input.offset || 1,
+                })
+                return displayFile(verification.boundRead.path, title, file, [])
+              }
 
-        if (stat.type === "Directory") {
-          const items = yield* list(filepath)
-          const limit = input.limit ?? DEFAULT_READ_LIMIT
-          const offset = input.offset || 1
-          const start = offset - 1
-          const sliced = items.slice(start, start + limit)
-          const truncated = start + sliced.length < items.length
+              if (stat.type === "Directory") {
+                const items = yield* list(filepath)
+                const limit = input.limit ?? DEFAULT_READ_LIMIT
+                const offset = input.offset || 1
+                const start = offset - 1
+                const sliced = items.slice(start, start + limit)
+                const truncated = start + sliced.length < items.length
 
-          return {
-            title,
-            output: [
-              `<path>${filepath}</path>`,
-              `<type>directory</type>`,
-              `<entries>`,
-              sliced.join("\n"),
-              truncated
-                ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
-                : `\n(${items.length} entries)`,
-              `</entries>`,
-            ].join("\n"),
-            metadata: {
-              preview: sliced.slice(0, 20).join("\n"),
-              truncated,
-              loaded: [] as string[],
-              display: {
-                type: "directory" as const,
-                path: filepath,
-                entries: sliced,
-                offset,
-                totalEntries: items.length,
-                truncated,
-              },
-            },
-          }
-        }
+                return {
+                  title,
+                  output: [
+                    `<path>${filepath}</path>`,
+                    `<type>directory</type>`,
+                    `<entries>`,
+                    sliced.join("\n"),
+                    truncated
+                      ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
+                      : `\n(${items.length} entries)`,
+                    `</entries>`,
+                  ].join("\n"),
+                  metadata: {
+                    preview: sliced.slice(0, 20).join("\n"),
+                    truncated,
+                    loaded: [] as string[],
+                    display: {
+                      type: "directory" as const,
+                      path: filepath,
+                      entries: sliced,
+                      offset,
+                      totalEntries: items.length,
+                      truncated,
+                    },
+                  },
+                }
+              }
 
-        const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
-        const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
+              const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
+              const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
 
-        const mime = sniffAttachmentMime(sample, FSUtil.mimeType(filepath))
-        const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
+              const mime = sniffAttachmentMime(sample, FSUtil.mimeType(filepath))
+              const isImage = isReadAttachmentMime(mime) && !isPdfAttachment(mime)
 
-        if (isImage || isPdfAttachment(mime)) {
-          const bytes = yield* fs.readFile(filepath)
-          const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
-          return {
-            title,
-            output: msg,
-            metadata: {
-              preview: msg,
-              truncated: false,
-              loaded: loaded.map((item) => item.filepath),
-            },
-            attachments: [
-              {
-                type: "file" as const,
-                mime,
-                url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
-              },
-            ],
-          }
-        }
+              if (isImage || isPdfAttachment(mime)) {
+                const bytes = yield* fs.readFile(filepath)
+                const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
+                return {
+                  title,
+                  output: msg,
+                  metadata: {
+                    preview: msg,
+                    truncated: false,
+                    loaded: loaded.map((item) => item.filepath),
+                  },
+                  attachments: [
+                    {
+                      type: "file" as const,
+                      mime,
+                      url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
+                    },
+                  ],
+                }
+              }
 
-        if (isBinaryFile(filepath, sample)) {
-          return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
-        }
+              if (isBinaryFile(filepath, sample)) {
+                return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+              }
 
-        const file = yield* lines(filepath, {
-          limit: input.limit ?? DEFAULT_READ_LIMIT,
-          offset: input.offset || 1,
-        })
+              const file = yield* lines(filepath, {
+                limit: input.limit ?? DEFAULT_READ_LIMIT,
+                offset: input.offset || 1,
+              })
 
-        yield* warm(filepath)
-        return displayFile(filepath, title, file, loaded)
+              yield* warm(filepath)
+              return displayFile(filepath, title, file, loaded)
+            }),
+          (verification) =>
+            verification && verification.boundRead
+              ? Effect.promise(() => closeBoundExternalTextFile(verification.boundRead!))
+              : Effect.void,
+        )
       })
 
       return yield* Effect.acquireUseRelease(

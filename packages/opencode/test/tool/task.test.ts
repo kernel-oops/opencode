@@ -104,6 +104,7 @@ function stubOps(opts?: {
 }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    canResumeTask: () => Effect.succeed(true),
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
@@ -249,7 +250,7 @@ describe("tool.task", () => {
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "Existing child" })
+      const child = yield* sessions.create({ parentID: chat.id, title: "Existing child", agent: "general" })
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let seen: SessionPrompt.PromptInput | undefined
@@ -281,6 +282,53 @@ describe("tool.task", () => {
       expect(result.output).toContain(`<task id="${child.id}" state="completed">`)
       expect(seen?.sessionID).toBe(child.id)
       expect(seen?.variant).toBe("xhigh")
+    }),
+  )
+
+  it.instance("execute rejects an unproven task_id before asking permission", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "Forged child", agent: "general" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let asked = false
+      let prompted = false
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            task_id: child.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: {
+                ...stubOps({ onPrompt: () => (prompted = true) }),
+                canResumeTask: () => Effect.succeed(false),
+              },
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.sync(() => void (asked = true)),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isSuccess(exit)) throw new Error("expected task_id rejection")
+      expect(Cause.squash(exit.cause)).toHaveProperty(
+        "message",
+        "task_id is not an authorised child of this Task context",
+      )
+      expect(asked).toBe(false)
+      expect(prompted).toBe(false)
     }),
   )
 

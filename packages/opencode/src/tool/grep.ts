@@ -3,9 +3,21 @@ import { Effect, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, verifyExternalDirectoryEffect } from "./external-directory"
+import { containsPath } from "../project/instance-context"
 import DESCRIPTION from "./grep.txt"
-import { bindSearchDirectory } from "./search-bound-directory"
+import {
+  bindSearchDirectory,
+  closeBoundSearchDirectory,
+  verifyBoundSearchDirectory,
+  type BoundSearchDirectory,
+} from "./search-bound-directory"
+import {
+  bindExternalTextFile,
+  closeBoundExternalTextFile,
+  readBoundExternalTextFile,
+  type BoundExternalTextFile,
+} from "./external-read-bound-file"
 import {
   bindGrepFiles,
   closeGrepSnapshot,
@@ -17,6 +29,11 @@ import {
 import * as Tool from "./tool"
 
 const RESULT_LIMIT = 100
+const EXTERNAL_GREP_FD = 3
+
+type SearchBinding =
+  | { readonly kind: "directory"; readonly value: BoundSearchDirectory }
+  | { readonly kind: "file"; readonly value: BoundExternalTextFile }
 
 async function searchBoundSnapshot(snapshot: BoundGrepSnapshot, literals: readonly string[]) {
   const rows: { path: string; line: number; text: string }[] = []
@@ -94,31 +111,56 @@ export const GrepTool = Tool.define(
           const lexical = path.resolve(requested)
           const search = FSUtil.resolve(lexical)
           const requestedInfo = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          yield* assertExternalDirectoryEffect(ctx, search, {
-            bypass: false,
-            kind: requestedInfo?.type === "Directory" ? "directory" : "file",
-            tool: "grep",
-          })
           const cwd = requestedInfo?.type === "Directory" ? search : path.dirname(search)
+          const isExternal = !containsPath(search, ins)
 
-          const eligible =
-            requestedInfo?.type === "Directory" &&
-            cwd === ins.directory &&
-            (input.path === undefined || lexical === search)
+          const projectDirectoryEligible = !isExternal && requestedInfo?.type === "Directory" && lexical === search
           return yield* Effect.acquireUseRelease(
-            eligible ? Effect.promise(() => bindSearchDirectory(ins.directory, cwd)) : Effect.succeed(undefined),
-            (bound) =>
+            Effect.promise(async (): Promise<SearchBinding | undefined> => {
+              if (isExternal && requestedInfo?.type === "File") {
+                const value = await bindExternalTextFile(search)
+                return value ? { kind: "file", value } : undefined
+              }
+              if (isExternal && requestedInfo?.type === "Directory") {
+                const value = await bindSearchDirectory(search, search)
+                return value ? { kind: "directory", value } : undefined
+              }
+              if (projectDirectoryEligible) {
+                const value = await bindSearchDirectory(ins.directory, search)
+                return value ? { kind: "directory", value } : undefined
+              }
+            }),
+            (binding) =>
               Effect.gen(function* () {
+                if (!isExternal && requestedInfo?.type === "Directory" && !binding)
+                  throw new Error("Project search directory could not be bound safely")
+                const externalBinding = isExternal ? binding : undefined
+                // A directory descriptor does not confine same-device descendant bind mounts. Retain it only to
+                // execute a human-authorised search against the reviewed directory; never attest completeness.
+                const searchBinding =
+                  externalBinding?.kind === "file"
+                    ? {
+                        version: 1 as const,
+                        contract: "pinned-external-search-v1" as const,
+                        mode: "file" as const,
+                        executor: "ripgrep-inherited-readonly-fd-v1" as const,
+                        bindingId: externalBinding.value.bindingId,
+                        effects: [] as const,
+                      }
+                    : undefined
+                const external = yield* assertExternalDirectoryEffect(ctx, search, {
+                  bypass: false,
+                  kind: requestedInfo?.type === "Directory" ? "directory" : "file",
+                  tool: "grep",
+                  searchBinding,
+                })
                 const render = (rows: { path: string; line: number; text: string }[]) => {
                   if (rows.length === 0) return empty
                   const truncated = rows.length === RESULT_LIMIT
                   const output = [`Found ${rows.length} matches${truncated ? " (more matches available)" : ""}`]
                   let current = ""
                   for (const match of rows) {
-                    const logical = path.resolve(
-                      requestedInfo?.type === "Directory" ? requested : path.dirname(requested),
-                      match.path,
-                    )
+                    const logical = requestedInfo?.type === "File" ? search : path.resolve(requested, match.path)
                     if (current !== logical) {
                       if (current !== "") output.push("")
                       current = logical
@@ -151,18 +193,70 @@ export const GrepTool = Tool.define(
                   })
 
                 const legacy = Effect.gen(function* () {
-                  yield* ask(false)
+                  const boundArguments =
+                    externalBinding?.kind === "file"
+                      ? {
+                          contract: "pinned-external-search-v1",
+                          mode: "bound",
+                          kind: "file",
+                          executor: searchBinding!.executor,
+                          bindingId: externalBinding.value.bindingId,
+                          invocation: input,
+                          effects: [],
+                        }
+                      : !isExternal && binding?.kind === "directory"
+                        ? {
+                            contract: "pinned-project-search-v1",
+                            mode: "directory",
+                            tool: "grep",
+                            executor: "ripgrep-procfd-cwd-v1",
+                            bindingId: binding.value.bindingId,
+                            invocation: input,
+                            effects: [],
+                          }
+                        : undefined
+                  yield* ask(Boolean(boundArguments), boundArguments ?? input)
+                  yield* verifyExternalDirectoryEffect(external)
+                  if (externalBinding?.kind === "directory") {
+                    yield* Effect.promise(() => verifyBoundSearchDirectory(externalBinding.value))
+                  }
+                  if (externalBinding?.kind === "file") {
+                    yield* Effect.promise(() => readBoundExternalTextFile(externalBinding.value)).pipe(Effect.asVoid)
+                  }
                   const result = yield* ripgrep.grep({
-                    cwd: bound?.cwd ?? cwd,
+                    cwd:
+                      binding?.kind === "directory"
+                        ? binding.value.cwd
+                        : binding?.kind === "file"
+                          ? `/proc/self/fd/${binding.value.root.fd}`
+                          : cwd,
+                    file:
+                      binding?.kind === "file"
+                        ? `/proc/self/fd/${EXTERNAL_GREP_FD}`
+                        : requestedInfo?.type === "File"
+                          ? path.basename(search)
+                          : undefined,
                     pattern: input.pattern,
                     include: input.include,
                     limit: RESULT_LIMIT,
+                    inheritedReadOnlyFds:
+                      binding?.kind === "file"
+                        ? [{ parent: binding.value.file.fd, child: EXTERNAL_GREP_FD }]
+                        : undefined,
                   })
+                  if (externalBinding?.kind === "directory") {
+                    yield* Effect.promise(() => verifyBoundSearchDirectory(externalBinding.value))
+                  }
+                  if (externalBinding?.kind === "file") {
+                    yield* Effect.promise(() => readBoundExternalTextFile(externalBinding.value)).pipe(Effect.asVoid)
+                  }
                   return render(result.map((item) => ({ path: item.entry.path, line: item.line, text: item.text })))
                 })
 
                 const literals = literalBranches(input.pattern)
-                if (!bound || !literals || input.include !== undefined) return yield* legacy
+                const bound = binding?.kind === "directory" ? binding.value : undefined
+                if (isExternal || search !== ins.directory || !bound || !literals || input.include !== undefined)
+                  return yield* legacy
                 const entries = yield* ripgrep
                   .find({
                     cwd: bound.cwd,
@@ -203,7 +297,12 @@ export const GrepTool = Tool.define(
                   (snapshot) => (snapshot ? Effect.promise(() => closeGrepSnapshot(snapshot)) : Effect.void),
                 )
               }),
-            (bound) => (bound ? Effect.promise(() => bound.directory.close().catch(() => {})) : Effect.void),
+            (binding) =>
+              binding?.kind === "directory"
+                ? Effect.promise(() => closeBoundSearchDirectory(binding.value))
+                : binding?.kind === "file"
+                  ? Effect.promise(() => closeBoundExternalTextFile(binding.value))
+                  : Effect.void,
           )
         }).pipe(Effect.orDie),
     }

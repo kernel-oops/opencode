@@ -5,7 +5,7 @@ import os from "os"
 import path from "path"
 import { createHash } from "node:crypto"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { GrepTool } from "../../src/tool/grep"
 import { provideInstance, testInstanceStoreLayer, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -64,6 +64,12 @@ const asks = () => {
 
 const root = path.join(__dirname, "../..")
 const full = (p: string) => (process.platform === "win32" ? Filesystem.normalizePath(p) : p)
+
+async function openFileLinks() {
+  return Promise.all(
+    (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+  )
+}
 
 const githubBase = <A, E, R>(url: string, self: Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
@@ -320,7 +326,7 @@ describe("tool.grep", () => {
     }),
   )
 
-  it.instance("keeps regex and include searches human-authorised", () =>
+  it.instance("uses bound project-search contracts for regex and include searches", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => Bun.write(path.join(test.directory, "test.txt"), "needle"))
@@ -334,13 +340,98 @@ describe("tool.grep", () => {
         yield* grep.execute(args, captured.next)
         const action = resolveReviewAction({
           builtin: true,
+          permission: "grep",
           identity: "grep",
           arguments: args,
           directory: test.directory,
           requested: captured.items[0]?.action,
         })
-        expect(action.complete).toBe(false)
+        expect(action.complete).toBe(true)
+        expect(action.arguments).toMatchObject({
+          contract: "pinned-project-search-v1",
+          mode: "directory",
+          tool: "grep",
+          executor: "ripgrep-procfd-cwd-v1",
+          invocation: args,
+          effects: [],
+        })
       }
+    }),
+  )
+
+  it.instance("keeps a production-shaped child Grep on its held directory across a symlink swap", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const test = yield* TestInstance
+      const templates = path.join(test.directory, "templates")
+      const moved = path.join(test.directory, "templates-reviewed")
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => fs.mkdir(templates))
+      yield* Effect.promise(() => Bun.write(path.join(templates, "flight.html"), "Import OCR duplicate\n"))
+      yield* Effect.promise(() => Bun.write(path.join(outside, "secret.html"), "Import outside-secret\n"))
+      const args = {
+        pattern: "Import|Export|OCR|conflict|duplicate|remove|delete",
+        path: templates,
+        include: "*.{html,twig}",
+      }
+      let requested: PermissionV1.ReviewAction | undefined
+      let replaced = false
+      const next = {
+        ...ctx,
+        ask: (input: Parameters<Tool.Context["ask"]>[0]) =>
+          Effect.promise(async () => {
+            requested = input.action
+            await fs.rename(templates, moved)
+            await fs.symlink(outside, templates, "dir")
+            replaced = true
+          }),
+      }
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const result = yield* grep.execute(args, next).pipe(
+        Effect.ensuring(
+          Effect.promise(async () => {
+            if (!replaced) return
+            await fs.rm(templates)
+            await fs.rename(moved, templates)
+          }),
+        ),
+      )
+
+      expect(result.output).toContain("Import OCR duplicate")
+      expect(result.output).not.toContain("outside-secret")
+      expect(result.output).not.toContain("/proc/self/fd")
+      const action = resolveReviewAction({
+        builtin: true,
+        permission: "grep",
+        identity: "grep",
+        arguments: args,
+        directory: test.directory,
+        requested,
+      })
+      expect(action.complete).toBe(true)
+      expect(action.arguments).toMatchObject({ contract: "pinned-project-search-v1", tool: "grep" })
+    }),
+  )
+
+  it.instance("fails closed before permission for a project Grep child symlink", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const test = yield* TestInstance
+      const real = path.join(test.directory, "templates-real")
+      const linked = path.join(test.directory, "templates")
+      yield* Effect.promise(() => fs.mkdir(real))
+      yield* Effect.promise(() => fs.symlink(real, linked, "dir"))
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const exit = yield* Effect.exit(grep.execute({ pattern: "Import.*OCR", path: linked }, captured.next))
+
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag === "Failure") expect(String(exit.cause)).toContain("could not be bound safely")
+      expect(captured.items).toHaveLength(0)
     }),
   )
 
@@ -699,16 +790,209 @@ describe("tool.grep", () => {
       yield* Effect.promise(() => Bun.write(file, "line1\nline2\nline3"))
       const info = yield* GrepTool
       const grep = yield* info.init()
-      const result = yield* grep.execute(
-        {
-          pattern: "line2",
-          path: file,
-        },
-        ctx,
-      )
+      const args = { pattern: "line2", path: file }
+      const captured = asks()
+      const result = yield* grep.execute(args, captured.next)
       expect(result.metadata.matches).toBe(1)
       expect(result.output).toContain(file)
       expect(result.output).toContain("Line 2: line2")
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          permission: "grep",
+          identity: "grep",
+          arguments: args,
+          directory: test.directory,
+          requested: captured.items.at(-1)?.action,
+        }).complete,
+      ).toBe(false)
+    }),
+  )
+
+  it.instance("searches only the requested exact file and never an adjacent hidden sibling", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const requested = path.join(test.directory, "requested.txt")
+      const hidden = path.join(test.directory, ".sibling-secret.txt")
+      yield* Effect.promise(() =>
+        Promise.all([
+          Bun.write(requested, "needle requested-value"),
+          Bun.write(hidden, "needle sibling-hidden-secret"),
+        ]),
+      )
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const result = yield* grep.execute({ pattern: "needle", path: requested }, ctx)
+
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain(requested)
+      expect(result.output).toContain("requested-value")
+      expect(result.output).not.toContain("sibling-hidden-secret")
+      expect(result.output).not.toContain(hidden)
+    }),
+  )
+
+  it.instance("binds an external exact file through both permissions and searches only that descriptor", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const requested = path.join(outside, "requested.txt")
+      const hidden = path.join(outside, ".sibling-secret.txt")
+      yield* Effect.promise(() =>
+        Promise.all([Bun.write(requested, "needle reviewed-value"), Bun.write(hidden, "needle sibling-hidden-secret")]),
+      )
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const result = yield* grep.execute({ pattern: "needle", path: requested }, captured.next)
+
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain("reviewed-value")
+      expect(result.output).not.toContain("sibling-hidden-secret")
+      expect(
+        captured.items.find((item) => item.permission === "external_directory")?.metadata.searchBinding,
+      ).toMatchObject({
+        contract: "pinned-external-search-v1",
+        mode: "file",
+        executor: "ripgrep-inherited-readonly-fd-v1",
+      })
+      expect(captured.items.find((item) => item.permission === "grep")?.action?.arguments).toMatchObject({
+        contract: "pinned-external-search-v1",
+        kind: "file",
+      })
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("requested.txt"))).toBe(false)
+    }),
+  )
+
+  it.instance("holds an external directory descriptor without attesting automatic completeness", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      yield* Effect.promise(() => Bun.write(path.join(outside, "reviewed.txt"), "needle reviewed-value"))
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      const result = yield* grep.execute({ pattern: "needle", path: outside }, captured.next)
+
+      expect(result.output).toContain("reviewed-value")
+      expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(
+        "searchBinding",
+      )
+      expect(captured.items.find((item) => item.permission === "grep")?.action?.complete).toBe(false)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item === outside)).toBe(false)
+    }),
+  )
+
+  it.instance("aborts external directory Grep when its reviewed ancestor is replaced by a symlink", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const reviewed = path.join(outside, "reviewed")
+      const moved = path.join(outside, "reviewed-original")
+      const replacement = path.join(outside, "replacement")
+      yield* Effect.promise(async () => {
+        await fs.mkdir(reviewed)
+        await fs.mkdir(replacement)
+        await Bun.write(path.join(reviewed, "value.txt"), "needle reviewed-value")
+        await Bun.write(path.join(replacement, "secret.txt"), "needle replacement-secret")
+      })
+      let asks = 0
+      const next: Tool.Context = {
+        ...ctx,
+        ask: () =>
+          ++asks === 2
+            ? Effect.promise(async () => {
+                await fs.rename(reviewed, moved)
+                await fs.symlink(replacement, reviewed, "dir")
+              })
+            : Effect.void,
+      }
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const exit = yield* Effect.exit(grep.execute({ pattern: "needle", path: reviewed }, next))
+
+      expect(asks).toBe(2)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("External path changed")
+    }),
+  )
+
+  it.instance("aborts external exact-file Grep when the reviewed file is replaced", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const requested = path.join(outside, "reviewed.txt")
+      const moved = path.join(outside, "reviewed-original.txt")
+      yield* Effect.promise(() => Bun.write(requested, "needle reviewed-value"))
+      let asks = 0
+      const next: Tool.Context = {
+        ...ctx,
+        ask: () =>
+          ++asks === 2
+            ? Effect.promise(async () => {
+                await fs.rename(requested, moved)
+                await Bun.write(requested, "needle replacement-secret")
+              })
+            : Effect.void,
+      }
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const exit = yield* Effect.exit(grep.execute({ pattern: "needle", path: requested }, next))
+
+      expect(asks).toBe(2)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(String(Cause.squash(exit.cause))).toContain("External path changed")
+    }),
+  )
+
+  it.instance("closes an external exact-file Grep descriptor on denial and cancellation", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const requested = path.join(outside, "held.txt")
+      yield* Effect.promise(() => Bun.write(requested, "needle held"))
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      let deniedAsks = 0
+      yield* Effect.exit(
+        grep.execute(
+          { pattern: "needle", path: requested },
+          {
+            ...ctx,
+            ask: () => (++deniedAsks === 1 ? Effect.void : Effect.die(new Error("denied"))),
+          },
+        ),
+      )
+      expect(deniedAsks).toBe(2)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("held.txt"))).toBe(false)
+
+      const entered = yield* Deferred.make<void>()
+      let cancelledAsks = 0
+      const fiber = yield* grep
+        .execute(
+          { pattern: "needle", path: requested },
+          {
+            ...ctx,
+            ask: () =>
+              ++cancelledAsks === 1
+                ? Effect.void
+                : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          },
+        )
+        .pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+      expect(cancelledAsks).toBe(2)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("held.txt"))).toBe(false)
     }),
   )
 

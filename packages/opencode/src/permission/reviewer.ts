@@ -35,9 +35,12 @@ export {
 export { isAdvisoryAllowCandidate } from "./advisory-gate"
 export { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "./obvious-risk-gate"
 export {
+  genericRiskCandidateRejection,
+  type GenericRiskCandidateRejection,
   isExternalDirectoryRiskAllowCandidate,
   isGenericRiskAllowCandidate,
   isGenericRiskCandidate,
+  registeredReadonlyInvocation,
 } from "./generic-review-action"
 export type Result = { decision: Decision } | { failure: Failure }
 

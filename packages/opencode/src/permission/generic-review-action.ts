@@ -31,11 +31,15 @@ const contracts: Readonly<Record<string, Contract>> = {
 }
 
 const externalDirectoryContracts: Readonly<Record<string, Contract>> = {
+  glob: { permissions: ["external_directory"], cwd: "session", arguments: "invocation" },
   grep: { permissions: ["external_directory"], cwd: "session", arguments: "invocation" },
   read: { permissions: ["external_directory"], cwd: "session", arguments: "invocation" },
 }
 
 const invocationContract = "registered-builtin-invocation-v1"
+const boundExternalSearchContract = "pinned-external-search-v1"
+const boundProjectSearchContract = "pinned-project-search-v1"
+const boundExternalReadContract = "pinned-external-text-v1"
 
 function argumentsComplete(contract: Contract, value: unknown) {
   if (!record(value)) return false
@@ -72,6 +76,286 @@ function exactKeys(value: Record<string, unknown>, keys: string[]) {
     actual.every((item): item is string => typeof item === "string") &&
     actual.toSorted().every((item, index) => item === expected[index])
   )
+}
+
+function readonlyInvocationArguments(identity: string, value: unknown) {
+  if (!record(value)) return false
+  if (identity === "glob") {
+    if (!exactKeys(value, value.path === undefined ? ["pattern"] : ["path", "pattern"])) return false
+    return (
+      typeof value.pattern === "string" &&
+      value.pattern.length > 0 &&
+      (value.path === undefined || (typeof value.path === "string" && value.path.length > 0))
+    )
+  }
+  if (identity === "grep") {
+    const keys = [
+      "pattern",
+      ...(value.path === undefined ? [] : ["path"]),
+      ...(value.include === undefined ? [] : ["include"]),
+    ]
+    if (!exactKeys(value, keys)) return false
+    return (
+      typeof value.pattern === "string" &&
+      value.pattern.length > 0 &&
+      (value.path === undefined || (typeof value.path === "string" && value.path.length > 0)) &&
+      (value.include === undefined || (typeof value.include === "string" && value.include.length > 0))
+    )
+  }
+  if (identity !== "read") return false
+  const keys = [
+    "filePath",
+    ...(value.offset === undefined ? [] : ["offset"]),
+    ...(value.limit === undefined ? [] : ["limit"]),
+  ]
+  if (!exactKeys(value, keys) || typeof value.filePath !== "string" || value.filePath.length === 0) return false
+  return (
+    (value.offset === undefined || (Number.isSafeInteger(value.offset) && Number(value.offset) >= 0)) &&
+    (value.limit === undefined || (Number.isSafeInteger(value.limit) && Number(value.limit) >= 0))
+  )
+}
+
+function sameReadonlyInvocation(identity: string, left: unknown, right: unknown) {
+  if (!readonlyInvocationArguments(identity, left) || !readonlyInvocationArguments(identity, right)) return false
+  if (!record(left) || !record(right)) return false
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length && keys.every((key) => left[key] === right[key])
+}
+
+function boundExternalSearchArguments(identity: string, value: unknown) {
+  if (identity !== "grep" || !record(value)) return false
+  if (
+    !exactKeys(value, ["bindingId", "contract", "effects", "executor", "invocation", "kind", "mode"]) ||
+    value.contract !== boundExternalSearchContract ||
+    value.mode !== "bound" ||
+    typeof value.bindingId !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(value.bindingId) ||
+    !Array.isArray(value.effects) ||
+    types.isProxy(value.effects) ||
+    value.effects.length !== 0 ||
+    !readonlyInvocationArguments(identity, value.invocation)
+  )
+    return false
+  return value.kind === "file" && value.executor === "ripgrep-inherited-readonly-fd-v1"
+}
+
+function boundProjectSearchArguments(identity: string, value: unknown) {
+  if ((identity !== "glob" && identity !== "grep") || !record(value)) return false
+  if (
+    !exactKeys(value, ["bindingId", "contract", "effects", "executor", "invocation", "mode", "tool"]) ||
+    value.contract !== boundProjectSearchContract ||
+    value.mode !== "directory" ||
+    value.tool !== identity ||
+    value.executor !== "ripgrep-procfd-cwd-v1" ||
+    typeof value.bindingId !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(value.bindingId) ||
+    !Array.isArray(value.effects) ||
+    types.isProxy(value.effects) ||
+    value.effects.length !== 0 ||
+    !readonlyInvocationArguments(identity, value.invocation)
+  )
+    return false
+  return true
+}
+
+function boundProjectSearchScope(identity: string, value: unknown, directory: string, cwd: unknown) {
+  if (!boundProjectSearchArguments(identity, value) || !record(value) || !record(value.invocation)) return false
+  if (!path.isAbsolute(directory) || typeof cwd !== "string" || !path.isAbsolute(cwd)) return false
+  const raw = value.invocation.path ?? directory
+  if (typeof raw !== "string" || raw.length === 0) return false
+  const target = path.resolve(directory, raw)
+  return contains(directory, target) && cwd === target
+}
+
+function boundExternalReadArguments(identity: string, value: unknown) {
+  if (identity !== "read" || !record(value)) return false
+  return (
+    exactKeys(value, ["bindingId", "contract", "effects", "invocation", "mode"]) &&
+    value.contract === boundExternalReadContract &&
+    value.mode === "bound" &&
+    typeof value.bindingId === "string" &&
+    /^[0-9a-f]{32}$/u.test(value.bindingId) &&
+    Array.isArray(value.effects) &&
+    !types.isProxy(value.effects) &&
+    value.effects.length === 0 &&
+    readonlyInvocationArguments(identity, value.invocation)
+  )
+}
+
+function boundExternalSearchRequested(input: {
+  readonly permission?: string
+  readonly identity: string
+  readonly arguments: unknown
+  readonly directory: string
+  readonly requested: PermissionV1.ReviewAction
+}) {
+  const requested = input.requested
+  if (
+    input.identity !== "grep" ||
+    input.permission !== input.identity ||
+    requested.identity !== input.identity ||
+    requested.complete !== true ||
+    typeof requested.cwd !== "string" ||
+    !path.isAbsolute(requested.cwd) ||
+    !boundExternalSearchArguments(input.identity, requested.arguments) ||
+    !record(requested.arguments) ||
+    !sameReadonlyInvocation(input.identity, input.arguments, requested.arguments.invocation) ||
+    !record(input.arguments)
+  )
+    return false
+  const raw = input.arguments.path ?? input.directory
+  if (typeof raw !== "string" || raw.length === 0) return false
+  const target = path.resolve(input.directory, raw)
+  if (contains(input.directory, target)) return false
+  return requested.arguments.kind === "file" && requested.cwd === path.dirname(target)
+}
+
+function boundProjectSearchRequested(input: {
+  readonly permission?: string
+  readonly identity: string
+  readonly arguments: unknown
+  readonly directory: string
+  readonly requested: PermissionV1.ReviewAction
+}) {
+  const requested = input.requested
+  if (
+    (input.identity !== "glob" && input.identity !== "grep") ||
+    input.permission !== input.identity ||
+    requested.identity !== input.identity ||
+    requested.complete !== true ||
+    typeof requested.cwd !== "string" ||
+    !path.isAbsolute(requested.cwd) ||
+    !boundProjectSearchArguments(input.identity, requested.arguments) ||
+    !record(requested.arguments) ||
+    !sameReadonlyInvocation(input.identity, input.arguments, requested.arguments.invocation) ||
+    !record(input.arguments)
+  )
+    return false
+  return boundProjectSearchScope(input.identity, requested.arguments, input.directory, requested.cwd)
+}
+
+function boundExternalReadRequested(input: {
+  readonly permission?: string
+  readonly permissionMetadata?: Record<string, unknown>
+  readonly identity: string
+  readonly arguments: unknown
+  readonly directory: string
+  readonly requested: PermissionV1.ReviewAction
+}) {
+  const requested = input.requested
+  if (
+    input.identity !== "read" ||
+    input.permission !== "read" ||
+    requested.identity !== "read" ||
+    requested.complete !== true ||
+    typeof requested.cwd !== "string" ||
+    !path.isAbsolute(requested.cwd) ||
+    !boundExternalReadArguments(input.identity, requested.arguments) ||
+    !record(requested.arguments) ||
+    !sameReadonlyInvocation(input.identity, input.arguments, requested.arguments.invocation) ||
+    !record(input.arguments) ||
+    !primaryReadBindingMetadata(input.permissionMetadata)
+  )
+    return false
+  const metadataBinding = input.permissionMetadata?.readBinding
+  if (!record(metadataBinding) || requested.arguments.bindingId !== metadataBinding.bindingId) return false
+  const raw = input.arguments.filePath
+  if (typeof raw !== "string" || raw.length === 0) return false
+  const target = path.resolve(input.directory, raw)
+  return !contains(input.directory, target) && requested.cwd === path.dirname(target)
+}
+
+function primaryReadBindingMetadata(value: unknown) {
+  if (!record(value) || !exactKeys(value, ["readBinding"]) || !record(value.readBinding)) return false
+  const binding = value.readBinding
+  return (
+    exactKeys(binding, ["bindingId", "contract", "version"]) &&
+    binding.version === 1 &&
+    binding.contract === boundExternalReadContract &&
+    typeof binding.bindingId === "string" &&
+    /^[0-9a-f]{32}$/u.test(binding.bindingId)
+  )
+}
+
+function externalSearchBindingMetadata(value: unknown, identity: string) {
+  if (identity !== "grep" || !record(value)) return false
+  const binding = value.searchBinding
+  const scope = value.readScope
+  if (
+    !exactKeys(value, ["filepath", "parentDir", "readScope", "searchBinding", "tool"]) ||
+    value.tool !== identity ||
+    !record(binding) ||
+    !record(scope) ||
+    !exactKeys(scope, ["canonicalRoot", "canonicalTarget", "kind", "version"]) ||
+    scope.version !== 1 ||
+    scope.kind !== "file" ||
+    typeof scope.canonicalTarget !== "string" ||
+    typeof scope.canonicalRoot !== "string" ||
+    value.filepath !== scope.canonicalTarget ||
+    value.parentDir !== scope.canonicalRoot
+  )
+    return false
+  return (
+    exactKeys(binding, ["bindingId", "contract", "effects", "executor", "mode", "version"]) &&
+    binding.version === 1 &&
+    binding.contract === boundExternalSearchContract &&
+    typeof binding.bindingId === "string" &&
+    /^[0-9a-f]{32}$/u.test(binding.bindingId) &&
+    Array.isArray(binding.effects) &&
+    !types.isProxy(binding.effects) &&
+    binding.effects.length === 0 &&
+    binding.mode === "file" &&
+    binding.executor === "ripgrep-inherited-readonly-fd-v1"
+  )
+}
+
+function externalReadBindingMetadata(value: unknown) {
+  if (!record(value) || !exactKeys(value, ["filepath", "parentDir", "readBinding", "readScope", "tool"])) return false
+  const binding = value.readBinding
+  const scope = value.readScope
+  if (
+    value.tool !== "read" ||
+    !record(binding) ||
+    !record(scope) ||
+    !exactKeys(binding, ["bindingId", "contract", "version"]) ||
+    binding.version !== 1 ||
+    binding.contract !== "pinned-external-text-v1" ||
+    typeof binding.bindingId !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(binding.bindingId) ||
+    !exactKeys(scope, ["canonicalRoot", "canonicalTarget", "kind", "version"]) ||
+    scope.version !== 1 ||
+    scope.kind !== "file" ||
+    typeof scope.canonicalTarget !== "string" ||
+    typeof scope.canonicalRoot !== "string" ||
+    !path.isAbsolute(scope.canonicalTarget) ||
+    !path.isAbsolute(scope.canonicalRoot)
+  )
+    return false
+  return (
+    value.filepath === scope.canonicalTarget &&
+    value.parentDir === scope.canonicalRoot &&
+    path.dirname(scope.canonicalTarget) === scope.canonicalRoot
+  )
+}
+
+export function registeredReadonlyInvocation(action: PermissionReviewSnapshot["action"]) {
+  if (action.identity !== "glob" && action.identity !== "grep" && action.identity !== "read") return
+  const contract = { permissions: [action.identity], cwd: "session", arguments: "invocation" } satisfies Contract
+  if (!record(action.arguments)) return
+  const invocation =
+    argumentsComplete(contract, action.arguments) ||
+    boundExternalSearchArguments(action.identity, action.arguments) ||
+    boundProjectSearchArguments(action.identity, action.arguments) ||
+    boundExternalReadArguments(action.identity, action.arguments)
+      ? action.arguments.invocation
+      : undefined
+  if (!readonlyInvocationArguments(action.identity, invocation) || !record(invocation)) return
+  return { identity: action.identity as "glob" | "grep" | "read", invocation }
+}
+
+function contains(root: string, target: string) {
+  const relative = path.relative(root, target)
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
 }
 
 function metadataTool(value: unknown) {
@@ -250,7 +534,32 @@ export function resolveReviewAction(input: {
         ? externalDirectoryContracts[contractIdentity]
         : contracts[contractIdentity]
       : undefined
+  if (
+    input.permission === "external_directory" &&
+    (externalIdentity === "glob" || externalIdentity === "grep") &&
+    !externalSearchBindingMetadata(input.permissionMetadata, externalIdentity)
+  )
+    return { identity: input.identity, arguments: input.arguments, complete: false }
+  if (
+    input.permission === "external_directory" &&
+    externalIdentity === "read" &&
+    !externalReadBindingMetadata(input.permissionMetadata)
+  )
+    return { identity: input.identity, arguments: input.arguments, complete: false }
   if (input.requested) {
+    const boundExternalSearch = boundExternalSearchRequested({ ...input, requested: input.requested })
+    if (boundExternalSearch) return input.requested
+    const boundProjectSearch = boundProjectSearchRequested({ ...input, requested: input.requested })
+    if (boundProjectSearch) return input.requested
+    const boundExternalRead = boundExternalReadRequested({ ...input, requested: input.requested })
+    if (boundExternalRead) return input.requested
+    if (
+      (input.identity === "glob" || input.identity === "grep") &&
+      typeof input.requested.cwd === "string" &&
+      path.isAbsolute(input.requested.cwd) &&
+      !contains(input.directory, input.requested.cwd)
+    )
+      return { identity: input.identity, arguments: input.arguments, complete: false }
     if (externalContractExpected && !contract)
       return { identity: input.identity, arguments: input.arguments, complete: false }
     if (
@@ -264,6 +573,10 @@ export function resolveReviewAction(input: {
       return { ...input.requested, complete: false }
     if (contract && !requestedActionComplete(contract, input.arguments, input.requested, input.directory))
       return { ...input.requested, complete: false }
+    if (!contract)
+      return input.identity === "read" || input.identity === "glob" || input.identity === "grep"
+        ? { ...input.requested, complete: false }
+        : input.requested
     return input.requested
   }
   if (contract?.requested) return { identity: input.identity, arguments: input.arguments, complete: false }
@@ -282,16 +595,40 @@ export function resolveReviewAction(input: {
   }
 }
 
-export function isGenericRiskCandidate(input: {
+type GenericRiskInput = {
   readonly settled: boolean
   readonly permission: string
   readonly assessment: RiskPolicyAssessment
   readonly snapshot: PermissionReviewSnapshot
   readonly policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
-}) {
+  readonly directory?: string
+  readonly allowExternalReadScope?: boolean
+}
+
+export type GenericRiskCandidateRejection =
+  | "review_unsettled"
+  | "assessment_invalid"
+  | "contract_unknown"
+  | "action_incomplete"
+  | "action_scope_invalid"
+  | "authority_action_changed"
+  | "authority_evidence_changed"
+  | "authority_revoked"
+  | "authority_turn_changed"
+  | "context_unsafe"
+  | "trusted_evidence_incomplete"
+
+export function genericRiskCandidateRejection(input: GenericRiskInput): GenericRiskCandidateRejection | undefined {
   const action = input.snapshot.action
-  const contract = contracts[action.identity]
-  if (!contract) return false
+  const boundExternal = boundExternalSearchArguments(action.identity, action.arguments)
+  const boundProject = boundProjectSearchArguments(action.identity, action.arguments)
+  const boundRead = boundExternalReadArguments(action.identity, action.arguments)
+  const specialised = contracts[action.identity]
+  const contract =
+    boundExternal || boundProject || boundRead
+      ? ({ permissions: [action.identity], cwd: "session", arguments: "invocation" } satisfies Contract)
+      : specialised
+  if (!contract) return "contract_unknown"
   const validated =
     input.policy === "exceptional-risk-only-v1"
       ? validateExceptionalRiskAssessment(input.assessment)
@@ -301,24 +638,56 @@ export function isGenericRiskCandidate(input: {
       ? action.cwd_status === "not_applicable"
       : action.cwd_status === "exact" && typeof action.cwd === "string" && action.cwd.length > 0
   const trusted = input.snapshot.trusted
-  return (
-    input.settled &&
-    !("failure" in validated) &&
-    contract.permissions.includes(input.permission) &&
-    action.permission === input.permission &&
-    action.origin === "tool" &&
-    action.complete &&
-    action.omitted_items === 0 &&
-    action.omitted_bytes === 0 &&
-    argumentsComplete(contract, action.arguments) &&
-    cwdComplete &&
-    input.snapshot.context_safe_for_gate &&
-    trusted.complete &&
-    trusted.omitted_items === 0 &&
-    trusted.omitted_bytes === 0 &&
-    trusted.items.length > 0 &&
-    trusted.items.every((item) => item.source === "human" && item.trusted)
+  if (!input.settled) return "review_unsettled"
+  if ("failure" in validated) return "assessment_invalid"
+  if (
+    !contract.permissions.includes(input.permission) ||
+    action.permission !== input.permission ||
+    action.origin !== "tool" ||
+    !action.complete ||
+    action.omitted_items !== 0 ||
+    action.omitted_bytes !== 0 ||
+    !(boundExternal || boundProject || boundRead || argumentsComplete(contract, action.arguments)) ||
+    !cwdComplete
   )
+    return "action_incomplete"
+  if (boundExternal) {
+    if (
+      typeof input.directory !== "string" ||
+      !path.isAbsolute(input.directory) ||
+      typeof action.cwd !== "string" ||
+      contains(input.directory, action.cwd)
+    )
+      return "action_scope_invalid"
+  } else if (boundProject) {
+    if (
+      typeof input.directory !== "string" ||
+      !boundProjectSearchScope(action.identity, action.arguments, input.directory, action.cwd)
+    )
+      return "action_scope_invalid"
+  } else if (boundRead) {
+    if (
+      typeof input.directory !== "string" ||
+      !path.isAbsolute(input.directory) ||
+      typeof action.cwd !== "string" ||
+      contains(input.directory, action.cwd) ||
+      input.allowExternalReadScope !== true
+    )
+      return "action_scope_invalid"
+  }
+  if (!input.snapshot.context_safe_for_gate) return "context_unsafe"
+  if (
+    !trusted.complete ||
+    trusted.omitted_items !== 0 ||
+    trusted.omitted_bytes !== 0 ||
+    trusted.items.length === 0 ||
+    trusted.items.some((item) => item.source !== "human" || !item.trusted)
+  )
+    return "trusted_evidence_incomplete"
+}
+
+export function isGenericRiskCandidate(input: GenericRiskInput) {
+  return genericRiskCandidateRejection(input) === undefined
 }
 
 export function isGenericRiskAllowCandidate(input: Parameters<typeof isGenericRiskCandidate>[0]) {
@@ -350,14 +719,17 @@ export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof i
       : validateObviousRiskAssessment(input.assessment)
   const trusted = input.snapshot.trusted
   const argumentsValid = contract
-    ? argumentsComplete(contract, action.arguments)
+    ? argumentsComplete(contract, action.arguments) && registeredReadonlyInvocation(action) !== undefined
     : action.identity === "bash" && bashExternalArguments(action.arguments, action.cwd)
   return (
     input.settled &&
     !("failure" in validated) &&
     action.permission === "external_directory" &&
     action.origin === "tool" &&
-    (action.identity === "read" || action.identity === "grep" || action.identity === "bash") &&
+    (action.identity === "read" ||
+      action.identity === "grep" ||
+      action.identity === "glob" ||
+      action.identity === "bash") &&
     action.complete &&
     action.omitted_items === 0 &&
     action.omitted_bytes === 0 &&

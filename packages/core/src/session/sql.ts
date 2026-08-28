@@ -115,6 +115,54 @@ export const PartTable = sqliteTable(
   ],
 )
 
+export const PermissionReviewDelegationTable = sqliteTable(
+  "permission_review_delegation",
+  {
+    child_turn_id: text()
+      .$type<MessageID>()
+      .primaryKey()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    child_session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    parent_turn_id: text()
+      .$type<MessageID>()
+      .notNull()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    parent_session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    root_turn_id: text()
+      .$type<MessageID>()
+      .notNull()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    root_session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    task_message_id: text()
+      .$type<MessageID>()
+      .notNull()
+      .references(() => MessageTable.id, { onDelete: "cascade" }),
+    task_part_id: text()
+      .$type<PartID>()
+      .notNull()
+      .references(() => PartTable.id, { onDelete: "cascade" }),
+    task_call_id: text().notNull(),
+    child_agent: text().notNull(),
+    time_created: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [
+    uniqueIndex("permission_review_delegation_task_idx").on(table.task_message_id, table.task_call_id),
+    index("permission_review_delegation_child_session_idx").on(table.child_session_id),
+    index("permission_review_delegation_root_turn_idx").on(table.root_turn_id),
+  ],
+)
+
 export const TodoTable = sqliteTable(
   "todo",
   {

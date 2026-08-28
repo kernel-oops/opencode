@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "d0a8d140-478a-47cf-8094-56e267eea180",
-  "prevIds": ["f14a9b18-8207-487e-a3d3-227e629ba9ad"],
+  "id": "66a0994e-995c-4b6c-bbd4-bbcf36cd0cf4",
+  "prevIds": ["d0a8d140-478a-47cf-8094-56e267eea180"],
   "ddl": [
     {
       "name": "workspace",
@@ -58,6 +58,10 @@
     },
     {
       "name": "permission_review_correction",
+      "entityType": "tables"
+    },
+    {
+      "name": "permission_review_delegation",
       "entityType": "tables"
     },
     {
@@ -920,6 +924,116 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "child_turn_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_session_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_turn_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_turn_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_session_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_message_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_part_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_call_id",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "child_agent",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "permission_review_delegation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "session_id",
       "entityType": "columns",
       "table": "session_context_epoch"
@@ -1614,6 +1728,94 @@
       "table": "permission_review_correction"
     },
     {
+      "columns": ["child_turn_id"],
+      "tableTo": "message",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_child_turn_id_message_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["child_session_id"],
+      "tableTo": "session",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_child_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["parent_turn_id"],
+      "tableTo": "message",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_parent_turn_id_message_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["parent_session_id"],
+      "tableTo": "session",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_parent_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["root_turn_id"],
+      "tableTo": "message",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_root_turn_id_message_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["root_session_id"],
+      "tableTo": "session",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_root_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["task_message_id"],
+      "tableTo": "message",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_task_message_id_message_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": ["task_part_id"],
+      "tableTo": "part",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_permission_review_delegation_task_part_id_part_id_fk",
+      "entityType": "fks",
+      "table": "permission_review_delegation"
+    },
+    {
       "columns": ["session_id"],
       "tableTo": "session",
       "columnsTo": ["id"],
@@ -1785,6 +1987,13 @@
       "entityType": "pks"
     },
     {
+      "columns": ["child_turn_id"],
+      "nameExplicit": false,
+      "name": "permission_review_delegation_pk",
+      "table": "permission_review_delegation",
+      "entityType": "pks"
+    },
+    {
       "columns": ["session_id"],
       "nameExplicit": false,
       "name": "session_context_epoch_pk",
@@ -1948,6 +2157,52 @@
       "name": "permission_review_correction_session_idx",
       "entityType": "indexes",
       "table": "permission_review_correction"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_message_id",
+          "isExpression": false
+        },
+        {
+          "value": "task_call_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "permission_review_delegation_task_idx",
+      "entityType": "indexes",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": [
+        {
+          "value": "child_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "permission_review_delegation_child_session_idx",
+      "entityType": "indexes",
+      "table": "permission_review_delegation"
+    },
+    {
+      "columns": [
+        {
+          "value": "root_turn_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "permission_review_delegation_root_turn_idx",
+      "entityType": "indexes",
+      "table": "permission_review_delegation"
     },
     {
       "columns": [
