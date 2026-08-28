@@ -43,6 +43,7 @@ readonly PATCH_BRANCHES=(
   "routine-project-grep-binary-skip"
   "generic-fallback-rewrite"
   "external-directory-fallback"
+  "external-directory-metadata-fix"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -66,6 +67,7 @@ readonly PATCH_IDS=(
   "bf6203e316407b3aaaacfb83bca3763543ba1470"
   "2fd3b25f17039d9103330ed810676608100fc8c6"
   "5aa74c246326cea2b48856b97994968200b3660a"
+  "3a63934effab579a4984688124337a82c65f6e0c"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -89,6 +91,7 @@ readonly PATCH_TIPS=(
   "d44fe5b2bd6661b56c6f400346486661bbc4958c"
   "f57c859bb8b52438fadf3a563964369e395e59f1"
   "976dcae20ad1b39675d2e6d49c7296095d1098f3"
+  "ec64ac4416b0a16fa302d781d0fb869b3ae6882c"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
@@ -103,6 +106,7 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/permission/audit-correlation.test.ts"
   "packages/opencode/test/permission/exceptional-risk-policy.test.ts"
   "packages/opencode/test/permission/next.test.ts"
+  "packages/opencode/test/tool/external-directory.test.ts"
   "packages/opencode/test/permission/obvious-risk-policy.test.ts"
   "packages/opencode/test/permission/replay-oauth.test.ts"
   "packages/opencode/test/permission/reviewer-input.test.ts"
