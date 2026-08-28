@@ -298,7 +298,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     }) {
       yield* requireSession(ctx.params.sessionID)
       const message = yield* promptSvc
-        .prompt({
+        .promptAdmission({
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
@@ -313,7 +313,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof PromptPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+      yield* promptSvc.promptAdmission({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
             yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })

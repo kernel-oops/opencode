@@ -14,9 +14,11 @@ import {
   type PermissionReviewContext,
   type PermissionReviewInput,
 } from "@opencode-ai/plugin"
+import { BashPermissionEvaluator } from "./bash-evaluator"
 import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
 import { InstanceRef } from "@/effect/instance-ref"
+import { buildPermissionReviewSnapshot, type EvidenceInput } from "./reviewer-input"
 
 export const Event = PermissionV1.Event
 
@@ -24,6 +26,15 @@ export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
+  readonly captureTurn: (input: {
+    sessionID: string
+    rootSessionID: string
+    trusted: readonly EvidenceInput[]
+    untrusted: readonly EvidenceInput[]
+    complete?: boolean
+    contextSafeForGate?: boolean
+  }) => Effect.Effect<void>
+  readonly captureUntrusted: (input: { sessionID: string; evidence: readonly EvidenceInput[] }) => Effect.Effect<void>
 }
 
 interface PendingEntry {
@@ -37,7 +48,7 @@ interface ReviewLease {
 }
 
 interface ActiveReviewerRun {
-  readonly run: PermissionReviewer.Run
+  readonly run: { abort: () => void }
 }
 
 interface State {
@@ -48,7 +59,22 @@ interface State {
   scope: Scope.Scope
   disposed: boolean
   project: PermissionReviewContext["project"]
+  turns: Map<
+    string,
+    {
+      trusted: EvidenceInput[]
+      untrusted: EvidenceInput[]
+      trustedComplete: boolean
+      untrustedComplete: boolean
+      contextSafeForGate: boolean
+    }
+  >
 }
+
+const MAX_EVIDENCE_ITEMS = 64
+const MAX_EVIDENCE_BYTES = 8 * 1024
+const MAX_TRUSTED_EVIDENCE_BYTES = 40 * 1024
+const MAX_EVIDENCE_SESSIONS = 64
 
 export const REVIEW_TIMEOUT = "30 seconds"
 export const REVIEW_CAPACITY = 4
@@ -92,6 +118,7 @@ const layer = Layer.effect(
     const sessions = yield* Session.Service
     const config = yield* Config.Service
     const reviewer = yield* PermissionReviewer.Service
+    const bashEvaluator = yield* BashPermissionEvaluator.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         const scope = yield* Scope.Scope
@@ -107,6 +134,7 @@ const layer = Layer.effect(
             directory: ctx.directory,
             worktree: ctx.worktree,
           },
+          turns: new Map(),
         }
 
         yield* Effect.addFinalizer(() =>
@@ -119,12 +147,80 @@ const layer = Layer.effect(
             state.pending.clear()
             state.reviews.clear()
             state.reviewerRuns.clear()
+            state.turns.clear()
           }),
         )
 
         return state
       }),
     )
+
+    const boundedEvidence = (items: readonly EvidenceInput[]) => {
+      let complete = true
+      const bounded = items.slice(-MAX_EVIDENCE_ITEMS).map((item) => {
+        if (Buffer.byteLength(item.text, "utf8") <= MAX_EVIDENCE_BYTES) return { ...item }
+        complete = false
+        let text = item.text
+        while (Buffer.byteLength(text, "utf8") > MAX_EVIDENCE_BYTES) {
+          const size = Buffer.byteLength(text, "utf8")
+          text = text.slice(0, Math.max(0, Math.floor((text.length * MAX_EVIDENCE_BYTES) / size)))
+        }
+        return { ...item, text }
+      })
+      if (bounded.length !== items.length) complete = false
+      return { items: bounded, complete }
+    }
+
+    const boundedTrustedEvidence = (items: readonly EvidenceInput[]) => {
+      const withinBudget = Buffer.byteLength(JSON.stringify(items), "utf8") <= MAX_TRUSTED_EVIDENCE_BYTES
+      const selected = withinBudget ? items : items.length <= 1 ? items : [items[0], items.at(-1)!]
+      const itemBudget = withinBudget
+        ? MAX_TRUSTED_EVIDENCE_BYTES
+        : Math.floor(MAX_TRUSTED_EVIDENCE_BYTES / Math.max(1, selected.length))
+      let complete = withinBudget
+      const bounded = selected.map((item) => {
+        if (Buffer.byteLength(item.text, "utf8") <= itemBudget) return { ...item }
+        complete = false
+        let text = item.text
+        while (Buffer.byteLength(text, "utf8") > itemBudget) {
+          const size = Buffer.byteLength(text, "utf8")
+          text = text.slice(0, Math.max(0, Math.floor((text.length * itemBudget) / size)))
+        }
+        return { ...item, text }
+      })
+      return { items: bounded, complete }
+    }
+
+    const remember = <K, V>(map: Map<K, V>, key: K, value: V) => {
+      map.delete(key)
+      map.set(key, value)
+      while (map.size > MAX_EVIDENCE_SESSIONS) map.delete(map.keys().next().value!)
+    }
+
+    const captureTurn: Interface["captureTurn"] = Effect.fn("Permission.captureTurn")(function* (input) {
+      const current = yield* InstanceState.get(state)
+      const trusted = boundedTrustedEvidence(input.trusted)
+      const untrusted = boundedEvidence(input.untrusted)
+      remember(current.turns, input.sessionID, {
+        trusted: trusted.items,
+        untrusted: untrusted.items,
+        trustedComplete: (input.complete ?? true) && trusted.complete,
+        untrustedComplete: false,
+        contextSafeForGate: input.contextSafeForGate === true,
+      })
+    })
+
+    const captureUntrusted: Interface["captureUntrusted"] = Effect.fn("Permission.captureUntrusted")(function* (input) {
+      const current = yield* InstanceState.get(state)
+      const turn = current.turns.get(input.sessionID)
+      if (!turn) return
+      const untrusted = boundedEvidence([...turn.untrusted, ...input.evidence])
+      remember(current.turns, input.sessionID, {
+        ...turn,
+        untrusted: untrusted.items,
+        untrustedComplete: turn.untrustedComplete && untrusted.complete,
+      })
+    })
 
     const lineage = Effect.fn("Permission.lineage")(function* (sessionID: PermissionV1.Request["sessionID"]) {
       const fallback = {
@@ -169,6 +265,19 @@ const layer = Layer.effect(
         policyVersion: input.review.policyVersion,
         fallbackToHuman: input.fallbackToHuman,
         reviewSettled: input.reviewSettled,
+      })
+    })
+
+    const auditEvaluator = Effect.fn("Permission.auditEvaluator")(function* (input: {
+      result: BashPermissionEvaluator.Decision | BashPermissionEvaluator.Failure | "interrupted"
+      latencyMs: number
+      authoritative: boolean
+    }) {
+      yield* Effect.logInfo("bash permission evaluator", {
+        source: "bash_evaluator",
+        result: input.result,
+        latencyMs: input.latencyMs,
+        authoritative: input.authoritative,
       })
     })
 
@@ -222,6 +331,29 @@ const layer = Layer.effect(
       const sessionContext = source?.session
         ? { ...source.session, lineage: [...source.session.lineage] }
         : yield* lineage(info.sessionID)
+      const turn = current.turns.get(info.sessionID) ?? {
+        trusted: [],
+        untrusted: [],
+        trustedComplete: false,
+        untrustedComplete: false,
+        contextSafeForGate: false,
+      }
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: info.permission,
+        origin: source?.origin ?? "unknown",
+        patterns: info.patterns,
+        metadata: info.metadata,
+        action: source?.action ?? {
+          identity: info.permission,
+          arguments: source?.arguments,
+          complete: false,
+        },
+        trusted: turn.trusted,
+        untrusted: turn.untrusted,
+        trustedComplete: turn.trustedComplete,
+        untrustedComplete: turn.untrustedComplete,
+        contextSafeForGate: turn.contextSafeForGate,
+      })
       const review: PermissionReviewContext = {
         policyVersion: PERMISSION_REVIEW_POLICY_VERSION,
         reviewID: `review_${id}`,
@@ -231,6 +363,7 @@ const layer = Layer.effect(
         agent: source?.agent,
         model: source?.model,
         arguments: source?.arguments === undefined ? undefined : safeReviewValue(source.arguments),
+        snapshot,
         rules,
       }
 
@@ -242,8 +375,11 @@ const layer = Layer.effect(
         review,
       }
       const prepared = yield* plugin.preparePermissionAsk(hookInput)
-      const reviewerConfig = (yield* config.get()).permission_reviewer
+      const permissionConfig = yield* config.get()
+      const reviewerConfig = permissionConfig.permission_reviewer
+      const evaluatorConfig = permissionConfig.bash_permission_evaluator
       const started = yield* Clock.currentTimeMillis
+      const deadline = started + 30_000
       let result: Exclude<ReviewResult, "interrupted">
       const reserve = () => {
         if (current.reviews.size >= REVIEW_CAPACITY) return
@@ -269,66 +405,146 @@ const layer = Layer.effect(
         )
       }
       const pluginWait = pluginRun
-        ? Effect.promise(() => pluginRun.result).pipe(
-            Effect.catchCause((cause) => {
-              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-              return Effect.succeed("error" as const)
-            }),
-            Effect.timeoutOrElse({
-              duration: REVIEW_TIMEOUT,
-              orElse: () => Effect.succeed("timeout" as const),
-            }),
-            Effect.ensuring(Effect.sync(() => finish(pluginLease!))),
-          )
+        ? Effect.gen(function* () {
+            const timeoutMs = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
+            if (timeoutMs === 0) return "timeout" as const
+            return yield* Effect.promise(() => pluginRun.result).pipe(
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                return Effect.succeed("error" as const)
+              }),
+              Effect.timeoutOrElse({
+                duration: timeoutMs,
+                orElse: () => Effect.succeed("timeout" as const),
+              }),
+            )
+          }).pipe(Effect.ensuring(Effect.sync(() => finish(pluginLease!))))
         : Effect.succeed(prepared ? ("capacity" as const) : undefined)
 
-      const prepareReviewer = Effect.uninterruptible(
-        reviewer
-          .prepare({
-            config: reviewerConfig!,
-            permission: info.permission,
-            origin: review.origin,
-            arguments: source?.arguments,
-          })
-          .pipe(
-            Effect.tap((run) => {
-              if (!run.admitted) return Effect.void
-              const active: ActiveReviewerRun = { run }
-              current.reviewerRuns.add(active)
-              return run.settled.pipe(
-                Effect.flatMap(() =>
-                  current.disposed
-                    ? Effect.void
-                    : Effect.logInfo("permission review settled", {
-                        requestID: info.id,
-                        reviewID: review.reviewID,
-                        source: "builtin",
-                        reviewSettled: true,
-                      }),
-                ),
-                Effect.ensuring(Effect.sync(() => current.reviewerRuns.delete(active))),
-                Effect.forkIn(current.scope),
-                Effect.asVoid,
-              )
-            }),
+      const prepareReviewer = (timeoutMs: number) =>
+        Effect.uninterruptible(
+          reviewer
+            .prepare({
+              config: reviewerConfig!,
+              permission: info.permission,
+              origin: review.origin,
+              snapshot,
+              timeoutMs,
+            })
+            .pipe(
+              Effect.tap((run) => {
+                if (!run.admitted) return Effect.void
+                const active: ActiveReviewerRun = { run }
+                current.reviewerRuns.add(active)
+                return run.settled.pipe(
+                  Effect.flatMap(() =>
+                    current.disposed
+                      ? Effect.void
+                      : Effect.logInfo("permission review settled", {
+                          requestID: info.id,
+                          reviewID: review.reviewID,
+                          source: "builtin",
+                          reviewSettled: true,
+                        }),
+                  ),
+                  Effect.ensuring(Effect.sync(() => current.reviewerRuns.delete(active))),
+                  Effect.forkIn(current.scope),
+                  Effect.asVoid,
+                )
+              }),
+            ),
+        ).pipe(Effect.provideService(InstanceRef, instance))
+      const waitReviewer = (timeoutMs: number) =>
+        prepareReviewer(timeoutMs).pipe(
+          Effect.flatMap((run) =>
+            run.result.pipe(
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                return Effect.succeed({ failure: "provider" as const })
+              }),
+              Effect.map((reviewResult) => ({ run, reviewResult })),
+            ),
           ),
-      ).pipe(Effect.provideService(InstanceRef, instance))
-      const waitReviewer = prepareReviewer.pipe(
-        Effect.flatMap((run) =>
-          run.result.pipe(
-            Effect.catchCause((cause) => {
-              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-              return Effect.succeed({ failure: "provider" as const })
-            }),
-            Effect.map((reviewResult) => ({ run, reviewResult })),
-          ),
-        ),
-      )
+        )
 
-      if (reviewerConfig?.mode === "audit-only") {
-        const authoritative = yield* Deferred.make<void>()
-        yield* Deferred.await(authoritative).pipe(
-          Effect.andThen(waitReviewer),
+      const waitEvaluator =
+        evaluatorConfig && evaluatorConfig.mode !== "disabled"
+          ? Effect.uninterruptible(bashEvaluator.prepare({ config: evaluatorConfig, action: source?.action })).pipe(
+              Effect.tap((run) => {
+                if (!run.admitted) return Effect.void
+                const active: ActiveReviewerRun = { run }
+                current.reviewerRuns.add(active)
+                return run.settled.pipe(
+                  Effect.ensuring(Effect.sync(() => current.reviewerRuns.delete(active))),
+                  Effect.forkIn(current.scope),
+                  Effect.asVoid,
+                )
+              }),
+              Effect.flatMap((run) => run.result.pipe(Effect.map((reviewResult) => ({ run, reviewResult })))),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                return Effect.succeed({ run: undefined, reviewResult: { failure: "process" as const } })
+              }),
+            )
+          : undefined
+
+      if (evaluatorConfig?.mode === "audit-only" && waitEvaluator) {
+        yield* waitEvaluator.pipe(
+          Effect.flatMap(({ reviewResult }) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.flatMap((now) =>
+                auditEvaluator({
+                  result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
+                  latencyMs: now - started,
+                  authoritative: false,
+                }),
+              ),
+            ),
+          ),
+          Effect.catchCause((cause) =>
+            current.disposed
+              ? Effect.void
+              : Clock.currentTimeMillis.pipe(
+                  Effect.flatMap((now) =>
+                    auditEvaluator({
+                      result: Cause.hasInterrupts(cause) ? "interrupted" : "process",
+                      latencyMs: now - started,
+                      authoritative: false,
+                    }),
+                  ),
+                ),
+          ),
+          Effect.forkIn(current.scope),
+        )
+      }
+
+      const evaluator =
+        evaluatorConfig?.mode === "enforce" && waitEvaluator
+          ? yield* waitEvaluator.pipe(
+              Effect.tap(({ reviewResult }) =>
+                Clock.currentTimeMillis.pipe(
+                  Effect.flatMap((now) =>
+                    auditEvaluator({
+                      result: "decision" in reviewResult ? reviewResult.decision : reviewResult.failure,
+                      latencyMs: now - started,
+                      authoritative: true,
+                    }),
+                  ),
+                ),
+              ),
+            )
+          : undefined
+      const evaluatorResult = evaluator?.reviewResult
+      const evaluatorFallback =
+        evaluatorResult !== undefined && ("failure" in evaluatorResult || evaluatorResult.decision === "noop")
+      const evaluatorDisposition =
+        evaluatorResult && "decision" in evaluatorResult && evaluatorResult.decision === "allow" ? "allow" : "ask"
+      const remaining = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
+
+      const evaluatorEnforcing = evaluatorConfig?.mode === "enforce"
+      const needsReviewer = !evaluatorEnforcing || evaluatorFallback
+      if (reviewerConfig?.mode === "audit-only" && needsReviewer && remaining > 0) {
+        yield* waitReviewer(remaining).pipe(
           Effect.flatMap(({ run, reviewResult }) =>
             Effect.gen(function* () {
               if (current.disposed) return
@@ -383,8 +599,6 @@ const layer = Layer.effect(
               : Effect.void,
           ),
         )
-        // The detached built-in work cannot start until the authoritative disposition is known.
-        yield* Deferred.succeed(authoritative, undefined)
         const latencyMs = (yield* Clock.currentTimeMillis) - started
         if (pluginResult === "error") {
           yield* Effect.logError("permission ask plugin failed or returned invalid status", {
@@ -406,10 +620,12 @@ const layer = Layer.effect(
             pluginResult === "capacity",
           reviewSettled: pluginLease?.settled ?? true,
         })
-        result = pluginResult ?? "ask"
+        result = evaluatorFallback ? (pluginResult === "deny" ? "deny" : "ask") : (pluginResult ?? "ask")
       } else {
         const reviewerWait: Effect.Effect<{ run: PermissionReviewer.Run; reviewResult: BuiltinResult } | undefined> =
-          reviewerConfig ? waitReviewer : Effect.succeed(undefined)
+          reviewerConfig?.mode === "enforce" && needsReviewer && remaining > 0
+            ? waitReviewer(remaining)
+            : Effect.succeed(undefined)
         const completed = yield* Effect.all([pluginWait, reviewerWait] as const, { concurrency: "unbounded" }).pipe(
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
@@ -463,6 +679,8 @@ const layer = Layer.effect(
         const enforcing = [
           ...(pluginResult ? [pluginResult] : []),
           ...(builtinResult ? ["decision" in builtinResult ? builtinResult.decision : "ask"] : []),
+          ...(evaluatorEnforcing && !evaluatorFallback ? [evaluatorDisposition] : []),
+          ...(evaluatorFallback && (!reviewerConfig || remaining === 0) ? (["ask"] as const) : []),
         ]
         if (enforcing.includes("deny")) result = "deny"
         else if (enforcing.length > 0 && enforcing.every((item) => item === "allow")) result = "allow"
@@ -549,7 +767,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.info)
     })
 
-    return Service.of({ ask, reply, list })
+    return Service.of({ ask, reply, list, captureTurn, captureUntrusted })
   }),
 )
 
@@ -599,7 +817,14 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, Plugin.node, Session.node, Config.node, PermissionReviewer.node],
+  deps: [
+    EventV2Bridge.node,
+    Plugin.node,
+    Session.node,
+    Config.node,
+    PermissionReviewer.node,
+    BashPermissionEvaluator.node,
+  ],
 })
 
 export * as Permission from "."

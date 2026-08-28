@@ -384,6 +384,7 @@ const layer = Layer.effect(
                 model: { providerID: ctx.model.providerID, modelID: ctx.model.id },
                 session: yield* Session.resolveLineage(session, currentSession),
                 arguments: input,
+                action: { identity: value.name, arguments: input, complete: false },
               },
             })
             return

@@ -62,7 +62,8 @@ describe("instance HttpApi", () => {
 
       expect(response.status).toBe(200)
       expect(response.headers["content-type"]).toContain("application/json")
-      expect(yield* response.json).toMatchObject({
+      const document = yield* response.json
+      expect(document).toMatchObject({
         openapi: expect.any(String),
         info: expect.any(Object),
         paths: expect.objectContaining({
@@ -70,6 +71,25 @@ describe("instance HttpApi", () => {
           "/session": expect.any(Object),
         }),
       })
+      const schema = (
+        document as {
+          components: {
+            schemas: {
+              BashPermissionEvaluatorConfig: {
+                anyOf: ReadonlyArray<{
+                  additionalProperties?: unknown
+                  properties?: { expected?: { additionalProperties?: unknown } }
+                }>
+              }
+            }
+          }
+        }
+      ).components.schemas.BashPermissionEvaluatorConfig
+      expect(schema.anyOf).toHaveLength(3)
+      for (const branch of schema.anyOf) {
+        expect(branch.additionalProperties).toBe(false)
+        if (branch.properties?.expected) expect(branch.properties.expected.additionalProperties).toBe(false)
+      }
     }),
   )
 

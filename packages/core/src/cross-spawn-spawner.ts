@@ -22,10 +22,25 @@ import {
   ProcessId,
 } from "effect/unstable/process/ChildProcessSpawner"
 import * as NodeChildProcess from "node:child_process"
+import { readFileSync, readdirSync } from "node:fs"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
+
+export interface InheritedReadOnlyFd {
+  readonly child: number
+  readonly parent: number
+}
+
+const inheritedReadOnlyFds = new WeakMap<ChildProcess.StandardCommand, ReadonlyArray<InheritedReadOnlyFd>>()
+
+export function registerInheritedReadOnlyFds(
+  command: ChildProcess.StandardCommand,
+  descriptors: ReadonlyArray<InheritedReadOnlyFd>,
+) {
+  inheritedReadOnlyFds.set(command, descriptors)
+}
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
@@ -96,6 +111,73 @@ const toPlatformError = (
 
 type ExitSignal = Deferred.Deferred<readonly [code: number | null, signal: NodeJS.Signals | null]>
 
+interface ProcessStat {
+  readonly group: number
+  readonly session: number
+  readonly started: string
+}
+
+interface ProcessGroupIdentity {
+  readonly leader: number
+  readonly group: number
+  readonly session: number
+  readonly started: string
+}
+
+function processStat(pid: number): ProcessStat | undefined {
+  try {
+    const value = readFileSync(`/proc/${pid}/stat`, "utf8")
+    const end = value.lastIndexOf(")")
+    if (end < 0) return
+    const fields = value
+      .slice(end + 2)
+      .trim()
+      .split(/ +/u)
+    const group = Number(fields[2])
+    const session = Number(fields[3])
+    const started = fields[19]
+    if (!Number.isSafeInteger(group) || !Number.isSafeInteger(session) || !started) return
+    return { group, session, started }
+  } catch {
+    return
+  }
+}
+
+function processGroupIdentity(proc: NodeChildProcess.ChildProcess): ProcessGroupIdentity | undefined {
+  if (globalThis.process.platform !== "linux" || !proc.pid) return
+  const stat = processStat(proc.pid)
+  if (!stat || stat.group !== proc.pid || stat.session !== proc.pid) return
+  return { leader: proc.pid, group: stat.group, session: stat.session, started: stat.started }
+}
+
+function ownsProcessGroup(identity: ProcessGroupIdentity) {
+  const leader = processStat(identity.leader)
+  // A live PID with different birth or session data is a reused leader PID.
+  // Do not fall through and infer ownership from other numeric matches.
+  if (leader)
+    return leader.group === identity.group && leader.session === identity.session && leader.started === identity.started
+
+  // A detached session is stable for the lifetime of its remaining members.
+  // Requiring both captured values prevents a reused group ID in another
+  // session from being treated as this child after its leader is reaped. This
+  // is lifecycle cleanup rather than containment: a child can deliberately
+  // escape by joining another group or session.
+  try {
+    let member = false
+    for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue
+      const pid = Number(entry.name)
+      const stat = processStat(pid)
+      if (!stat) continue
+      if (pid === identity.leader && stat.started !== identity.started) return false
+      if (stat.group === identity.group && stat.session === identity.session) member = true
+    }
+    return member
+  } catch {
+    return false
+  }
+}
+
 export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
@@ -150,18 +232,20 @@ export const make = Effect.gen(function* () {
     sout: ChildProcess.StdoutConfig,
     serr: ChildProcess.StderrConfig,
     extra: ReadonlyArray<{ fd: number; config: ChildProcess.AdditionalFdConfig }>,
+    inherited: ReadonlyArray<InheritedReadOnlyFd>,
   ): NodeChildProcess.StdioOptions => {
     const pipe = (x: NodeChildProcess.IOType | undefined) =>
       process.platform === "win32" && x === "pipe" ? "overlapped" : x
-    const arr: Array<NodeChildProcess.IOType | undefined> = [
+    const arr: Array<NodeChildProcess.IOType | number | undefined> = [
       pipe(input(sin.stream)),
       pipe(output(sout.stream)),
       pipe(output(serr.stream)),
     ]
-    if (extra.length === 0) return arr as NodeChildProcess.StdioOptions
-    const max = extra.reduce((acc, x) => Math.max(acc, x.fd), 2)
+    if (extra.length === 0 && inherited.length === 0) return arr as NodeChildProcess.StdioOptions
+    const max = [...extra.map((x) => x.fd), ...inherited.map((x) => x.child)].reduce((acc, fd) => Math.max(acc, fd), 2)
     for (let i = 3; i <= max; i++) arr[i] = "ignore"
     for (const x of extra) arr[x.fd] = pipe("pipe")
+    for (const x of inherited) arr[x.child] = x.parent
     return arr as NodeChildProcess.StdioOptions
   }
 
@@ -265,7 +349,10 @@ export const make = Effect.gen(function* () {
   }
 
   const spawn = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
-    Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
+    Effect.callback<
+      readonly [NodeChildProcess.ChildProcess, ExitSignal, ProcessGroupIdentity | undefined],
+      PlatformError.PlatformError
+    >((resume) => {
       const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
       const proc = launch(command.command, command.args, opts)
       let end = false
@@ -282,7 +369,21 @@ export const make = Effect.gen(function* () {
         Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
       })
       proc.on("spawn", () => {
-        resume(Effect.succeed([proc, signal]))
+        try {
+          const group = opts.detached ? processGroupIdentity(proc) : undefined
+          if (globalThis.process.platform === "linux" && opts.detached && command.options.forceKillAfter && !group) {
+            proc.kill("SIGKILL")
+            return resume(
+              Effect.fail(
+                toPlatformError("processGroup", new Error("Failed to identify detached process group"), command),
+              ),
+            )
+          }
+          resume(Effect.succeed([proc, signal, group]))
+        } catch (err) {
+          proc.kill("SIGKILL")
+          resume(Effect.fail(toPlatformError("processGroup", toError(err), command)))
+        }
       })
       return Effect.sync(() => {
         proc.kill("SIGTERM")
@@ -293,6 +394,7 @@ export const make = Effect.gen(function* () {
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
     signal: NodeJS.Signals,
+    group = proc.pid,
   ) => {
     if (globalThis.process.platform === "win32") {
       return Effect.callback<void, PlatformError.PlatformError>((resume) => {
@@ -305,7 +407,7 @@ export const make = Effect.gen(function* () {
 
     return Effect.try({
       try: () => {
-        globalThis.process.kill(-proc.pid!, signal)
+        globalThis.process.kill(-group!, signal)
       },
       catch: (err) => toPlatformError("kill", toError(err), command),
     })
@@ -368,37 +470,68 @@ export const make = Effect.gen(function* () {
           const sout = stdio(command.options, "stdout")
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
+          const inherited = inheritedReadOnlyFds.get(command) ?? []
           const dir = yield* cwd(command.options)
 
-          const [proc, signal] = yield* Effect.acquireRelease(
+          const [proc, signal, group] = yield* Effect.acquireRelease(
             spawn(command, {
               cwd: dir,
               env: env(command.options),
-              stdio: stdios(sin, sout, serr, extra),
+              stdio: stdios(sin, sout, serr, extra, inherited),
               detached: command.options.detached ?? process.platform !== "win32",
               shell: command.options.shell,
               windowsHide: process.platform === "win32",
             }),
-            Effect.fnUntraced(function* ([proc, signal]) {
+            Effect.fnUntraced(function* ([proc, signal, group]) {
               const done = yield* Deferred.isDone(signal)
-              const kill = timeout(proc, command, command.options)
-              if (done) {
-                const [code] = yield* Deferred.await(signal)
-                if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
-                return yield* Effect.void
+              if (process.platform === "win32") {
+                if (done) return yield* Effect.void
+                return yield* Effect.ignore(timeout(proc, command, command.options)(killGroup))
               }
               const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+                Effect.suspend(() => {
+                  if (process.platform !== "linux") return Effect.as(killGroup(command, proc, s), true)
+                  if (group) {
+                    if (!ownsProcessGroup(group)) return Effect.succeed(false)
+                    return Effect.as(killGroup(command, proc, s, group.group), true)
+                  }
+                  if (done || proc.exitCode !== null) return Effect.succeed(false)
+                  return Effect.as(killOne(command, proc, s), true)
+                })
               const sig = command.options.killSignal ?? "SIGTERM"
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              const escalated = command.options.forceKillAfter
-                ? Effect.timeoutOrElse(attempt, {
-                    duration: command.options.forceKillAfter,
-                    orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-                  })
-                : attempt
-              return yield* Effect.ignore(escalated)
+              const forceKillAfter = command.options.forceKillAfter
+              if (!forceKillAfter) {
+                if (done) return yield* Effect.void
+                return yield* Effect.ignore(send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid))
+              }
+              return yield* Effect.ignore(
+                Effect.gen(function* () {
+                  const sent = yield* send(sig)
+                  if (!sent) return
+                  if (process.platform !== "linux" && process.platform !== "win32") {
+                    // POSIX has no portable equivalent of Linux /proc identity
+                    // checks. Preserve the historical bounded group escalation:
+                    // the leader exiting must not strand descendants.
+                    yield* Effect.sleep(forceKillAfter)
+                    yield* Effect.ignore(send("SIGKILL"))
+                    if (!done) yield* Deferred.await(signal)
+                    return
+                  }
+                  const exited = yield* Effect.raceFirst(
+                    Effect.gen(function* () {
+                      if (group) while (ownsProcessGroup(group)) yield* Effect.sleep("5 millis")
+                      else if (!done) yield* Deferred.await(signal)
+                      return true
+                    }),
+                    Effect.sleep(forceKillAfter).pipe(Effect.as(false)),
+                  )
+                  if (exited) return
+                  yield* Effect.ignore(send("SIGKILL"))
+                  if (!done) yield* Deferred.await(signal)
+                  if (!group) return
+                  while (ownsProcessGroup(group)) yield* Effect.sleep("5 millis")
+                }),
+              )
             }),
           )
 
@@ -427,13 +560,47 @@ export const make = Effect.gen(function* () {
             kill: (opts?: ChildProcess.KillOptions) => {
               const sig = opts?.killSignal ?? "SIGTERM"
               const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+                Effect.suspend(() => {
+                  if (process.platform !== "linux")
+                    return Effect.as(
+                      Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s)),
+                      true,
+                    )
+                  if (group) {
+                    if (!ownsProcessGroup(group)) return Effect.succeed(false)
+                    return Effect.as(killGroup(command, proc, s, group.group), true)
+                  }
+                  if (proc.exitCode !== null) return Effect.succeed(false)
+                  return Effect.as(killOne(command, proc, s), true)
+                })
               const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              if (!opts?.forceKillAfter) return attempt
-              return Effect.timeoutOrElse(attempt, {
-                duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-              })
+              const forceKillAfter = opts?.forceKillAfter
+              if (!forceKillAfter) return attempt
+              return Effect.gen(function* () {
+                const sent = yield* send(sig)
+                if (!sent) return
+                if (process.platform !== "linux" && process.platform !== "win32") {
+                  // See the scope finaliser above: a successful leader exit is
+                  // not evidence that its POSIX process group is empty.
+                  yield* Effect.sleep(forceKillAfter)
+                  yield* Effect.ignore(send("SIGKILL"))
+                  if (!(yield* Deferred.isDone(signal))) yield* Deferred.await(signal)
+                  return
+                }
+                const exited = yield* Effect.raceFirst(
+                  Effect.gen(function* () {
+                    if (group) while (ownsProcessGroup(group)) yield* Effect.sleep("5 millis")
+                    else yield* Deferred.await(signal)
+                    return true
+                  }),
+                  Effect.sleep(forceKillAfter).pipe(Effect.as(false)),
+                )
+                if (exited) return
+                yield* Effect.ignore(send("SIGKILL"))
+                if (!(yield* Deferred.isDone(signal))) yield* Deferred.await(signal)
+                if (!group) return
+                while (ownsProcessGroup(group)) yield* Effect.sleep("5 millis")
+              }).pipe(Effect.asVoid)
             },
             unref: Effect.sync(() => {
               if (ref) {

@@ -64,6 +64,7 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
       .filter((x) => x)
       .join("\n"),
   ]
+  const originalSystem = [...system]
 
   const header = system[0]
   yield* input.plugin.trigger(
@@ -180,6 +181,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
 
   return {
     system,
+    permissionReviewPluginSystem:
+      system.length === originalSystem.length && system.every((item, index) => item === originalSystem[index])
+        ? undefined
+        : system.join("\n"),
     messages,
     tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
     params,

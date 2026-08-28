@@ -33,6 +33,8 @@ import { NamedError } from "@opencode-ai/core/util/error"
 import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
+import { buildPermissionReviewAdmission } from "@/permission/admission"
+import { transcriptEvidence } from "@/permission/reviewer-input"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
@@ -101,6 +103,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly promptAdmission: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
@@ -632,7 +635,11 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (
+      input: PromptInput,
+      directAdmission = false,
+    ) {
+      const admission = directAdmission ? buildPermissionReviewAdmission(input.parts) : undefined
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -653,6 +660,7 @@ const layer = Layer.effect(
           : undefined
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
@@ -667,9 +675,9 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
+        ...(admission && !current.parentID ? { permissionReview: { admission } } : {}),
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (
         current.agent !== info.agent ||
         current.model?.providerID !== info.model.providerID ||
@@ -1049,12 +1057,10 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const submitPrompt = Effect.fnUntraced(function* (input: PromptInput, directAdmission: boolean) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      const message = yield* createUserMessage(input, directAdmission)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1069,6 +1075,10 @@ const layer = Layer.effect(
       if (input.noReply === true) return message
       return yield* loop({ sessionID: input.sessionID })
     })
+    const prompt: Interface["prompt"] = Effect.fn("SessionPrompt.prompt")((input) => submitPrompt(input, false))
+    const promptAdmission: Interface["promptAdmission"] = Effect.fn("SessionPrompt.promptAdmission")((input) =>
+      submitPrompt(input, true),
+    )
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1253,15 +1263,42 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            // Only the persisted direct-admission record can authorise. Same-user API clients and
+            // installed plugins are already privileged arbitrary-code principals, but generated,
+            // resolved, transformed, reminder and child text never becomes trusted evidence.
+            const storedTranscript = transcriptEvidence(msgs, !!session.parentID, true, sessionID)
+            const reviewLineage = yield* Session.resolveLineage(sessions, session)
+            const storedHuman = storedTranscript.items.filter((item) => item.source === "human")
+            const instructions = yield* instruction.system().pipe(Effect.orDie)
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
+            const transcript = transcriptEvidence(msgs, !!session.parentID, false)
+            const configuredContext = [
+              ...SystemPrompt.provider(model).map((text) => ({ source: "developer" as const, text })),
+              ...(agent.prompt ? [{ source: "agent" as const, text: agent.prompt }] : []),
+              ...instructions.map((text) => ({ source: "instruction" as const, text })),
+            ]
+            yield* permission.captureTurn({
+              sessionID,
+              rootSessionID: reviewLineage.rootID ?? sessionID,
+              trusted: storedHuman,
+              untrusted: [
+                ...configuredContext,
+                ...transcript.items.filter((item) => item.source !== "human"),
+                ...env.map((text) => ({ source: "environment" as const, text })),
+                ...(mcpInstructions ? [{ source: "mcp" as const, text: mcpInstructions }] : []),
+                ...(skills ? [{ source: "skill" as const, text: skills }] : []),
+                ...(lastUser.system ? [{ source: "plugin" as const, text: lastUser.system }] : []),
+              ],
+              complete: !session.parentID && reviewLineage.complete && storedTranscript.complete,
+              contextSafeForGate: !session.parentID && reviewLineage.complete && storedTranscript.complete,
+            })
             const system = [
               ...env,
               ...instructions,
@@ -1483,6 +1520,7 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      promptAdmission,
       prompt,
       loop,
       shell,
