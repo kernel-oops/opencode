@@ -2,10 +2,11 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { describe, expect } from "bun:test"
 import path from "path"
-import { Effect } from "effect"
+import { mkdir, rename, symlink, writeFile } from "node:fs/promises"
+import { Effect, Exit } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import type { Tool } from "@/tool/tool"
-import { assertExternalDirectoryEffect } from "../../src/tool/external-directory"
+import { assertExternalDirectoryEffect, verifyExternalDirectoryEffect } from "../../src/tool/external-directory"
 import { Filesystem } from "@/util/filesystem"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
@@ -96,6 +97,100 @@ describe("tool.assertExternalDirectory", () => {
       expect(Object.hasOwn(req!.metadata, "tool")).toBe(false)
     }),
   )
+
+  if (process.platform === "linux") {
+    it.instance("emits exact canonical read-scope metadata only for an existing direct target", () =>
+      Effect.gen(function* () {
+        const outside = yield* tmpdirScoped()
+        const target = path.join(outside, "file.txt")
+        yield* Effect.promise(() => writeFile(target, "content"))
+        const { requests, ctx } = makeCtx()
+
+        yield* assertExternalDirectoryEffect(ctx, target, { kind: "file", tool: "read" })
+
+        const metadata = requests[0]?.metadata
+        expect(metadata).toEqual({
+          filepath: target,
+          parentDir: outside,
+          tool: "read",
+          readScope: {
+            version: 1,
+            canonicalTarget: target,
+            canonicalRoot: outside,
+            kind: "file",
+          },
+        })
+      }),
+    )
+
+    it.instance("canonicalises a symlink target but does not make it capability eligible", () =>
+      Effect.gen(function* () {
+        const outside = yield* tmpdirScoped()
+        const target = path.join(outside, "target.txt")
+        const linked = path.join(outside, "linked.txt")
+        yield* Effect.promise(async () => {
+          await writeFile(target, "content")
+          await symlink(target, linked)
+        })
+        const { requests, ctx } = makeCtx()
+
+        yield* assertExternalDirectoryEffect(ctx, linked, { kind: "file", tool: "read" })
+
+        expect(requests[0]?.metadata).toEqual({ filepath: target, parentDir: outside, tool: "read" })
+      }),
+    )
+
+    it.instance("execution verifier rejects a target swapped after permission", () =>
+      Effect.gen(function* () {
+        const outside = yield* tmpdirScoped()
+        const target = path.join(outside, "flight.txt")
+        const moved = path.join(outside, "original.txt")
+        yield* Effect.promise(() => writeFile(target, "original"))
+        const ctx: Tool.Context = {
+          ...baseCtx,
+          ask: () =>
+            Effect.promise(async () => {
+              await rename(target, moved)
+              await writeFile(target, "replacement")
+            }),
+        }
+
+        const verification = yield* assertExternalDirectoryEffect(ctx, target, { kind: "file", tool: "read" })
+        const exit = yield* verifyExternalDirectoryEffect(verification).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+    )
+
+    it.instance("execution verifier rejects an ancestor replaced by a symlink after permission", () =>
+      Effect.gen(function* () {
+        const outside = yield* tmpdirScoped()
+        const root = path.join(outside, "approved")
+        const moved = path.join(outside, "original")
+        const replacement = path.join(outside, "replacement")
+        const target = path.join(root, "flight.txt")
+        yield* Effect.promise(async () => {
+          await mkdir(root)
+          await mkdir(replacement)
+          await writeFile(target, "original")
+          await writeFile(path.join(replacement, "flight.txt"), "replacement")
+        })
+        const ctx: Tool.Context = {
+          ...baseCtx,
+          ask: () =>
+            Effect.promise(async () => {
+              await rename(root, moved)
+              await symlink(replacement, root)
+            }),
+        }
+
+        const verification = yield* assertExternalDirectoryEffect(ctx, target, { kind: "file", tool: "read" })
+        const exit = yield* verifyExternalDirectoryEffect(verification).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+    )
+  }
 
   it.live("skips prompting when bypass=true", () =>
     Effect.gen(function* () {

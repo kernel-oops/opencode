@@ -34,7 +34,7 @@ import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { buildPermissionReviewAdmission } from "@/permission/admission"
-import { transcriptEvidence } from "@/permission/reviewer-input"
+import { childTranscriptEvidence, transcriptEvidence } from "@/permission/reviewer-input"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
@@ -149,6 +149,10 @@ const layer = Layer.effect(
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        promptTask: (input: PromptInput, receipt: string) =>
+          submitPrompt(input, false, receipt).pipe(Effect.catch(Effect.die)),
+        authoriseTaskDelegation: (input) => permission.authoriseTaskDelegation(input),
+        canResumeTask: (input) => permission.canResumeTask(input),
       } satisfies TaskPromptOps
     })
 
@@ -1057,10 +1061,27 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const submitPrompt = Effect.fnUntraced(function* (input: PromptInput, directAdmission: boolean) {
+    const submitPrompt = Effect.fnUntraced(function* (
+      input: PromptInput,
+      directAdmission: boolean,
+      taskDelegationReceipt?: string,
+    ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input, directAdmission)
+      if (taskDelegationReceipt) {
+        const captured = yield* permission
+          .captureTaskDelegation({
+            receipt: taskDelegationReceipt,
+            childSessionID: input.sessionID,
+            childTurnID: message.info.id,
+          })
+          .pipe(Effect.exit)
+        if (Exit.isFailure(captured)) {
+          yield* sessions.removeMessage({ sessionID: input.sessionID, messageID: message.info.id }).pipe(Effect.ignore)
+          return yield* Effect.die(Cause.squash(captured.cause))
+        }
+      }
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1266,7 +1287,9 @@ const layer = Layer.effect(
             // Only the persisted direct-admission record can authorise. Same-user API clients and
             // installed plugins are already privileged arbitrary-code principals, but generated,
             // resolved, transformed, reminder and child text never becomes trusted evidence.
-            const storedTranscript = transcriptEvidence(msgs, !!session.parentID, true, sessionID)
+            const storedTranscript = session.parentID
+              ? childTranscriptEvidence(msgs, sessionID)
+              : transcriptEvidence(msgs, false, true, sessionID)
             const reviewLineage = yield* Session.resolveLineage(sessions, session)
             const storedHuman = storedTranscript.items.filter((item) => item.source === "human")
             const instructions = yield* instruction.system().pipe(Effect.orDie)
@@ -1297,8 +1320,8 @@ const layer = Layer.effect(
                 ...(skills ? [{ source: "skill" as const, text: skills }] : []),
                 ...(lastUser.system ? [{ source: "plugin" as const, text: lastUser.system }] : []),
               ],
-              complete: !session.parentID && reviewLineage.complete && storedTranscript.complete,
-              contextSafeForGate: !session.parentID && reviewLineage.complete && storedTranscript.complete,
+              complete: reviewLineage.complete && storedTranscript.complete,
+              contextSafeForGate: reviewLineage.complete && storedTranscript.complete,
             })
             const system = [
               ...env,

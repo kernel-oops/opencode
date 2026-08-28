@@ -19,6 +19,18 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  promptTask?(input: SessionPrompt.PromptInput, receipt: string): Effect.Effect<SessionV1.WithParts>
+  authoriseTaskDelegation?(input: {
+    sessionID: string
+    messageID: string
+    callID: string
+    childAgent: string
+  }): Effect.Effect<string | undefined, unknown>
+  canResumeTask?(input: {
+    parentSessionID: string
+    childSessionID: string
+    childAgent: string
+  }): Effect.Effect<boolean, unknown>
 }
 
 const id = "task"
@@ -94,6 +106,9 @@ export const TaskTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const cfg = yield* config.get()
+      const ops = ctx.extra?.promptOps as TaskPromptOps
+      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+      const taskCallID = ctx.callID
       const runInBackground = params.background === true
       if (runInBackground && !flags.experimentalBackgroundSubagents) {
         return yield* Effect.fail(
@@ -116,6 +131,32 @@ export const TaskTool = Tool.define(
         )
       }
 
+      const next = yield* agent.get(params.subagent_type)
+      if (!next) {
+        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
+      }
+
+      const session = params.task_id
+        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      if (
+        session &&
+        (session.parentID !== parent.id ||
+          session.projectID !== parent.projectID ||
+          session.workspaceID !== parent.workspaceID ||
+          session.directory !== parent.directory ||
+          session.path !== parent.path ||
+          session.agent !== next.name ||
+          !(ops.canResumeTask
+            ? yield* ops.canResumeTask({
+                parentSessionID: parent.id,
+                childSessionID: session.id,
+                childAgent: next.name,
+              })
+            : false))
+      )
+        return yield* Effect.fail(new Error("task_id is not an authorised child of this Task context"))
+
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
           permission: id,
@@ -127,15 +168,6 @@ export const TaskTool = Tool.define(
           },
         })
       }
-
-      const next = yield* agent.get(params.subagent_type)
-      if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
-      }
-
-      const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -194,12 +226,21 @@ export const TaskTool = Tool.define(
         metadata,
       })
 
-      const ops = ctx.extra?.promptOps as TaskPromptOps
-      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+      const delegationReceipt =
+        ctx.extra?.bypassAgentCheck || !taskCallID
+          ? undefined
+          : ops.authoriseTaskDelegation
+            ? yield* ops.authoriseTaskDelegation({
+                sessionID: ctx.sessionID,
+                messageID: ctx.messageID,
+                callID: taskCallID,
+                childAgent: next.name,
+              })
+            : undefined
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
-        const result = yield* ops.prompt({
+        const input = {
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,
           model: {
@@ -209,7 +250,11 @@ export const TaskTool = Tool.define(
           variant: next.model ? undefined : variant,
           agent: next.name,
           parts,
-        })
+        }
+        const result =
+          delegationReceipt && ops.promptTask
+            ? yield* ops.promptTask(input, delegationReceipt)
+            : yield* ops.prompt(input)
         if (result.info.role === "assistant" && result.info.error) {
           const message =
             "message" in result.info.error.data && typeof result.info.error.data.message === "string"

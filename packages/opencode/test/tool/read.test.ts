@@ -24,6 +24,7 @@ import {
   supportsInstructionWatchFilesystem,
 } from "../../src/tool/read-bound-file"
 import { generation } from "../../src/tool/bound-generation"
+import { bindExternalTextFile, closeBoundExternalTextFile } from "../../src/tool/external-read-bound-file"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
 import { Filesystem } from "@/util/filesystem"
@@ -156,6 +157,11 @@ async function inotifyWatchCount() {
     count += info.match(/^inotify wd:/gmu)?.length ?? 0
   }
   return count
+}
+async function openFileLinks() {
+  return Promise.all(
+    (await fs.readdir("/proc/self/fd")).map((fd) => fs.readlink(`/proc/self/fd/${fd}`).catch(() => "")),
+  )
 }
 const asks = () => {
   const items: ReviewRequest[] = []
@@ -368,7 +374,10 @@ describe("tool.read pinned project text review", () => {
 
       yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
 
-      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+      expect(captured.items.find((item) => item.permission === "read")?.action).toMatchObject({
+        identity: "read",
+        complete: false,
+      })
     }),
   )
 
@@ -492,7 +501,7 @@ describe("tool.read pinned project text review", () => {
       yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
 
       const read = captured.items.find((item) => item.permission === "read")
-      expect(read?.action).toBeUndefined()
+      expect(read?.action).toMatchObject({ identity: "read", complete: false })
       expect(
         resolveReviewAction({
           builtin: true,
@@ -518,7 +527,10 @@ describe("tool.read pinned project text review", () => {
 
       yield* exec(dir, { filePath: path.join(linked, "Secret.php"), offset: 1, limit: 20 }, captured.next)
 
-      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+      expect(captured.items.find((item) => item.permission === "read")?.action).toMatchObject({
+        identity: "read",
+        complete: false,
+      })
     }),
   )
 
@@ -535,7 +547,10 @@ describe("tool.read pinned project text review", () => {
 
       yield* exec(dir, { filePath: linked, offset: 1, limit: 20 }, captured.next)
 
-      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+      expect(captured.items.find((item) => item.permission === "read")?.action).toMatchObject({
+        identity: "read",
+        complete: false,
+      })
     }),
   )
 
@@ -549,7 +564,10 @@ describe("tool.read pinned project text review", () => {
 
       yield* exec(dir, { filePath: filepath, offset: 1, limit: 20 }, captured.next)
 
-      expect(captured.items.find((item) => item.permission === "read")?.action).toBeUndefined()
+      expect(captured.items.find((item) => item.permission === "read")?.action).toMatchObject({
+        identity: "read",
+        complete: false,
+      })
     }),
   )
 
@@ -732,6 +750,122 @@ describe("tool.read pinned project text review", () => {
 })
 
 describe("tool.read external_directory permission", () => {
+  it.live("does not bind symlinks, hard links, directories or special files for external scope reuse", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const regular = path.join(outer, "regular.txt")
+      const linked = path.join(outer, "linked.txt")
+      const hard = path.join(outer, "hard.txt")
+      const fifo = path.join(outer, "special.fifo")
+      yield* put(regular, "content\n")
+      yield* Effect.promise(() => fs.symlink(regular, linked))
+      yield* Effect.promise(() => fs.link(regular, hard))
+      const status = yield* Effect.promise(async () => {
+        const child = Bun.spawn(["mkfifo", fifo], { stdout: "ignore", stderr: "ignore" })
+        return child.exited
+      })
+      expect(status).toBe(0)
+
+      for (const candidate of [linked, regular, hard, outer, fifo]) {
+        expect(yield* Effect.promise(() => bindExternalTextFile(candidate))).toBeUndefined()
+      }
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.startsWith(outer))).toBe(false)
+    }),
+  )
+
+  it.live("binds ordinary external text but declines media, binary and oversized files", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const text = path.join(outer, "ordinary.txt")
+      const png = path.join(outer, "image.png")
+      const jpeg = path.join(outer, "image.bin")
+      const pdf = path.join(outer, "document.pdf")
+      const binary = path.join(outer, "payload.data")
+      const oversized = path.join(outer, "oversized.txt")
+      yield* put(text, "ordinary external text\n")
+      yield* put(png, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]))
+      yield* put(jpeg, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]))
+      yield* put(pdf, Buffer.from("%PDF-1.4\n% external document\n"))
+      yield* put(binary, Buffer.from([0x00, 0x01, 0x02, 0x03]))
+      yield* put(oversized, Buffer.alloc(1024 * 1024 + 1, 0x61))
+
+      const binding = yield* Effect.promise(() => bindExternalTextFile(text))
+      expect(binding).toBeDefined()
+      if (binding) yield* Effect.promise(() => closeBoundExternalTextFile(binding))
+      for (const candidate of [png, jpeg, pdf, binary, oversized]) {
+        expect(yield* Effect.promise(() => bindExternalTextFile(candidate))).toBeUndefined()
+      }
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.startsWith(outer))).toBe(false)
+    }),
+  )
+
+  it.live("routes external PNG, JPEG, PDF and large media through the legacy attachment path", () =>
+    Effect.gen(function* () {
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const png = path.join(outer, "image.png")
+      const jpeg = path.join(outer, "image.bin")
+      const pdf = path.join(outer, "document.pdf")
+      const large = path.join(outer, "large.png")
+      yield* put(
+        png,
+        Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      )
+      yield* put(jpeg, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]))
+      yield* put(pdf, Buffer.from("%PDF-1.4\n% external document\n"))
+      yield* put(
+        large,
+        Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(1024 * 1024)]),
+      )
+
+      for (const [filePath, mime, output] of [
+        [png, "image/png", "Image read successfully"],
+        [jpeg, "image/jpeg", "Image read successfully"],
+        [pdf, "application/pdf", "PDF read successfully"],
+        [large, "image/png", "Image read successfully"],
+      ] as const) {
+        const captured = asks()
+        const result = yield* exec(dir, { filePath }, captured.next)
+        const external = captured.items.find((item) => item.permission === "external_directory")
+        const primary = captured.items.find((item) => item.permission === "read")
+        expect(external?.metadata).not.toHaveProperty("readBinding")
+        expect(primary?.metadata).toEqual({})
+        expect(result.output).toBe(output)
+        expect(result.attachments?.[0].mime).toBe(mime)
+      }
+    }),
+  )
+
+  it.live("keeps non-bindable external reads on the legacy permission path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const original = path.join(outer, "original.txt")
+      const hardlink = path.join(outer, "hardlink.txt")
+      const oversized = path.join(outer, "oversized.txt")
+      const directory = path.join(outer, "directory")
+      yield* put(original, "hard-linked content\n")
+      yield* Effect.promise(() => fs.link(original, hardlink))
+      yield* put(oversized, Buffer.alloc(1024 * 1024 + 1, 0x61))
+      yield* put(path.join(directory, "entry.txt"), "entry\n")
+
+      for (const filePath of [hardlink, oversized, directory]) {
+        const captured = asks()
+        yield* exec(dir, { filePath, limit: 1 }, captured.next)
+        expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(
+          "readBinding",
+        )
+        expect(captured.items.find((item) => item.permission === "read")?.metadata).toEqual({})
+      }
+    }),
+  )
+
   it.live("allows reading absolute path inside project directory", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
@@ -764,6 +898,93 @@ describe("tool.read external_directory permission", () => {
       const ext = items.find((item) => item.permission === "external_directory")
       expect(ext).toBeDefined()
       expect(ext!.patterns).toContain(glob(path.join(outer, "*")))
+      if (process.platform === "linux") {
+        expect(ext!.metadata.readBinding).toMatchObject({ contract: "pinned-external-text-v1" })
+      }
+    }),
+  )
+
+  it.live("uses only the held external descriptor and skips instruction discovery", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const target = path.join(outer, "reviewed.txt")
+      yield* put(path.join(outer, "AGENTS.md"), "do not expose these parent instructions")
+      yield* put(target, "first line\nsecond line\n")
+      const captured = asks()
+
+      const result = yield* exec(dir, { filePath: target, offset: 2, limit: 1 }, captured.next)
+
+      expect(result.output).toContain("2: second line")
+      expect(result.output).not.toContain("parent instructions")
+      expect(result.metadata.loaded).toEqual([])
+      expect(
+        captured.items.find((item) => item.permission === "external_directory")?.metadata.readBinding,
+      ).toMatchObject({
+        contract: "pinned-external-text-v1",
+      })
+    }),
+  )
+
+  it.live("closes held external descriptors on denial and cancellation", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const target = path.join(outer, "held.txt")
+      yield* put(target, "held content\n")
+
+      let deniedAsks = 0
+      const denied = yield* fail(
+        dir,
+        { filePath: target },
+        {
+          ...ctx,
+          ask: () => (++deniedAsks === 1 ? Effect.void : Effect.die(new Error("denied"))),
+        },
+      )
+      expect(denied.message).toBe("denied")
+      expect(deniedAsks).toBe(2)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("held.txt"))).toBe(false)
+
+      const entered = yield* Deferred.make<void>()
+      let cancelledAsks = 0
+      const next = {
+        ...ctx,
+        ask: () =>
+          ++cancelledAsks === 1 ? Effect.void : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      }
+      const fiber = yield* exec(dir, { filePath: target }, next).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+      expect(cancelledAsks).toBe(2)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("held.txt"))).toBe(false)
+    }),
+  )
+
+  it.live("aborts when an external file changes after the primary read permission", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const target = path.join(outer, "reviewed.txt")
+      yield* put(target, "reviewed content")
+
+      const next: Tool.Context = {
+        ...ctx,
+        ask: (req) =>
+          req.permission === "read"
+            ? Effect.promise(async () => {
+                await fs.rename(target, `${target}.reviewed`)
+                await fs.writeFile(target, "replacement content")
+              })
+            : Effect.void,
+      }
+
+      const error = yield* fail(dir, { filePath: target }, next)
+      expect(error.message).toBe("External path changed after permission review")
+      expect(yield* load(target)).toBe("replacement content")
     }),
   )
 

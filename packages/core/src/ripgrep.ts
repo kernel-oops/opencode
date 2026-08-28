@@ -5,6 +5,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { Entry, Match } from "@opencode-ai/schema/filesystem"
 import { makeGlobalNode } from "./effect/app-node"
 import { AppProcess, collectStream, waitForAbort } from "./process"
+import { registerInheritedReadOnlyFds, type InheritedReadOnlyFd } from "./cross-spawn-spawner"
 import { NonNegativeInt, PositiveInt, RelativePath } from "./schema"
 import { RipgrepBinary } from "./ripgrep/binary"
 
@@ -79,6 +80,7 @@ export interface GrepInput {
   readonly include?: string
   readonly limit: number
   readonly signal?: AbortSignal
+  readonly inheritedReadOnlyFds?: ReadonlyArray<InheritedReadOnlyFd>
 }
 
 export interface Interface {
@@ -109,12 +111,17 @@ const layer = Layer.effect(
       readonly nullSeparated?: boolean
       readonly pattern?: string
       readonly onItem?: (item: A) => Effect.Effect<void>
+      readonly inheritedReadOnlyFds?: ReadonlyArray<InheritedReadOnlyFd>
     }) => {
       const program = Effect.scoped(
         Effect.gen(function* () {
-          const handle = yield* process.spawn(
-            ChildProcess.make(yield* binary.filepath, input.args, { cwd: input.cwd, extendEnv: true, stdin: "ignore" }),
-          )
+          const command = ChildProcess.make(yield* binary.filepath, input.args, {
+            cwd: input.cwd,
+            extendEnv: true,
+            stdin: "ignore",
+          })
+          if (input.inheritedReadOnlyFds) registerInheritedReadOnlyFds(command, input.inheritedReadOnlyFds)
+          const handle = yield* process.spawn(command)
           const stderrFiber = yield* collectStream(handle.stderr, ERROR_BYTES).pipe(
             Effect.map((output) => output.buffer.toString("utf8")),
             Effect.forkScoped,

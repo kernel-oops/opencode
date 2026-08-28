@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import fs from "fs/promises"
+import { constants } from "node:fs"
 import path from "path"
 import { Effect } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -99,6 +100,36 @@ describe("Ripgrep", () => {
           })
 
           expect(matches[0]?.text).toBe(`needle${"x".repeat(1_993)}...`)
+        }),
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("searches an inherited read-only file descriptor without reopening its pathname", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) =>
+        Effect.gen(function* () {
+          const reviewed = path.join(tmp.path, "reviewed.txt")
+          const sibling = path.join(tmp.path, "sibling-secret.txt")
+          yield* Effect.promise(() => fs.writeFile(reviewed, "needle reviewed-value\n"))
+          yield* Effect.promise(() => fs.writeFile(sibling, "needle sibling-secret\n"))
+          const file = yield* Effect.acquireRelease(
+            Effect.promise(() => fs.open(reviewed, constants.O_RDONLY | constants.O_NOFOLLOW)),
+            (handle) => Effect.promise(() => handle.close()),
+          )
+
+          const matches = yield* (yield* Ripgrep.Service).grep({
+            cwd: tmp.path,
+            pattern: "needle",
+            file: "/proc/self/fd/3",
+            inheritedReadOnlyFds: [{ parent: file.fd, child: 3 }],
+            limit: 10,
+          })
+
+          expect(matches).toHaveLength(1)
+          expect(matches[0]?.text.trimEnd()).toBe("needle reviewed-value")
+          expect(matches[0]?.text).not.toContain("sibling-secret")
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),

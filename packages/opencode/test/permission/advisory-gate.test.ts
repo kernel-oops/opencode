@@ -159,7 +159,7 @@ describe("generic built-in risk allow gate", () => {
       identity: "glob",
       arguments: { pattern: "*.md" },
       cwd: "/tmp/project",
-      complete: true,
+      complete: false,
     })
     expect(
       resolveReviewAction({
@@ -285,6 +285,226 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
+  test("requires exact bound project search contracts and rejects unbound filesystem invocations", () => {
+    const searches = [
+      {
+        identity: "glob",
+        invocation: { pattern: "**/*{flight,Flight,log,Log}*", path: "/tmp/project" },
+        cwd: "/tmp/project",
+      },
+      {
+        identity: "grep",
+        invocation: {
+          pattern: "Import|Export|OCR|conflict|duplicate|remove|delete",
+          path: "/tmp/project/templates",
+          include: "*.{html,twig}",
+        },
+        cwd: "/tmp/project/templates",
+      },
+    ] as const
+
+    for (const item of searches) {
+      const requested = {
+        identity: item.identity,
+        arguments: {
+          contract: "pinned-project-search-v1",
+          mode: "directory",
+          tool: item.identity,
+          executor: "ripgrep-procfd-cwd-v1",
+          bindingId: "00000000000000000000000000000000",
+          invocation: item.invocation,
+          effects: [],
+        },
+        cwd: item.cwd,
+        complete: true,
+      }
+      const action = resolveReviewAction({
+        builtin: true,
+        permission: item.identity,
+        identity: item.identity,
+        arguments: item.invocation,
+        directory: "/tmp/project",
+        requested,
+      })
+      expect(action).toEqual(requested)
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: item.identity,
+        origin: "tool",
+        patterns: ["*"],
+        metadata: {},
+        action,
+        trusted: [{ source: "human", text: "Inspect the Flight log implementation" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: item.identity,
+          assessment,
+          snapshot,
+          directory: "/tmp/project",
+        }),
+      ).toBe(true)
+      expect(
+        resolveReviewAction({
+          builtin: false,
+          permission: item.identity,
+          identity: item.identity,
+          arguments: item.invocation,
+          directory: "/tmp/project",
+          requested,
+        }).complete,
+      ).toBe(false)
+    }
+
+    for (const item of [
+      { identity: "read", invocation: { filePath: "/tmp/project/README.md" }, cwd: "/tmp/project" },
+      ...searches,
+    ] as const) {
+      const action = resolveReviewAction({
+        builtin: true,
+        permission: item.identity,
+        identity: item.identity,
+        arguments: item.invocation,
+        directory: "/tmp/project",
+        requested: { identity: item.identity, arguments: item.invocation, cwd: item.cwd, complete: true },
+      })
+      expect(action.complete).toBe(false)
+    }
+
+    const invocation = searches[1].invocation
+    const envelope = {
+      contract: "pinned-project-search-v1",
+      mode: "directory",
+      tool: "grep",
+      executor: "ripgrep-procfd-cwd-v1",
+      bindingId: "00000000000000000000000000000000",
+      invocation,
+      effects: [],
+    }
+    for (const requested of [
+      { identity: "grep", arguments: envelope, cwd: "/tmp/project/assets", complete: true },
+      { identity: "grep", arguments: { ...envelope, tool: "glob" }, cwd: searches[1].cwd, complete: true },
+      {
+        identity: "grep",
+        arguments: { ...envelope, invocation: { ...invocation, path: "/tmp/external" } },
+        cwd: searches[1].cwd,
+        complete: true,
+      },
+      { identity: "grep", arguments: { ...envelope, extra: true }, cwd: searches[1].cwd, complete: true },
+    ]) {
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          permission: "grep",
+          identity: "grep",
+          arguments: invocation,
+          directory: "/tmp/project",
+          requested,
+        }).complete,
+      ).toBe(false)
+    }
+  })
+
+  test("requires an exact-file binding and keeps external directory Glob and Grep incomplete", () => {
+    for (const identity of ["glob", "grep"] as const) {
+      const invocation = { pattern: "*.ts", path: "/tmp/external" }
+      const envelope = {
+        contract: "pinned-external-search-v1",
+        mode: "bound",
+        bindingId: "00000000000000000000000000000000",
+        kind: "directory",
+        executor: "ripgrep-procfd-cwd-v1",
+        effects: [],
+        invocation,
+      }
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          permission: identity,
+          identity,
+          arguments: invocation,
+          directory: "/tmp/project",
+          requested: { identity, arguments: envelope, cwd: "/tmp/external", complete: true },
+        }).complete,
+      ).toBe(false)
+    }
+
+    for (const item of [
+      {
+        identity: "grep",
+        kind: "file",
+        executor: "ripgrep-inherited-readonly-fd-v1",
+        invocation: { pattern: "needle", path: "/tmp/external/reviewed.txt" },
+        cwd: "/tmp/external",
+      },
+    ] as const) {
+      const unbound = resolveReviewAction({
+        builtin: true,
+        permission: item.identity,
+        identity: item.identity,
+        arguments: item.invocation,
+        directory: "/tmp/project",
+        requested: {
+          identity: item.identity,
+          arguments: item.invocation,
+          cwd: item.cwd,
+          complete: false,
+        },
+      })
+      expect(unbound.complete).toBe(false)
+
+      const envelope = {
+        contract: "pinned-external-search-v1",
+        mode: "bound",
+        bindingId: "00000000000000000000000000000000",
+        kind: item.kind,
+        executor: item.executor,
+        effects: [],
+        invocation: item.invocation,
+      }
+      const bound = resolveReviewAction({
+        builtin: true,
+        permission: item.identity,
+        identity: item.identity,
+        arguments: item.invocation,
+        directory: "/tmp/project",
+        requested: {
+          identity: item.identity,
+          arguments: envelope,
+          cwd: item.cwd,
+          complete: true,
+        },
+      })
+      expect(bound).toEqual({
+        identity: item.identity,
+        arguments: envelope,
+        cwd: item.cwd,
+        complete: true,
+      })
+      const snapshot = buildPermissionReviewSnapshot({
+        permission: item.identity,
+        origin: "tool",
+        patterns: ["*"],
+        metadata: {},
+        action: bound,
+        trusted: [{ source: "human", text: "Search this exact external target read-only" }],
+        untrusted: [],
+        contextSafeForGate: true,
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: item.identity,
+          assessment,
+          snapshot,
+          directory: "/tmp/project",
+        }),
+      ).toBe(true)
+    }
+  })
+
   test("never upgrades explicit incomplete, custom, lossy, or mismatched fallback actions", () => {
     const invocation = { filePath: "a.ts", content: "value" }
     const requested = {
@@ -375,15 +595,57 @@ describe("generic built-in risk allow gate", () => {
     ).toBe(false)
   })
 
-  test("allows only complete registered read, grep, and Bash external-directory actions", () => {
-    for (const [identity, invocation] of [
-      ["read", { filePath: "/tmp/external/a.ts", offset: 1, limit: 20 }],
-      ["grep", { pattern: "TODO", path: "/tmp/external" }],
+  test("allows only complete registered read, exact-file grep, and Bash external-directory actions", () => {
+    for (const item of [
+      {
+        identity: "read",
+        invocation: { filePath: "/tmp/external/a.ts", offset: 1, limit: 20 },
+        permissionMetadata: {
+          tool: "read",
+          filepath: "/tmp/external/a.ts",
+          parentDir: "/tmp/external",
+          readScope: {
+            version: 1,
+            canonicalTarget: "/tmp/external/a.ts",
+            canonicalRoot: "/tmp/external",
+            kind: "file",
+          },
+          readBinding: {
+            version: 1,
+            contract: "pinned-external-text-v1",
+            bindingId: "00000000000000000000000000000000",
+          },
+        },
+      },
+      {
+        identity: "grep",
+        invocation: { pattern: "TODO", path: "/tmp/external/a.ts" },
+        permissionMetadata: {
+          tool: "grep",
+          filepath: "/tmp/external/a.ts",
+          parentDir: "/tmp/external",
+          readScope: {
+            version: 1,
+            canonicalTarget: "/tmp/external/a.ts",
+            canonicalRoot: "/tmp/external",
+            kind: "file",
+          },
+          searchBinding: {
+            version: 1,
+            contract: "pinned-external-search-v1",
+            mode: "file",
+            executor: "ripgrep-inherited-readonly-fd-v1",
+            bindingId: "00000000000000000000000000000000",
+            effects: [],
+          },
+        },
+      },
     ] as const) {
+      const { identity, invocation, permissionMetadata } = item
       const action = resolveReviewAction({
         builtin: true,
         permission: "external_directory",
-        permissionMetadata: { tool: identity },
+        permissionMetadata,
         identity,
         arguments: invocation,
         directory: "/tmp/project",
@@ -512,7 +774,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("keeps search actions human-authorised even when attested at the exact session directory", () => {
+  test("keeps unbound search actions human-authorised even when claimed at the exact session directory", () => {
     for (const identity of ["glob", "grep"]) {
       const argumentsValue = { pattern: "*", path: "/tmp/project" }
       const action = resolveReviewAction({
@@ -522,7 +784,7 @@ describe("generic built-in risk allow gate", () => {
         directory: "/tmp/project",
         requested: { identity, arguments: argumentsValue, cwd: "/tmp/project", complete: true },
       })
-      expect(action.complete).toBe(identity === "glob")
+      expect(action.complete).toBe(false)
       const exact = buildPermissionReviewSnapshot({
         permission: identity,
         origin: "tool",
@@ -579,7 +841,7 @@ describe("generic built-in risk allow gate", () => {
             complete: true,
           },
         }).complete,
-      ).toBe(identity === "glob")
+      ).toBe(false)
     }
   })
 

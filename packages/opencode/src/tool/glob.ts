@@ -3,9 +3,10 @@ import { Effect, Schema } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
-import { assertExternalDirectoryEffect } from "./external-directory"
+import { assertExternalDirectoryEffect, verifyExternalDirectoryEffect } from "./external-directory"
+import { containsPath } from "../project/instance-context"
 import DESCRIPTION from "./glob.txt"
-import { bindSearchDirectory } from "./search-bound-directory"
+import { bindSearchDirectory, closeBoundSearchDirectory, verifyBoundSearchDirectory } from "./search-bound-directory"
 import * as Tool from "./tool"
 
 export const Parameters = Schema.Struct({
@@ -34,16 +35,35 @@ export const GlobTool = Tool.define(
           if (info?.type === "File") {
             throw new Error(`glob path must be a directory: ${search}`)
           }
-          yield* assertExternalDirectoryEffect(ctx, search, {
-            bypass: false,
-            kind: "directory",
-          })
 
-          const eligible = search === ins.directory && (input.path === undefined || lexical === search)
+          const isExternal = !containsPath(search, ins)
+          const projectEligible = !isExternal && info?.type === "Directory" && lexical === search
           return yield* Effect.acquireUseRelease(
-            eligible ? Effect.promise(() => bindSearchDirectory(ins.directory, search)) : Effect.succeed(undefined),
+            isExternal
+              ? Effect.promise(() => bindSearchDirectory(search, search))
+              : projectEligible
+                ? Effect.promise(() => bindSearchDirectory(ins.directory, search))
+                : Effect.succeed(undefined),
             (bound) =>
               Effect.gen(function* () {
+                if (!isExternal && !bound) throw new Error("Project search directory could not be bound safely")
+                const external = yield* assertExternalDirectoryEffect(ctx, search, {
+                  bypass: false,
+                  kind: "directory",
+                  tool: "glob",
+                })
+                const boundArguments =
+                  !isExternal && bound
+                    ? {
+                        contract: "pinned-project-search-v1",
+                        mode: "directory",
+                        tool: "glob",
+                        executor: "ripgrep-procfd-cwd-v1",
+                        bindingId: bound.bindingId,
+                        invocation: input,
+                        effects: [],
+                      }
+                    : undefined
                 yield* ctx.ask({
                   permission: "glob",
                   patterns: [input.pattern],
@@ -54,14 +74,16 @@ export const GlobTool = Tool.define(
                   },
                   action: {
                     identity: "glob",
-                    arguments: input,
+                    arguments: boundArguments ?? input,
                     cwd: search,
-                    // ripgrep's one-file-system boundary is device based, so a same-device bind mount
-                    // can still expose names. Keep search human-authorised until traversal is descriptor-bound.
-                    complete: false,
+                    // External traversal remains human-authorised: a root descriptor and ripgrep's device-based
+                    // one-file-system boundary do not confine same-device descendant bind mounts.
+                    complete: Boolean(boundArguments),
                   },
                 })
 
+                yield* verifyExternalDirectoryEffect(external)
+                if (bound) yield* Effect.promise(() => verifyBoundSearchDirectory(bound))
                 const limit = 100
                 const files = yield* ripgrep.glob({
                   cwd: bound?.cwd ?? search,
@@ -69,6 +91,7 @@ export const GlobTool = Tool.define(
                   limit,
                   oneFileSystem: Boolean(bound),
                 })
+                if (bound) yield* Effect.promise(() => verifyBoundSearchDirectory(bound))
                 const truncated = files.length === limit
 
                 const output = []
@@ -92,7 +115,7 @@ export const GlobTool = Tool.define(
                   output: output.join("\n"),
                 }
               }),
-            (bound) => (bound ? Effect.promise(() => bound.directory.close().catch(() => {})) : Effect.void),
+            (bound) => (bound ? Effect.promise(() => closeBoundSearchDirectory(bound)) : Effect.void),
           )
         }).pipe(Effect.orDie),
     }

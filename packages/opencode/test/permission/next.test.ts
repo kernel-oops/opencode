@@ -10,6 +10,7 @@ import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Npm } from "@opencode-ai/core/npm"
 import { Permission } from "../../src/permission"
+import { inspectThenRevalidateAuthority } from "../../src/permission/index"
 import { Plugin } from "../../src/plugin"
 import { Auth } from "../../src/auth"
 import { Account } from "../../src/account/account"
@@ -20,7 +21,7 @@ import { TestInstance, tmpdirScoped, withTmpdirInstance } from "../fixture/fixtu
 import { testEffect } from "../lib/effect"
 import { AccountTest } from "../fake/account"
 import { NpmTest } from "../fake/npm"
-import { MessageID, SessionID } from "../../src/session/schema"
+import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { Session } from "../../src/session/session"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -31,18 +32,27 @@ import { MockLanguageModelV3 } from "ai/test"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { simulateReadableStream } from "ai"
 import { createHash } from "node:crypto"
-import { chmod } from "node:fs/promises"
+import { chmod, realpath, stat, symlink, writeFile } from "node:fs/promises"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { buildPermissionReviewAdmission } from "../../src/permission/admission"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
-import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
+import { PermissionReviewCorrectionTable, PermissionReviewDelegationTable } from "@opencode-ai/core/session/sql"
 import { resolveReviewAction } from "../../src/permission/generic-review-action"
-import { and, eq } from "drizzle-orm"
+import { and, eq, sql } from "drizzle-orm"
 import { auditCorrelationKey } from "../../src/permission/audit-correlation"
 import { PermissionReviewer } from "../../src/permission/reviewer"
 import { LITERAL_GREP_LIMITS } from "../../src/tool/grep-bound-files"
+import { Agent } from "../../src/agent/agent"
+import { BackgroundJob } from "../../src/background/job"
+import { Config } from "../../src/config/config"
+import { SessionRunState } from "../../src/session/run-state"
+import { SessionStatus } from "../../src/session/status"
+import { Truncate } from "../../src/tool/truncate"
+import { ToolRegistry } from "../../src/tool/registry"
+import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 
 const reviewerAlias = ModelV2.ID.make("gpt-5.6-luna-oauth")
 const reviewerModel = ProviderTest.model({
@@ -67,6 +77,15 @@ const env = AppNodeBuilder.build(
     CrossSpawnSpawner.node,
     InstanceStore.node,
     Session.node,
+    Agent.node,
+    BackgroundJob.node,
+    Config.node,
+    SessionRunState.node,
+    SessionStatus.node,
+    Truncate.node,
+    ToolRegistry.node,
+    Ripgrep.node,
+    RuntimeFlags.node,
     SessionProjector.node,
     Database.node,
   ]),
@@ -200,6 +219,25 @@ const obviousReviewerOutput = (
   }),
 })
 
+function delayedObviousAllow() {
+  let entered!: () => void
+  let release!: () => void
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  reviewerLanguage = new MockLanguageModelV3({
+    doStream: async () => {
+      entered()
+      await blocked
+      return obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+    },
+  })
+  return { started, release }
+}
+
 const evaluatorIdentity = {
   implementation: "integration-evaluator",
   version: "1.0.0",
@@ -297,9 +335,9 @@ const bashAction = (directory: string, complete = true) => ({
   },
 })
 
-const bashRequest = (session: string, directory: string, complete = true) => ({
+const bashRequest = (session: string, directory: string, complete = true, turnID?: MessageID) => ({
   sessionID: SessionID.make(session),
-  tool: { messageID: `message_${session}`, callID: `call_${session}` },
+  tool: { messageID: turnID ?? (`message_${session}` as MessageID), callID: `call_${session}` },
   permission: "bash",
   patterns: ["git status"],
   metadata: {},
@@ -307,6 +345,37 @@ const bashRequest = (session: string, directory: string, complete = true) => ({
   ruleset: [],
   review: bashAction(directory, complete),
 })
+
+const projectSearchAction = (
+  identity: "glob" | "grep",
+  directory: string,
+  input: { pattern: string; path?: string; include?: string },
+  complete = true,
+) =>
+  resolveReviewAction({
+    builtin: true,
+    permission: identity,
+    permissionMetadata: input,
+    identity,
+    arguments: input,
+    directory,
+    requested: complete
+      ? {
+          identity,
+          arguments: {
+            contract: "pinned-project-search-v1",
+            mode: "directory",
+            tool: identity,
+            executor: "ripgrep-procfd-cwd-v1",
+            bindingId: "33333333333333333333333333333333",
+            invocation: input,
+            effects: [],
+          },
+          cwd: input.path ?? directory,
+          complete: true,
+        }
+      : { identity, arguments: input, cwd: input.path ?? directory, complete: false },
+  })
 
 const genericGlobRequest = (sessionID: SessionID, turnID: MessageID, directory: string, complete = true) => ({
   sessionID,
@@ -318,14 +387,309 @@ const genericGlobRequest = (sessionID: SessionID, turnID: MessageID, directory: 
   ruleset: [],
   review: {
     origin: "tool" as const,
-    action: {
-      identity: "glob",
-      arguments: { pattern: "*.md" },
-      cwd: directory,
-      complete,
-    },
+    action: projectSearchAction("glob", directory, { pattern: "*.md" }, complete),
   },
 })
+
+const genericGrepRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  input: { pattern: string; path: string; include?: string },
+) => ({
+  sessionID,
+  tool: { messageID, callID: `call_${messageID}` },
+  permission: "grep",
+  patterns: [input.pattern],
+  metadata: { pattern: input.pattern, path: input.path },
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: projectSearchAction("grep", directory, input),
+  },
+})
+
+const externalGrepRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  input: { pattern: string; path: string; include?: string },
+  kind: "directory" | "file" = "directory",
+) => {
+  const root = kind === "file" ? path.dirname(input.path) : input.path
+  const metadata = {
+    filepath: input.path,
+    parentDir: root,
+    tool: "grep",
+    readScope: {
+      version: 1,
+      canonicalTarget: input.path,
+      canonicalRoot: root,
+      kind,
+    },
+    searchBinding: {
+      version: 1,
+      contract: "pinned-external-search-v1",
+      mode: kind,
+      executor: kind === "file" ? "ripgrep-inherited-readonly-fd-v1" : "ripgrep-procfd-cwd-v1",
+      bindingId: "11111111111111111111111111111111",
+      effects: [],
+    },
+  }
+  return {
+    sessionID,
+    tool: { messageID, callID: `external_${messageID}` },
+    permission: "external_directory",
+    patterns: [`${root}/*`],
+    metadata,
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "external_directory",
+        permissionMetadata: metadata,
+        identity: "grep",
+        arguments: input,
+        directory,
+      }),
+    },
+  }
+}
+
+const genericExternalGrepRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  input: { pattern: string; path: string; include?: string },
+  kind: "directory" | "file" = "directory",
+) => ({
+  sessionID,
+  tool: { messageID, callID: `grep_${messageID}` },
+  permission: "grep",
+  patterns: [input.pattern],
+  metadata: { pattern: input.pattern, path: input.path },
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: resolveReviewAction({
+      builtin: true,
+      permission: "grep",
+      permissionMetadata: { pattern: input.pattern, path: input.path },
+      identity: "grep",
+      arguments: input,
+      directory,
+      requested: {
+        identity: "grep",
+        arguments: {
+          contract: "pinned-external-search-v1",
+          mode: "bound",
+          kind,
+          executor: kind === "file" ? "ripgrep-inherited-readonly-fd-v1" : "ripgrep-procfd-cwd-v1",
+          bindingId: "11111111111111111111111111111111",
+          invocation: input,
+          effects: [],
+        },
+        cwd: kind === "file" ? path.dirname(input.path) : input.path,
+        complete: true,
+      },
+    }),
+  },
+})
+
+const externalGlobRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  input: { pattern: string; path: string },
+) => {
+  const metadata = {
+    filepath: input.path,
+    parentDir: input.path,
+    tool: "glob",
+    readScope: {
+      version: 1,
+      canonicalTarget: input.path,
+      canonicalRoot: input.path,
+      kind: "directory",
+    },
+    searchBinding: {
+      version: 1,
+      contract: "pinned-external-search-v1",
+      mode: "directory",
+      executor: "ripgrep-procfd-cwd-v1",
+      bindingId: "22222222222222222222222222222222",
+      effects: [],
+    },
+  }
+  return {
+    sessionID,
+    tool: { messageID, callID: `external_glob_${messageID}` },
+    permission: "external_directory",
+    patterns: [`${input.path}/*`],
+    metadata,
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "external_directory",
+        permissionMetadata: metadata,
+        identity: "glob",
+        arguments: input,
+        directory,
+      }),
+    },
+  }
+}
+
+const genericExternalGlobRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  input: { pattern: string; path: string },
+) => ({
+  sessionID,
+  tool: { messageID, callID: `glob_${messageID}` },
+  permission: "glob",
+  patterns: [input.pattern],
+  metadata: input,
+  always: [],
+  ruleset: [],
+  review: {
+    origin: "tool" as const,
+    action: resolveReviewAction({
+      builtin: true,
+      permission: "glob",
+      permissionMetadata: input,
+      identity: "glob",
+      arguments: input,
+      directory,
+      requested: {
+        identity: "glob",
+        arguments: {
+          contract: "pinned-external-search-v1",
+          mode: "bound",
+          kind: "directory",
+          executor: "ripgrep-procfd-cwd-v1",
+          bindingId: "22222222222222222222222222222222",
+          invocation: input,
+          effects: [],
+        },
+        cwd: input.path,
+        complete: true,
+      },
+    }),
+  },
+})
+
+const externalReadScopeRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  filePath: string,
+  bound = true,
+) => {
+  const input = { filePath }
+  const parentDir = path.dirname(filePath)
+  const metadata = {
+    filepath: filePath,
+    parentDir,
+    tool: "read",
+    readScope: {
+      version: 1,
+      canonicalTarget: filePath,
+      canonicalRoot: parentDir,
+      kind: "file",
+    },
+    ...(bound
+      ? {
+          readBinding: {
+            version: 1,
+            contract: "pinned-external-text-v1",
+            bindingId: "00000000000000000000000000000000",
+          },
+        }
+      : {}),
+  }
+  return {
+    sessionID,
+    tool: { messageID, callID: `external_read_${messageID}` },
+    permission: "external_directory",
+    patterns: [`${parentDir}/*`],
+    metadata,
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "external_directory",
+        permissionMetadata: metadata,
+        identity: "read",
+        arguments: input,
+        directory,
+      }),
+    },
+  }
+}
+
+const genericReadRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  filePath: string,
+  bound = false,
+) => {
+  const input = { filePath }
+  const metadata = bound
+    ? {
+        readBinding: {
+          version: 1,
+          contract: "pinned-external-text-v1",
+          bindingId: "00000000000000000000000000000000",
+        },
+      }
+    : {}
+  return {
+    sessionID,
+    tool: { messageID, callID: `read_${messageID}` },
+    permission: "read",
+    patterns: [filePath],
+    metadata,
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "read",
+        permissionMetadata: metadata,
+        identity: "read",
+        arguments: input,
+        directory,
+        requested: bound
+          ? {
+              identity: "read",
+              arguments: {
+                contract: "pinned-external-text-v1",
+                mode: "bound",
+                bindingId: "00000000000000000000000000000000",
+                invocation: input,
+                effects: [],
+              },
+              cwd: path.dirname(filePath),
+              complete: true,
+            }
+          : { identity: "read", arguments: input, cwd: path.dirname(filePath), complete: false },
+      }),
+    },
+  }
+}
 
 const genericFallbackRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => ({
   sessionID,
@@ -349,31 +713,6 @@ const genericFallbackRequest = (sessionID: SessionID, turnID: MessageID, directo
     },
   },
 })
-
-const externalReadRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
-  const arguments_ = { filePath: "/tmp/external/package.json", offset: 1, limit: 40 }
-  const metadata = { filepath: "/tmp/external/package.json", parentDir: "/tmp/external", tool: "read" }
-  return {
-    sessionID,
-    tool: { messageID: turnID, callID: `call_${sessionID}` },
-    permission: "external_directory",
-    patterns: ["/tmp/external/*"],
-    metadata,
-    always: [],
-    ruleset: [],
-    review: {
-      origin: "tool" as const,
-      action: resolveReviewAction({
-        builtin: true,
-        permission: "external_directory",
-        permissionMetadata: metadata,
-        identity: "read",
-        arguments: arguments_,
-        directory,
-      }),
-    },
-  }
-}
 
 const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
   const pattern = "Calendar apps choose when to refresh|refreshes every 6 hours|PUBLISHED-TTL|REFRESH-INTERVAL"
@@ -465,6 +804,7 @@ const capturePersistedTurn = Effect.fn("test.capturePersistedTurn")(function* (i
     turnID,
     trusted: [],
     untrusted: [],
+    contextSafeForGate: true,
   })
   return turnID
 })
@@ -481,7 +821,146 @@ const recapturePersistedTurn = Effect.fn("test.recapturePersistedTurn")(function
     turnID: input.turnID,
     trusted: [],
     untrusted: [],
+    contextSafeForGate: true,
   })
+})
+
+const admittedBashRequest = Effect.fn("test.admittedBashRequest")(function* (directory: string, title: string) {
+  const sessions = yield* Session.Service
+  const sessionID = (yield* sessions.create({ title })).id
+  const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+  return bashRequest(sessionID, directory, true, turnID)
+})
+
+const createDelegationTable = Effect.fn("test.createDelegationTable")(function* () {
+  const db = yield* Database.Service
+  yield* db.db.run(sql`
+    CREATE TABLE IF NOT EXISTS permission_review_delegation (
+      child_turn_id text PRIMARY KEY NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+      child_session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+      parent_session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+      root_session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+      parent_turn_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+      root_turn_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+      task_message_id text NOT NULL REFERENCES message(id) ON DELETE CASCADE,
+      task_part_id text NOT NULL REFERENCES part(id) ON DELETE CASCADE,
+      task_call_id text NOT NULL,
+      child_agent text NOT NULL,
+      time_created integer NOT NULL,
+      CONSTRAINT permission_review_delegation_task_call_unique UNIQUE(task_message_id, task_call_id)
+    )
+  `)
+})
+
+const seedDelegatedTurn = Effect.fn("test.seedDelegatedTurn")(function* (input: {
+  directory: string
+  rootSummary?: boolean
+}) {
+  yield* createDelegationTable()
+  const sessions = yield* Session.Service
+  const permission = yield* Permission.Service
+  const root = yield* sessions.create({ title: "Delegated reviewer root" })
+  const rootTurnID = MessageID.ascending()
+  const admission = buildPermissionReviewAdmission([{ type: "text", text: "Inspect the flight log code read-only" }])
+  yield* sessions.updateMessage({
+    id: rootTurnID,
+    sessionID: root.id,
+    role: "user",
+    time: { created: Date.now() },
+    agent: "build",
+    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+    permissionReview: { admission },
+    ...(input.rootSummary ? { summary: { diffs: [] } } : {}),
+  })
+  yield* permission.captureTurn({
+    sessionID: root.id,
+    rootSessionID: root.id,
+    turnID: rootTurnID,
+    trusted: [{ source: "human", text: admission.text[0]! }],
+    untrusted: [],
+    complete: true,
+    contextSafeForGate: true,
+  })
+
+  const child = yield* sessions.create({ parentID: root.id, title: "Cat child", agent: "Cat" })
+  const taskMessageID = MessageID.ascending()
+  yield* sessions.updateMessage({
+    id: taskMessageID,
+    role: "assistant",
+    parentID: rootTurnID,
+    sessionID: root.id,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: root.directory, root: root.directory },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ModelV2.ID.make("test"),
+    providerID: ProviderV2.ID.make("test"),
+    time: { created: Date.now(), completed: Date.now() },
+    finish: "tool-calls",
+  })
+  const taskPartID = PartID.ascending()
+  const taskCallID = `call_${taskPartID}`
+  yield* sessions.updatePart({
+    id: taskPartID,
+    messageID: taskMessageID,
+    sessionID: root.id,
+    type: "tool",
+    callID: taskCallID,
+    tool: "task",
+    state: {
+      status: "completed",
+      input: { description: "Inspect", prompt: "Inspect read-only", subagent_type: "Cat" },
+      output: "delegated",
+      title: "Inspect",
+      metadata: { parentSessionId: root.id, sessionId: child.id },
+      time: { start: Date.now(), end: Date.now() },
+    },
+  })
+
+  const receipt = yield* permission.authoriseTaskDelegation({
+    sessionID: root.id,
+    messageID: taskMessageID,
+    callID: taskCallID,
+    childAgent: "Cat",
+  })
+  if (!receipt) throw new Error("expected delegation receipt")
+  const childTurnID = MessageID.ascending()
+  yield* sessions.updateMessage({
+    id: childTurnID,
+    sessionID: child.id,
+    role: "user",
+    time: { created: Date.now() },
+    agent: "Cat",
+    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+  })
+  yield* permission.captureTaskDelegation({ receipt, childSessionID: child.id, childTurnID })
+  yield* permission.captureTurn({
+    sessionID: child.id,
+    rootSessionID: root.id,
+    turnID: childTurnID,
+    trusted: [],
+    untrusted: [{ source: "child_prompt", text: "Inspect read-only" }],
+    complete: true,
+    contextSafeForGate: true,
+  })
+
+  const childAssistantID = MessageID.ascending()
+  yield* sessions.updateMessage({
+    id: childAssistantID,
+    role: "assistant",
+    parentID: childTurnID,
+    sessionID: child.id,
+    mode: "build",
+    agent: "Cat",
+    cost: 0,
+    path: { cwd: child.directory, root: child.directory },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ModelV2.ID.make("test"),
+    providerID: ProviderV2.ID.make("test"),
+    time: { created: Date.now() },
+  })
+  return { root, rootTurnID, child, childTurnID, childAssistantID, taskMessageID, taskPartID }
 })
 
 const reviewerAsk = (input: Parameters<Permission.Interface["ask"]>[0]) =>
@@ -534,6 +1013,7 @@ const withObviousReviewer = (
     policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
     automatic_allow?: "never" | "policy-gated"
     automatic_rewrite?: "never" | "once-per-turn"
+    agents?: Record<string, { description: string; mode: "subagent" }>
   },
   ...sources: string[]
 ) => ({
@@ -559,6 +1039,7 @@ const withObviousReviewer = (
             automatic_allow: input.automatic_allow ?? "never",
             automatic_rewrite: input.automatic_rewrite ?? "never",
           },
+          ...(input.agents ? { agent: input.agents } : {}),
         }),
       )
     }),
@@ -1514,6 +1995,7 @@ it.instance(
       })
       yield* permission.captureUntrusted({
         sessionID: childID,
+        turnID: "msg_child_turn",
         evidence: [{ source: "plugin", text: "A system-transform plugin added this instruction." }],
       })
 
@@ -1599,7 +2081,7 @@ it.instance(
                 },
                 { source: "instruction", trusted: false, text: "Never expose credentials." },
               ],
-              complete: false,
+              complete: true,
               omitted_items: 0,
               omitted_bytes: 0,
             },
@@ -3746,7 +4228,7 @@ it.instance(
 )
 
 it.instance(
-  "generic reviewer - trusted glob stays human when descendant traversal is not pinned",
+  "generic reviewer - trusted registered glob can be automatically allowed",
   () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -3757,26 +4239,1113 @@ it.instance(
         doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
 
-      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
-      expect(yield* waitForPending(1)).toHaveLength(1)
-      yield* rejectAll()
-      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+      yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory))
+      expect(yield* list()).toHaveLength(0)
 
       expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
       const logs = JSON.stringify(yield* TestConsole.logLines)
-      expect(logs).not.toContain('"source":"bash_evaluator"')
-      expect(logs).not.toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
     }),
-  withBashEvaluator({
-    mode: "permit-only",
-    policy: { decision: "deny" },
-    reviewer: {
-      mode: "enforce",
-      policy: "obvious-risk-only-v1",
-      automatic_allow: "policy-gated",
-    },
-  }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
   15_000,
+)
+
+it.instance(
+  "generic reviewer - ordinary unbound project Read remains human-authorised",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Generic read allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const filePath = path.join(test.directory, "README.md")
+      yield* Effect.promise(() => writeFile(filePath, "read me"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const fiber = yield* reviewerAsk(genericReadRequest(sessionID, turnID, test.directory, filePath)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"human"')
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "generic reviewer - unbound external Read cannot use automatic cached-scope authority",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Unbound external Read" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      const textPath = path.join(external, "bound.txt")
+      const filePath = path.join(external, "media.pdf")
+      yield* Effect.promise(() => Promise.all([writeFile(textPath, "bound text\n"), writeFile(filePath, "%PDF-1.4\n")]))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, textPath))
+      expect(yield* list()).toHaveLength(0)
+
+      const gate = yield* reviewerAsk(
+        externalReadScopeRequest(sessionID, turnID, test.directory, filePath, false),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(gate))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const primary = yield* reviewerAsk(genericReadRequest(sessionID, turnID, test.directory, filePath)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(primary))).toBeInstanceOf(PermissionV1.RejectedError)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(3)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"readScopeCode":"read_scope_minted"')
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "delegated reviewer - Flight-log root and child read-only searches use only the persisted root admission",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const external = yield* tmpdirScoped()
+      const externalName = "tool_047e55bb7001Vs2COS081Q2s8q"
+      yield* Effect.promise(() => writeFile(path.join(external, externalName), "Flight log import export OCR delete"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const globInput = { pattern: "**/*{flight,Flight,log,Log}*", path: seeded.root.directory }
+      yield* reviewerAsk({
+        sessionID: seeded.root.id,
+        tool: { messageID: seeded.taskMessageID, callID: "call_root_glob" },
+        permission: "glob",
+        patterns: [globInput.pattern],
+        metadata: { pattern: globInput.pattern, path: globInput.path },
+        always: [],
+        ruleset: [],
+        review: {
+          origin: "tool",
+          action: projectSearchAction("glob", seeded.root.directory, globInput),
+        },
+      })
+      yield* reviewerAsk(
+        genericGrepRequest(seeded.root.id, seeded.taskMessageID, seeded.root.directory, {
+          pattern: "Import|Export|OCR|conflict|duplicate|remove|delete",
+          path: path.join(seeded.root.directory, "templates"),
+          include: "*.{html,twig}",
+        }),
+      )
+      yield* reviewerAsk(
+        genericGrepRequest(seeded.root.id, seeded.taskMessageID, seeded.root.directory, {
+          pattern: "flight.*(remove|delete)|remove.*flight|delete.*flight|data-.*flight",
+          path: path.join(seeded.root.directory, "assets"),
+          include: "*.{js,ts,jsx,tsx}",
+        }),
+      )
+      yield* reviewerAsk({
+        sessionID: seeded.root.id,
+        tool: { messageID: seeded.taskMessageID, callID: "call_root_task_review" },
+        permission: "task",
+        patterns: ["Cat"],
+        metadata: { description: "Inspect", subagent_type: "Cat" },
+        always: [],
+        ruleset: [],
+        review: {
+          origin: "tool",
+          action: resolveReviewAction({
+            builtin: true,
+            permission: "task",
+            permissionMetadata: { description: "Inspect", subagent_type: "Cat" },
+            identity: "task",
+            arguments: { description: "Inspect", prompt: "Inspect read-only", subagent_type: "Cat" },
+            directory: seeded.root.directory,
+          }),
+        },
+      })
+
+      const childInput = {
+        pattern: "(?i)(flight.?log|import|export|ocr|conflict|badge|delete|deletion|table|row|icon|test|path)",
+        path: path.join(external, externalName),
+      }
+      yield* reviewerAsk(
+        externalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, childInput, "file"),
+      )
+      yield* reviewerAsk(
+        genericExternalGrepRequest(
+          seeded.child.id,
+          seeded.childAssistantID,
+          seeded.child.directory,
+          childInput,
+          "file",
+        ),
+      )
+      expect(yield* list()).toHaveLength(0)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
+      })
+      const rewrite = yield* reviewerAsk(
+        genericExternalGrepRequest(
+          seeded.child.id,
+          seeded.childAssistantID,
+          seeded.child.directory,
+          childInput,
+          "file",
+        ),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(rewrite))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).not.toContain("Inspect the flight log code read-only")
+      expect(logs).not.toContain(childInput.path)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+  }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - actual Task execution persists authority for the Flight-log read-only flow",
+  () =>
+    Effect.gen(function* () {
+      yield* createDelegationTable()
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      const root = yield* sessions.create({ title: "Actual Flight-log Task" })
+      const rootTurnID = MessageID.ascending()
+      const rootText = "Inspect the Flight-log Import, Export, OCR, duplicate and deletion code read-only"
+      const admission = buildPermissionReviewAdmission([{ type: "text", text: rootText }])
+      yield* sessions.updateMessage({
+        id: rootTurnID,
+        sessionID: root.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+        permissionReview: { admission },
+        summary: { diffs: [] },
+      })
+      yield* permission.captureTurn({
+        sessionID: root.id,
+        rootSessionID: root.id,
+        turnID: rootTurnID,
+        trusted: [{ source: "human", text: rootText }],
+        untrusted: [],
+        complete: true,
+        contextSafeForGate: true,
+      })
+
+      const taskInput = {
+        description: "Inspect Flight log",
+        prompt: "Inspect the supplied Flight-log results read-only",
+        subagent_type: "Cat",
+      }
+      const taskMessageID = MessageID.ascending()
+      const taskCallID = "call_actual_flight_task"
+      const taskPartID = PartID.ascending()
+      yield* sessions.updateMessage({
+        id: taskMessageID,
+        role: "assistant",
+        parentID: rootTurnID,
+        sessionID: root.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: root.directory, root: root.directory },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: Date.now() },
+      })
+      yield* sessions.updatePart({
+        id: taskPartID,
+        messageID: taskMessageID,
+        sessionID: root.id,
+        type: "tool",
+        callID: taskCallID,
+        tool: "task",
+        state: { status: "running", input: taskInput, time: { start: Date.now() } },
+      })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const rootGlob = { pattern: "**/*{flight,Flight,log,Log}*", path: root.directory }
+      yield* reviewerAsk({
+        sessionID: root.id,
+        tool: { messageID: taskMessageID, callID: "call_actual_root_glob" },
+        permission: "glob",
+        patterns: [rootGlob.pattern],
+        metadata: rootGlob,
+        always: [],
+        ruleset: [],
+        review: {
+          origin: "tool",
+          action: projectSearchAction("glob", root.directory, rootGlob),
+        },
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.fail(new Error("root Glob timed out")),
+        }),
+      )
+      yield* reviewerAsk(
+        genericGrepRequest(root.id, taskMessageID, root.directory, {
+          pattern: "Import|Export|OCR|conflict|duplicate|remove|delete",
+          path: path.join(root.directory, "templates"),
+          include: "*.{html,twig}",
+        }),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.fail(new Error("root templates Grep timed out")),
+        }),
+      )
+      yield* reviewerAsk(
+        genericGrepRequest(root.id, taskMessageID, root.directory, {
+          pattern: "flight.*(remove|delete)|remove.*flight|delete.*flight|data-.*flight",
+          path: path.join(root.directory, "assets"),
+          include: "*.{js,ts,jsx,tsx}",
+        }),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.fail(new Error("root assets Grep timed out")),
+        }),
+      )
+
+      let childAssistantID: MessageID | undefined
+      const promptOps: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: () => Effect.die(new Error("actual Task delegation unexpectedly used an ordinary prompt")),
+        authoriseTaskDelegation: (input) => permission.authoriseTaskDelegation(input),
+        canResumeTask: (input) => permission.canResumeTask(input),
+        promptTask: (input, receipt) =>
+          Effect.gen(function* () {
+            const child = yield* sessions.get(input.sessionID)
+            const childTurnID = input.messageID ?? MessageID.ascending()
+            const childText = input.parts
+              .filter((part): part is Extract<(typeof input.parts)[number], { type: "text" }> => part.type === "text")
+              .map((part) => part.text)
+              .join("\n")
+
+            yield* sessions.updateMessage({
+              id: childTurnID,
+              sessionID: child.id,
+              role: "user",
+              time: { created: Date.now() },
+              agent: "Cat",
+              model: input.model!,
+            })
+            yield* permission
+              .captureTaskDelegation({ receipt, childSessionID: child.id, childTurnID })
+              .pipe(Effect.orDie)
+            yield* permission.captureTurn({
+              sessionID: child.id,
+              rootSessionID: root.id,
+              turnID: childTurnID,
+              trusted: [],
+              untrusted: [{ source: "child_prompt", text: childText }],
+              complete: true,
+              contextSafeForGate: true,
+            })
+            const info: SessionV1.Assistant = {
+              id: MessageID.ascending(),
+              role: "assistant",
+              parentID: childTurnID,
+              sessionID: child.id,
+              mode: "Cat",
+              agent: "Cat",
+              cost: 0,
+              path: { cwd: child.directory, root: child.directory },
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: input.model!.modelID,
+              providerID: input.model!.providerID,
+              time: { created: Date.now() },
+              finish: "stop",
+            }
+            const textPart: SessionV1.TextPart = {
+              id: PartID.ascending(),
+              messageID: info.id,
+              sessionID: child.id,
+              type: "text",
+              text: "inspected",
+            }
+            yield* sessions.updateMessage(info)
+            yield* sessions.updatePart(textPart)
+            childAssistantID = info.id
+            return { info, parts: [textPart] }
+          }).pipe(Effect.orDie),
+      }
+      const task = yield* TaskTool
+      const definition = yield* task.init()
+      const taskResult = yield* definition
+        .execute(taskInput, {
+          sessionID: root.id,
+          messageID: taskMessageID,
+          callID: taskCallID,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          ask: (request) =>
+            permission
+              .ask({
+                ...request,
+                sessionID: root.id,
+                tool: { messageID: taskMessageID, callID: taskCallID },
+                ruleset: [],
+                review: {
+                  origin: "tool",
+                  action: resolveReviewAction({
+                    builtin: true,
+                    permission: request.permission,
+                    permissionMetadata: request.metadata,
+                    identity: "task",
+                    arguments: taskInput,
+                    directory: root.directory,
+                    requested: request.action,
+                  }),
+                },
+              })
+              .pipe(Effect.orDie),
+          metadata: (update) =>
+            Effect.gen(function* () {
+              const current = yield* sessions.getPart({
+                sessionID: root.id,
+                messageID: taskMessageID,
+                partID: taskPartID,
+              })
+              if (!current || current.type !== "tool") throw new Error("missing actual Task part")
+              yield* sessions.updatePart({
+                ...current,
+                state: {
+                  ...current.state,
+                  title: update.title ?? ("title" in current.state ? current.state.title : "") ?? "",
+                  metadata: update.metadata ?? ("metadata" in current.state ? current.state.metadata : {}) ?? {},
+                },
+              })
+            }),
+        })
+        .pipe(
+          Effect.timeoutOrElse({
+            duration: "10 seconds",
+            orElse: () => Effect.fail(new Error("actual Task execute timed out")),
+          }),
+        )
+
+      const child = yield* sessions.get(SessionID.make(taskResult.metadata.sessionId))
+      if (!childAssistantID) throw new Error("actual Task prompt did not persist child assistant")
+      const external = yield* tmpdirScoped()
+      const first = path.join(external, "tool_flight_results")
+      const second = path.join(external, "flight_details.txt")
+      yield* Effect.promise(() => Promise.all([writeFile(first, "flight OCR"), writeFile(second, "flight details")]))
+      const childGrep = {
+        pattern: "(?i)(flight.?log|import|export|ocr|delete)",
+        path: first,
+      }
+      yield* reviewerAsk(externalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file")).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.fail(new Error("external Grep gate timed out")),
+        }),
+      )
+      yield* reviewerAsk(
+        genericExternalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file"),
+      ).pipe(
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.fail(new Error("primary Grep timed out")) }),
+      )
+      yield* reviewerAsk(externalReadScopeRequest(child.id, childAssistantID, child.directory, second)).pipe(
+        Effect.timeoutOrElse({
+          duration: "5 seconds",
+          orElse: () => Effect.fail(new Error("external Read gate timed out")),
+        }),
+      )
+      yield* reviewerAsk(genericReadRequest(child.id, childAssistantID, child.directory, second, true)).pipe(
+        Effect.timeoutOrElse({ duration: "5 seconds", orElse: () => Effect.fail(new Error("primary Read timed out")) }),
+      )
+      expect(yield* list()).toHaveLength(0)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
+      })
+      const rewrite = yield* reviewerAsk(
+        genericExternalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file"),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(rewrite))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const outside = yield* tmpdirScoped()
+      const outsideFile = path.join(outside, "outside.txt")
+      yield* Effect.promise(() => writeFile(outsideFile, "outside"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("outside scope reviewer failure")
+        },
+      })
+      const outsideAsk = yield* reviewerAsk(
+        externalReadScopeRequest(child.id, childAssistantID, child.directory, outsideFile),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(outsideAsk))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+    agents: { Cat: { description: "Read-only Flight-log investigator", mode: "subagent" } },
+  }),
+  45_000,
+)
+
+it.effect("permission sequencing - revocation during delayed scope inspection cannot commit", () =>
+  Effect.gen(function* () {
+    const directory = yield* tmpdirScoped()
+    const target = path.join(directory, "scope.txt")
+    yield* Effect.promise(() => writeFile(target, "scope"))
+    const inspectionStarted = yield* Deferred.make<void>()
+    const releaseInspection = yield* Deferred.make<void>()
+    let authorityCurrent = true
+    let checks = 0
+    let minted = false
+
+    const fiber = yield* inspectThenRevalidateAuthority(
+      () =>
+        Effect.sync(() => {
+          checks += 1
+          return authorityCurrent
+        }),
+      () =>
+        Deferred.succeed(inspectionStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseInspection)),
+          Effect.andThen(
+            Effect.promise(async () => {
+              const canonical = await realpath(target)
+              const info = await stat(canonical)
+              return { canonical, regular: info.isFile() }
+            }),
+          ),
+        ),
+    ).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          if (result.authorityCurrent) minted = true
+        }),
+      ),
+      Effect.forkScoped,
+    )
+
+    yield* Deferred.await(inspectionStarted)
+    authorityCurrent = false
+    yield* Deferred.succeed(releaseInspection, undefined)
+    const result = yield* Fiber.join(fiber)
+
+    expect(result.authorityCurrent).toBe(false)
+    expect(result.inspection).toEqual({ canonical: target, regular: true })
+    expect(checks).toBe(2)
+    expect(minted).toBe(false)
+  }),
+)
+
+it.instance(
+  "delegated reviewer - external read scope is turn-bound, canonical, read-only, and fail-closed",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const external = yield* tmpdirScoped()
+      const sibling = yield* tmpdirScoped()
+      const first = path.join(external, "first.log")
+      const second = path.join(external, "second.log")
+      const outside = path.join(sibling, "outside.log")
+      const linked = path.join(external, "linked.log")
+      yield* Effect.promise(() =>
+        Promise.all([writeFile(first, "first"), writeFile(second, "second"), writeFile(outside, "outside")]),
+      )
+      yield* Effect.promise(() => symlink(outside, linked))
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const grep = { pattern: "first", path: first }
+      yield* reviewerAsk(
+        externalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, grep, "file"),
+      )
+      yield* reviewerAsk(
+        genericExternalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, grep, "file"),
+      )
+
+      const staysHuman = (request: Parameters<Permission.Interface["ask"]>[0]) =>
+        Effect.gen(function* () {
+          const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+          expect(yield* waitForPending(1)).toHaveLength(1)
+          yield* rejectAll()
+          expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+        })
+      const directoryGrep = { pattern: "first|second", path: external, include: "*.log" }
+      yield* staysHuman(
+        externalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, directoryGrep),
+      )
+      yield* staysHuman(
+        genericExternalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, directoryGrep),
+      )
+      const glob = { pattern: "*.log", path: external }
+      yield* staysHuman(externalGlobRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, glob))
+      yield* staysHuman(
+        genericExternalGlobRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, glob),
+      )
+      yield* reviewerAsk(
+        externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, second),
+      )
+      yield* reviewerAsk(
+        genericReadRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, second, true),
+      )
+      expect(yield* list()).toHaveLength(0)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(7)
+
+      const deniedRequest = externalReadScopeRequest(
+        seeded.child.id,
+        seeded.childAssistantID,
+        seeded.child.directory,
+        second,
+      )
+      expect(
+        yield* fail(
+          reviewerAsk({
+            ...deniedRequest,
+            ruleset: [{ permission: "external_directory", pattern: "*", action: "deny" }],
+          }),
+        ),
+      ).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(
+        yield* fail(
+          reviewerAsk({
+            ...genericReadRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, second, true),
+            ruleset: [{ permission: "read", pattern: "*", action: "deny" }],
+          }),
+        ),
+      ).toBeInstanceOf(PermissionV1.DeniedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider failure")
+        },
+      })
+      const outsideAsk = yield* reviewerAsk(
+        externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, outside),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(outsideAsk))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const linkedAsk = yield* reviewerAsk(
+        externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, linked),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(linkedAsk))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const parentEscape = `${external}/../${path.basename(sibling)}/outside.log`
+      const escapedAsk = yield* reviewerAsk(
+        externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, parentEscape),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(escapedAsk))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const unrelatedTurn = yield* captureTrustedPersistedTurn({
+        sessionID: seeded.root.id,
+        rootSessionID: seeded.root.id,
+      })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider failure")
+        },
+      })
+      const unrelated = yield* reviewerAsk(
+        externalReadScopeRequest(seeded.root.id, unrelatedTurn, seeded.root.directory, second),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(unrelated))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"readScopeCode":"read_scope_minted"')
+      expect(logs).toContain('"readScopeCode":"read_scope_reused"')
+      expect(logs).not.toContain(external)
+      expect(logs).not.toContain(sibling)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "generic reviewer - plugin ask remains authoritative when an external read scope matches",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Scoped plugin precedence" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      const filePath = path.join(external, "file.txt")
+      yield* Effect.promise(() => writeFile(filePath, "content"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, filePath))
+      const repeated = yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, filePath)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(repeated))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer(
+    { mode: "enforce", automatic_allow: "policy-gated" },
+    [
+      "let externalCount = 0",
+      "export default async () => ({",
+      '  "permission.ask": async (input, output) => {',
+      '    if (input.permission !== "external_directory") return',
+      "    externalCount += 1",
+      '    output.status = externalCount === 1 ? "allow" : "ask"',
+      "  },",
+      "})",
+      "",
+    ].join("\n"),
+  ),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - deleting or omitting the authorised Task edge fails to human",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const db = yield* Database.Service
+      const permission = yield* Permission.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* db.db.run(sql`DELETE FROM part WHERE id = ${seeded.taskPartID}`)
+      const deleted = yield* reviewerAsk(
+        genericGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, {
+          pattern: "flight",
+          path: seeded.child.directory,
+        }),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(deleted))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      const forged = yield* sessions.create({
+        parentID: seeded.root.id,
+        title: "forged child",
+        agent: "Cat",
+      })
+      const forgedTurnID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: forgedTurnID,
+        sessionID: forged.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "Cat",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      })
+      yield* permission.captureTurn({
+        sessionID: forged.id,
+        rootSessionID: seeded.root.id,
+        turnID: forgedTurnID,
+        trusted: [],
+        untrusted: [{ source: "child_prompt", text: "forged" }],
+        complete: true,
+        contextSafeForGate: true,
+      })
+      const forgedAsk = yield* reviewerAsk(genericGlobRequest(forged.id, forgedTurnID, forged.directory)).pipe(
+        Effect.forkScoped,
+      )
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(forgedAsk))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - persisted Task authority survives an instance reload",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const store = yield* InstanceStore.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+
+      yield* store.reload({ directory: test.directory })
+      yield* store.provide(
+        { directory: test.directory },
+        Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          yield* permission.captureTurn({
+            sessionID: seeded.child.id,
+            rootSessionID: seeded.root.id,
+            turnID: seeded.childTurnID,
+            trusted: [],
+            untrusted: [{ source: "child_prompt", text: "Inspect read-only" }],
+            complete: true,
+            contextSafeForGate: true,
+          })
+          reviewerLanguage = new MockLanguageModelV3({
+            doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+          })
+          yield* reviewerAsk(
+            genericGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, {
+              pattern: "flight|log",
+              path: path.join(seeded.child.directory, "assets"),
+              include: "*.ts",
+            }),
+          )
+          expect(yield* list()).toHaveLength(0)
+        }),
+      )
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - Task part revocation while Luna runs cannot allow or mint read scope",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const external = yield* tmpdirScoped()
+      const target = path.join(external, "flight.txt")
+      yield* Effect.promise(() => writeFile(target, "flight log"))
+      const delayed = delayedObviousAllow()
+      const fiber = yield* reviewerAsk(
+        externalGrepRequest(
+          seeded.child.id,
+          seeded.childAssistantID,
+          seeded.child.directory,
+          {
+            pattern: "flight|log",
+            path: target,
+          },
+          "file",
+        ),
+      ).pipe(Effect.forkScoped)
+
+      yield* Effect.promise(() => delayed.started)
+      const part = yield* sessions.getPart({
+        sessionID: seeded.root.id,
+        messageID: seeded.taskMessageID,
+        partID: seeded.taskPartID,
+      })
+      if (!part || part.type !== "tool" || !("metadata" in part.state)) throw new Error("expected Task part")
+      yield* sessions.updatePart({
+        ...part,
+        state: {
+          ...part.state,
+          metadata: { ...part.state.metadata, sessionId: SessionID.make("ses_revoked") },
+        },
+      })
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain("read_scope_minted")
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - delegation edge deletion while Luna runs cannot automatically allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const database = yield* Database.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const delayed = delayedObviousAllow()
+      const fiber = yield* reviewerAsk(
+        genericGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, {
+          pattern: "flight|log",
+          path: path.join(seeded.child.directory, "assets"),
+          include: "*.ts",
+        }),
+      ).pipe(Effect.forkScoped)
+
+      yield* Effect.promise(() => delayed.started)
+      yield* database.db
+        .delete(PermissionReviewDelegationTable)
+        .where(eq(PermissionReviewDelegationTable.child_turn_id, seeded.childTurnID))
+        .run()
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "generic reviewer - direct root admission deletion while Luna runs cannot automatically allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "Revoked direct authority" })
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID: root.id, rootSessionID: root.id })
+      const delayed = delayedObviousAllow()
+      const fiber = yield* reviewerAsk(genericGlobRequest(root.id, turnID, test.directory)).pipe(Effect.forkScoped)
+
+      yield* Effect.promise(() => delayed.started)
+      yield* sessions.removeMessage({ sessionID: root.id, messageID: turnID })
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "generic reviewer - direct root admission mutation while Luna runs cannot automatically allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "Mutated direct authority" })
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID: root.id, rootSessionID: root.id })
+      const delayed = delayedObviousAllow()
+      const fiber = yield* reviewerAsk(genericGlobRequest(root.id, turnID, test.directory)).pipe(Effect.forkScoped)
+
+      yield* Effect.promise(() => delayed.started)
+      const messages = yield* sessions.messages({ sessionID: root.id })
+      const turn = messages.find((message) => message.info.id === turnID)?.info
+      if (!turn || turn.role !== "user") throw new Error("expected admitted root turn")
+      yield* sessions.updateMessage({
+        ...turn,
+        permissionReview: {
+          admission: buildPermissionReviewAdmission([{ type: "text", text: "A different human request" }]),
+        },
+      })
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "generic reviewer - a new active turn while Luna runs cannot authorise the older action",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const root = yield* sessions.create({ title: "Superseded direct authority" })
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID: root.id, rootSessionID: root.id })
+      const delayed = delayedObviousAllow()
+      const fiber = yield* reviewerAsk(genericGlobRequest(root.id, turnID, test.directory)).pipe(Effect.forkScoped)
+
+      yield* Effect.promise(() => delayed.started)
+      yield* captureTrustedPersistedTurn({ sessionID: root.id, rootSessionID: root.id })
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - authority deletion during matching read-scope reuse falls to human",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const database = yield* Database.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const external = yield* tmpdirScoped()
+      const target = path.join(external, "flight.txt")
+      yield* Effect.promise(() => writeFile(target, "flight log"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const request = externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, target)
+      yield* reviewerAsk(request)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+
+      const reuse = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+      yield* Effect.sleep("75 millis")
+      yield* database.db
+        .delete(PermissionReviewDelegationTable)
+        .where(eq(PermissionReviewDelegationTable.child_turn_id, seeded.childTurnID))
+        .run()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(reuse))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer(
+    { mode: "enforce", automatic_allow: "policy-gated" },
+    permissionHook('    await new Promise((resolve) => setTimeout(resolve, 250))\n    output.status = "allow"'),
+  ),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - nested authorised Tasks retain only the root admission",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const grandchild = yield* sessions.create({ parentID: seeded.child.id, title: "Mark child", agent: "Mark" })
+      const taskMessageID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: taskMessageID,
+        role: "assistant",
+        parentID: seeded.childTurnID,
+        sessionID: seeded.child.id,
+        mode: "build",
+        agent: "Cat",
+        cost: 0,
+        path: { cwd: seeded.child.directory, root: seeded.child.directory },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: Date.now(), completed: Date.now() },
+        finish: "tool-calls",
+      })
+      const taskPartID = PartID.ascending()
+      const taskCallID = `call_${taskPartID}`
+      yield* sessions.updatePart({
+        id: taskPartID,
+        messageID: taskMessageID,
+        sessionID: seeded.child.id,
+        type: "tool",
+        callID: taskCallID,
+        tool: "task",
+        state: {
+          status: "completed",
+          input: { description: "Inspect nested", prompt: "Inspect nested read-only", subagent_type: "Mark" },
+          output: "delegated",
+          title: "Inspect nested",
+          metadata: { parentSessionId: seeded.child.id, sessionId: grandchild.id },
+          time: { start: Date.now(), end: Date.now() },
+        },
+      })
+      const receipt = yield* permission.authoriseTaskDelegation({
+        sessionID: seeded.child.id,
+        messageID: taskMessageID,
+        callID: taskCallID,
+        childAgent: "Mark",
+      })
+      expect(receipt).toBeTruthy()
+      if (!receipt) throw new Error("expected nested delegation receipt")
+      const turnID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: turnID,
+        sessionID: grandchild.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "Mark",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      })
+      yield* permission.captureTaskDelegation({ receipt, childSessionID: grandchild.id, childTurnID: turnID })
+      yield* permission.captureTurn({
+        sessionID: grandchild.id,
+        rootSessionID: seeded.root.id,
+        turnID,
+        trusted: [],
+        untrusted: [{ source: "child_prompt", text: "Inspect nested read-only" }],
+        complete: true,
+        contextSafeForGate: true,
+      })
+      const assistantID = MessageID.ascending()
+      yield* sessions.updateMessage({
+        id: assistantID,
+        role: "assistant",
+        parentID: turnID,
+        sessionID: grandchild.id,
+        mode: "build",
+        agent: "Mark",
+        cost: 0,
+        path: { cwd: grandchild.directory, root: grandchild.directory },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: Date.now() },
+      })
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      yield* reviewerAsk(
+        genericGrepRequest(grandchild.id, assistantID, grandchild.directory, {
+          pattern: "flight|log",
+          path: path.join(grandchild.directory, "assets"),
+          include: "*.ts",
+        }),
+      )
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).not.toContain("Inspect nested read-only")
+      expect(logs).not.toContain("Inspect the flight log code read-only")
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
 )
 
 it.instance(
@@ -3797,6 +5366,51 @@ it.instance(
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
   15_000,
+)
+
+it.instance(
+  "generic reviewer - custom Read, Glob, and Grep name collisions remain human-gated",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Custom search collisions" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      for (const [permissionName, arguments_] of [
+        ["glob", { pattern: "**/*{flight,Flight,log,Log}*", path: test.directory }],
+        ["grep", { pattern: "Import|Export|OCR", path: test.directory, include: "*.{html,twig}" }],
+        ["read", { filePath: path.join(test.directory, "README.md") }],
+      ] as const) {
+        const action = resolveReviewAction({
+          builtin: false,
+          permission: permissionName,
+          permissionMetadata: {},
+          identity: permissionName,
+          arguments: arguments_,
+          directory: test.directory,
+        })
+        expect(action.complete).toBe(false)
+        const fiber = yield* reviewerAsk({
+          sessionID,
+          tool: { messageID: turnID, callID: `call_custom_${permissionName}` },
+          permission: permissionName,
+          patterns: ["*"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+          review: { origin: "tool", action },
+        }).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+      }
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
 )
 
 it.instance(
@@ -3836,6 +5450,11 @@ it.instance(
       expect(yield* waitForPending(1)).toHaveLength(1)
       yield* rejectAll()
       expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+      const candidateLogs = (yield* TestConsole.logLines).filter(
+        (line): line is Record<string, unknown> => !!line && typeof line === "object" && "candidateRejection" in line,
+      )
+      expect(candidateLogs.some((line) => line.candidateRejection === "contract_unknown")).toBe(true)
+      expect(JSON.stringify(candidateLogs)).not.toContain(test.directory)
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
   15_000,
@@ -3878,7 +5497,9 @@ it.instance(
         doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
       })
 
-      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      const fiber = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory, false)).pipe(
+        Effect.forkScoped,
+      )
       expect(yield* waitForPending(1)).toHaveLength(1)
       yield* rejectAll()
       expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
@@ -3935,17 +5556,24 @@ it.instance(
       const sessions = yield* Session.Service
       const sessionID = (yield* sessions.create({ title: "External read allow" })).id
       const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const allowedDirectory = yield* tmpdirScoped()
+      const rewriteDirectory = yield* tmpdirScoped()
+      const allowedFile = path.join(allowedDirectory, "allowed.json")
+      const rewriteFile = path.join(rewriteDirectory, "rewrite.json")
+      yield* Effect.promise(() => Promise.all([writeFile(allowedFile, "{}"), writeFile(rewriteFile, "{}")]))
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
-      yield* reviewerAsk(externalReadRequest(sessionID, turnID, test.directory))
+      yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, allowedFile))
       expect(yield* list()).toHaveLength(0)
       expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
 
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
       })
-      const fiber = yield* reviewerAsk(externalReadRequest(sessionID, turnID, test.directory)).pipe(Effect.forkScoped)
+      const fiber = yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, rewriteFile)).pipe(
+        Effect.forkScoped,
+      )
       expect(yield* waitForPending(1)).toHaveLength(1)
       yield* rejectAll()
       yield* Fiber.await(fiber)
@@ -4017,7 +5645,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
-      yield* reviewerAsk(bashRequest("session_obvious_allow", test.directory))
+      yield* reviewerAsk(yield* admittedBashRequest(test.directory, "Obvious allow admission"))
       expect(yield* list()).toHaveLength(0)
       const logs = JSON.stringify(yield* TestConsole.logLines)
       expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
@@ -4034,7 +5662,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("allow", "destructive_or_irreversible", "none"),
       })
-      yield* reviewerAsk(bashRequest("session_exceptional_allow", test.directory))
+      yield* reviewerAsk(yield* admittedBashRequest(test.directory, "Exceptional allow admission"))
       expect(yield* list()).toHaveLength(0)
       expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
     }),
@@ -4131,7 +5759,7 @@ it.instance(
       })
 
       const turnID = yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
-      const first = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory)))
+      const first = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)))
       expect(first).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
       if (first instanceof PermissionV1.PolicyCorrectionError) {
         expect(first.feedback).toBe("Narrow the action to the smallest necessary target.")
@@ -4157,14 +5785,14 @@ it.instance(
       expect(Object.keys(marker ?? {}).sort()).toEqual(["session_id", "time_created", "turn_id"])
 
       yield* recapturePersistedTurn({ sessionID, rootSessionID: sessionID, turnID })
-      const second = yield* reviewerAsk(bashRequest(sessionID, test.directory)).pipe(Effect.forkScoped)
+      const second = yield* reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(Effect.forkScoped)
       expect(yield* waitForPending(1)).toHaveLength(1)
       expect(asked).toBe(1)
       yield* rejectAll()
       yield* Fiber.await(second)
 
-      yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
-      const third = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory)))
+      const thirdTurnID = yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
+      const third = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory, true, thirdTurnID)))
       expect(third).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
       expect(yield* list()).toHaveLength(0)
       expect(asked).toBe(1)
@@ -4184,7 +5812,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: () => Promise.resolve(obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target")),
       })
-      expect(yield* fail(reviewerAsk(bashRequest(sessionID, test.directory)))).toBeInstanceOf(
+      expect(yield* fail(reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)))).toBeInstanceOf(
         PermissionV1.PolicyCorrectionError,
       )
 
@@ -4194,7 +5822,7 @@ it.instance(
       }
 
       yield* recapturePersistedTurn({ sessionID, rootSessionID: sessionID, turnID })
-      const retry = yield* reviewerAsk(bashRequest(sessionID, test.directory)).pipe(Effect.forkScoped)
+      const retry = yield* reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(Effect.forkScoped)
       expect(yield* waitForPending(1)).toHaveLength(1)
       yield* rejectAll()
       expect(yield* fail(Fiber.join(retry))).toBeInstanceOf(PermissionV1.RejectedError)
@@ -4215,7 +5843,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: () => Promise.resolve(obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target")),
       })
-      expect(yield* fail(reviewerAsk(bashRequest(sessionID, test.directory)))).toBeInstanceOf(
+      expect(yield* fail(reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)))).toBeInstanceOf(
         PermissionV1.PolicyCorrectionError,
       )
 
@@ -4224,7 +5852,7 @@ it.instance(
         { directory: test.directory },
         Effect.gen(function* () {
           yield* recapturePersistedTurn({ sessionID, rootSessionID: sessionID, turnID })
-          const retry = yield* reviewerAsk(bashRequest(sessionID, test.directory)).pipe(Effect.forkScoped)
+          const retry = yield* reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(Effect.forkScoped)
           expect(yield* waitForPending(1)).toHaveLength(1)
           yield* rejectAll()
           expect(yield* fail(Fiber.join(retry))).toBeInstanceOf(PermissionV1.RejectedError)
@@ -4243,7 +5871,7 @@ it.instance(
       const sessions = yield* Session.Service
       const { db } = yield* Database.Service
       const sessionID = (yield* sessions.create({ title: "Failed rewrite persistence" })).id
-      yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
+      const turnID = yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
       reviewerLanguage = new MockLanguageModelV3({
         doStream: () => Promise.resolve(obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target")),
       })
@@ -4307,14 +5935,14 @@ it.instance(
       const test = yield* TestInstance
       const sessions = yield* Session.Service
       const sessionID = (yield* sessions.create({ title: "Concurrent rewrite admission" })).id
-      yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
+      const turnID = yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
       reviewerLanguage = new MockLanguageModelV3({
         doStream: () => Promise.resolve(obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target")),
       })
       const fibers = yield* Effect.all(
         [
-          reviewerAsk(bashRequest(sessionID, test.directory)).pipe(Effect.forkScoped),
-          reviewerAsk(bashRequest(sessionID, test.directory)).pipe(Effect.forkScoped),
+          reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(Effect.forkScoped),
+          reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(Effect.forkScoped),
         ],
         { concurrency: "unbounded" },
       )
@@ -4377,7 +6005,7 @@ it.instance(
       const test = yield* TestInstance
       const sessions = yield* Session.Service
       const sessionID = (yield* sessions.create({ title: "Interrupted rewrite audit" })).id
-      yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
+      const turnID = yield* capturePersistedTurn({ sessionID, rootSessionID: sessionID, direct: true })
       reviewerLanguage = new MockLanguageModelV3({
         doStream: () => Promise.resolve(obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target")),
       })
@@ -4391,7 +6019,7 @@ it.instance(
         }),
       ])
 
-      const first = yield* reviewerAsk(bashRequest(sessionID, test.directory)).pipe(
+      const first = yield* reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)).pipe(
         Effect.provide(interruptingAudit),
         Effect.forkScoped,
       )
@@ -4399,7 +6027,7 @@ it.instance(
       expect(Exit.isFailure(firstExit) && Cause.hasInterrupts(firstExit.cause)).toBe(true)
       expect(interrupted).toBe(true)
 
-      const second = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory)))
+      const second = yield* fail(reviewerAsk(bashRequest(sessionID, test.directory, true, turnID)))
       expect(second).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
       expect(yield* list()).toHaveLength(0)
     }),
@@ -4791,7 +6419,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
-      yield* reviewerAsk(bashRequest("session_evaluator_obvious_noop", test.directory))
+      yield* reviewerAsk(yield* admittedBashRequest(test.directory, "Evaluator noop admission"))
       expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
       expect(yield* list()).toHaveLength(0)
     }),

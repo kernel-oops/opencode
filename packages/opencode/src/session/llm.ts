@@ -114,6 +114,7 @@ const live: Layer.Layer<
       if (prepared.permissionReviewPluginSystem) {
         yield* perm.captureUntrusted({
           sessionID: input.sessionID,
+          turnID: input.user.id,
           evidence: [{ source: "plugin", text: prepared.permissionReviewPluginSystem }],
         })
       }

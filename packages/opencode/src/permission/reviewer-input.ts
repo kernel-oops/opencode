@@ -82,7 +82,7 @@ export function transcriptEvidence(
   let complete = !child && includeAdmission && provenanceKnown
   let admitted = 0
   for (const message of messages) {
-    if (message.info.summary) complete = false
+    if (message.info.role === "assistant" && message.info.summary) complete = false
     if (message.info.role === "user") {
       const record = message.info.permissionReview?.admission
       if (!child && includeAdmission && provenanceKnown && validPermissionReviewAdmission(record)) {
@@ -122,6 +122,36 @@ export function transcriptEvidence(
   }
   if (includeAdmission && admitted === 0) complete = false
   return { items, complete }
+}
+
+export function childTranscriptEvidence(messages: readonly SessionV1.WithParts[], sessionID: string) {
+  const result = transcriptEvidence(messages, true, false, sessionID)
+  let complete = messages.length > 0
+  const seen = new Set<string>()
+  for (const [index, message] of messages.entries()) {
+    const previous = messages[index - 1]
+    if (
+      message.info.sessionID !== sessionID ||
+      seen.has(message.info.id) ||
+      (previous !== undefined &&
+        (message.info.time.created < previous.info.time.created ||
+          (message.info.time.created === previous.info.time.created && message.info.id <= previous.info.id)))
+    )
+      complete = false
+    seen.add(message.info.id)
+    if (message.info.role === "assistant" && message.info.summary) complete = false
+    if (message.info.role === "user") {
+      if (message.info.permissionReview !== undefined) complete = false
+      if (message.parts.some((part) => part.type !== "text")) complete = false
+    }
+    if (
+      message.parts.some(
+        (part) => part.type === "tool" && (part.state.status === "pending" || part.state.status === "running"),
+      )
+    )
+      complete = false
+  }
+  return { items: result.items, complete }
 }
 
 type Redacted = { text: string; complete: boolean; omitted: number }
