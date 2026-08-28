@@ -97,6 +97,7 @@ export const GrepTool = Tool.define(
           yield* assertExternalDirectoryEffect(ctx, search, {
             bypass: false,
             kind: requestedInfo?.type === "Directory" ? "directory" : "file",
+            tool: "grep",
           })
           const cwd = requestedInfo?.type === "Directory" ? search : path.dirname(search)
 

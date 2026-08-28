@@ -74,6 +74,12 @@ function exactKeys(value: Record<string, unknown>, keys: string[]) {
   )
 }
 
+function metadataTool(value: unknown) {
+  if (!record(value)) return
+  const descriptor = Object.getOwnPropertyDescriptor(value, "tool")
+  return descriptor && "value" in descriptor && typeof descriptor.value === "string" ? descriptor.value : undefined
+}
+
 function projectTextFileArguments(input: Record<string, unknown>) {
   if (
     !exactKeys(input, [
@@ -226,15 +232,27 @@ function requestedActionComplete(
 export function resolveReviewAction(input: {
   readonly builtin: boolean
   readonly permission?: string
+  readonly permissionMetadata?: Record<string, unknown>
   readonly identity: string
   readonly arguments: unknown
   readonly directory: string
   readonly requested?: PermissionV1.ReviewAction
 }): PermissionV1.ReviewAction {
   if (!input.builtin) return { identity: input.identity, arguments: input.arguments, complete: false }
+  const externalIdentity =
+    input.permission === "external_directory" ? metadataTool(input.permissionMetadata) : undefined
+  const externalContractExpected =
+    input.permission === "external_directory" && Object.hasOwn(externalDirectoryContracts, input.identity)
+  const contractIdentity = input.permission === "external_directory" ? externalIdentity : input.identity
   const contract =
-    input.permission === "external_directory" ? externalDirectoryContracts[input.identity] : contracts[input.identity]
+    contractIdentity === input.identity
+      ? input.permission === "external_directory"
+        ? externalDirectoryContracts[contractIdentity]
+        : contracts[contractIdentity]
+      : undefined
   if (input.requested) {
+    if (externalContractExpected && !contract)
+      return { identity: input.identity, arguments: input.arguments, complete: false }
     if (
       contract &&
       (!record(input.requested) || !exactKeys(input.requested, ["arguments", "complete", "cwd", "identity"]))

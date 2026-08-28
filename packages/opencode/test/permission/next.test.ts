@@ -38,6 +38,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Database } from "@opencode-ai/core/database/database"
 import { PermissionReviewCorrectionTable } from "@opencode-ai/core/session/sql"
+import { resolveReviewAction } from "../../src/permission/generic-review-action"
 import { and, eq } from "drizzle-orm"
 import { auditCorrelationKey } from "../../src/permission/audit-correlation"
 import { PermissionReviewer } from "../../src/permission/reviewer"
@@ -349,28 +350,30 @@ const genericFallbackRequest = (sessionID: SessionID, turnID: MessageID, directo
   },
 })
 
-const externalReadRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => ({
-  sessionID,
-  tool: { messageID: turnID, callID: `call_${sessionID}` },
-  permission: "external_directory",
-  patterns: ["/tmp/external/*"],
-  metadata: { filepath: "/tmp/external/package.json", parentDir: "/tmp/external" },
-  always: [],
-  ruleset: [],
-  review: {
-    origin: "tool" as const,
-    action: {
-      identity: "read",
-      arguments: {
-        contract: "registered-builtin-invocation-v1",
-        effects_bound: false,
-        invocation: { filePath: "/tmp/external/package.json", offset: 1, limit: 40 },
-      },
-      cwd: directory,
-      complete: true,
+const externalReadRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
+  const arguments_ = { filePath: "/tmp/external/package.json", offset: 1, limit: 40 }
+  const metadata = { filepath: "/tmp/external/package.json", parentDir: "/tmp/external", tool: "read" }
+  return {
+    sessionID,
+    tool: { messageID: turnID, callID: `call_${sessionID}` },
+    permission: "external_directory",
+    patterns: ["/tmp/external/*"],
+    metadata,
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "external_directory",
+        permissionMetadata: metadata,
+        identity: "read",
+        arguments: arguments_,
+        directory,
+      }),
     },
-  },
-})
+  }
+}
 
 const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, directory: string) => {
   const pattern = "Calendar apps choose when to refresh|refreshes every 6 hours|PUBLISHED-TTL|REFRESH-INTERVAL"

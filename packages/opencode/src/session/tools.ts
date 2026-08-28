@@ -102,6 +102,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             action: resolveReviewAction({
               builtin,
               permission: req.permission,
+              permissionMetadata: req.metadata,
               identity: toolID,
               arguments: args,
               directory: input.session.directory,
