@@ -383,6 +383,7 @@ describe("generic built-in risk allow gate", () => {
       const action = resolveReviewAction({
         builtin: true,
         permission: "external_directory",
+        permissionMetadata: { tool: identity },
         identity,
         arguments: invocation,
         directory: "/tmp/project",
@@ -408,6 +409,32 @@ describe("generic built-in risk allow gate", () => {
       expect(
         isGenericRiskCandidate({ settled: true, permission: "external_directory", assessment, snapshot: built }),
       ).toBe(false)
+
+      const inherited = Object.create({ tool: identity }) as Record<string, unknown>
+      const accessor = Object.defineProperty({}, "tool", { get: () => identity }) as Record<string, unknown>
+      for (const permissionMetadata of [undefined, {}, { tool: "other" }, { tool: 1 }, inherited, accessor]) {
+        expect(
+          resolveReviewAction({
+            builtin: true,
+            permission: "external_directory",
+            permissionMetadata,
+            identity,
+            arguments: invocation,
+            directory: "/tmp/project",
+          }),
+        ).toEqual({ identity, arguments: invocation, complete: false })
+        expect(
+          resolveReviewAction({
+            builtin: true,
+            permission: "external_directory",
+            permissionMetadata,
+            identity,
+            arguments: invocation,
+            directory: "/tmp/project",
+            requested: action,
+          }),
+        ).toEqual({ identity, arguments: invocation, complete: false })
+      }
     }
 
     const bashAction = {

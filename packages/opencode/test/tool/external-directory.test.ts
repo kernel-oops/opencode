@@ -69,12 +69,13 @@ describe("tool.assertExternalDirectory", () => {
       const target = path.join(path.dirname(test.directory), "outside", "file.txt")
       const expected = glob(path.join(path.dirname(target), "*"))
 
-      yield* assertExternalDirectoryEffect(ctx, target)
+      yield* assertExternalDirectoryEffect(ctx, target, { tool: "read" })
 
       const req = requests.find((r) => r.permission === "external_directory")
       expect(req).toBeDefined()
       expect(req!.patterns).toEqual([expected])
       expect(req!.always).toEqual([expected])
+      expect(req!.metadata).toEqual({ filepath: target, parentDir: path.dirname(target), tool: "read" })
     }),
   )
 
@@ -92,6 +93,7 @@ describe("tool.assertExternalDirectory", () => {
       expect(req).toBeDefined()
       expect(req!.patterns).toEqual([expected])
       expect(req!.always).toEqual([expected])
+      expect(Object.hasOwn(req!.metadata, "tool")).toBe(false)
     }),
   )
 
