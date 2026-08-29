@@ -750,6 +750,8 @@ const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, dire
 const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn")(function* (input: {
   sessionID: SessionID
   rootSessionID: SessionID
+  untrustedComplete?: boolean
+  contextSafeForGate?: boolean
 }) {
   const sessions = yield* Session.Service
   const permission = yield* Permission.Service
@@ -772,7 +774,9 @@ const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn"
     turnID,
     trusted: [{ source: "human", text: "Find Markdown files" }],
     untrusted: [],
-    contextSafeForGate: true,
+    trustedComplete: true,
+    untrustedComplete: input.untrustedComplete,
+    contextSafeForGate: input.contextSafeForGate ?? true,
   })
   return turnID
 })
@@ -1013,6 +1017,7 @@ const withObviousReviewer = (
     policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
     automatic_allow?: "never" | "policy-gated"
     automatic_rewrite?: "never" | "once-per-turn"
+    bashEvaluator?: "disabled"
     agents?: Record<string, { description: string; mode: "subagent" }>
   },
   ...sources: string[]
@@ -1039,6 +1044,7 @@ const withObviousReviewer = (
             automatic_allow: input.automatic_allow ?? "never",
             automatic_rewrite: input.automatic_rewrite ?? "never",
           },
+          ...(input.bashEvaluator ? { bash_permission_evaluator: { mode: input.bashEvaluator } } : {}),
           ...(input.agents ? { agent: input.agents } : {}),
         }),
       )
@@ -5651,6 +5657,120 @@ it.instance(
       expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - a lossy historical summary does not revoke the current admitted turn",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const sessionID = (yield* sessions.create({ title: "Compacted session admission" })).id
+      const turnID = yield* captureTrustedPersistedTurn({
+        sessionID,
+        rootSessionID: sessionID,
+        untrustedComplete: false,
+      })
+
+      const request = bashRequest(sessionID, test.directory, true, turnID)
+      request.patterns[0] = "printf test | cat"
+      request.review.action.arguments.command = "printf test | cat"
+      yield* reviewerAsk(request)
+
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - bounded captured evidence stays untrusted without revoking the admitted turn",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const permission = yield* Permission.Service
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const sessionID = (yield* sessions.create({ title: "Bounded evidence admission" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      yield* permission.captureUntrusted({
+        sessionID,
+        turnID,
+        evidence: [{ source: "plugin", text: "untrusted-history-".repeat(1_024) }],
+      })
+
+      const request = bashRequest(sessionID, test.directory, true, turnID)
+      request.patterns[0] = "printf test | cat"
+      request.review.action.arguments.command = "printf test | cat"
+      yield* reviewerAsk(request)
+
+      expect(yield* list()).toHaveLength(0)
+      const prompt = reviewerLanguage.doStreamCalls[0]?.prompt.find((message) => message.role === "user")
+      const content = prompt?.content
+      const text =
+        typeof content === "string" ? content : content?.find((part) => part.type === "text" && "text" in part)?.text
+      const serialised = text?.match(/<permission-request>\n([\s\S]*)\n<\/permission-request>/)?.[1]
+      expect(serialised).toBeDefined()
+      const snapshot = JSON.parse(serialised!)
+      expect(snapshot.context_safe_for_gate).toBe(true)
+      expect(snapshot.untrusted.complete).toBe(false)
+      expect(snapshot.complete).toBe(false)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - an unsafe current turn still fails to human with an audit reason",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const sessionID = (yield* sessions.create({ title: "Unsafe current turn" })).id
+      const turnID = yield* captureTrustedPersistedTurn({
+        sessionID,
+        rootSessionID: sessionID,
+        untrustedComplete: false,
+        contextSafeForGate: false,
+      })
+      const request = bashRequest(sessionID, test.directory, true, turnID)
+      request.patterns[0] = "printf test | cat"
+      request.review.action.arguments.command = "printf test | cat"
+      const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"candidateRejection":"context_unsafe"')
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
   15_000,
 )
 

@@ -51,6 +51,8 @@ export interface Interface {
     trusted: readonly EvidenceInput[]
     untrusted: readonly EvidenceInput[]
     complete?: boolean
+    trustedComplete?: boolean
+    untrustedComplete?: boolean
     contextSafeForGate?: boolean
   }) => Effect.Effect<void>
   readonly captureUntrusted: (input: {
@@ -803,6 +805,8 @@ const layer = Layer.effect(
           : undefined
       const trusted = boundedTrustedEvidence(delegated?.trusted ?? directTrusted ?? input.trusted)
       const authorityComplete = directPromptAdmission || delegated !== undefined
+      const trustedInputComplete = input.trustedComplete ?? input.complete ?? true
+      const untrustedInputComplete = input.untrustedComplete ?? input.complete ?? true
       const effectiveRootSessionID = delegated?.rootSessionID ?? input.rootSessionID
       const key = turnKey(input.sessionID, input.turnID)
       const previous = current.turns.get(key)
@@ -827,10 +831,11 @@ const layer = Layer.effect(
             : directPromptAdmission
               ? rewrite
               : { status: "used" },
-        trustedComplete: authorityComplete && (input.complete ?? true) && trusted.complete,
-        untrustedComplete: (input.complete ?? true) && untrusted.complete,
-        contextSafeForGate:
-          authorityComplete && input.contextSafeForGate === true && trusted.complete && untrusted.complete,
+        trustedComplete: authorityComplete && trustedInputComplete && trusted.complete,
+        untrustedComplete: untrustedInputComplete && untrusted.complete,
+        // Untrusted evidence may be explicitly lossy after compaction or bounding. Keep that fact in
+        // untrustedComplete for the reviewer, but do not let it revoke a complete persisted human admission.
+        contextSafeForGate: authorityComplete && input.contextSafeForGate === true && trusted.complete,
       })
       remember(current.activeTurns, input.sessionID, key)
     })
@@ -892,7 +897,7 @@ const layer = Layer.effect(
         ...turn,
         untrusted: untrusted.items,
         untrustedComplete: turn.untrustedComplete && untrusted.complete,
-        contextSafeForGate: turn.contextSafeForGate && untrusted.complete,
+        contextSafeForGate: turn.contextSafeForGate,
       })
     })
 
@@ -1609,7 +1614,9 @@ const layer = Layer.effect(
           })
         )
           return rejectAuthority("authority_evidence_changed")
-        return active.contextSafeForGate && active.trustedComplete
+        if (!active.contextSafeForGate) return rejectAuthority("context_unsafe")
+        if (!active.trustedComplete) return rejectAuthority("trusted_evidence_incomplete")
+        return true
       })
       const safelyRevalidateAuthority = () =>
         revalidateAuthority().pipe(
