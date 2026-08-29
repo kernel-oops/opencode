@@ -45,6 +45,7 @@ readonly PATCH_BRANCHES=(
   "external-directory-fallback"
   "external-directory-metadata-fix"
   "delegated-permission-review"
+  "compacted-session-authority"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -70,6 +71,7 @@ readonly PATCH_IDS=(
   "5aa74c246326cea2b48856b97994968200b3660a"
   "3a63934effab579a4984688124337a82c65f6e0c"
   "d3061405bb2dee4a13d42698624b81a7735e2aef"
+  "80468be8039fc410f261679a1026d8bb972508e1"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -95,6 +97,7 @@ readonly PATCH_TIPS=(
   "976dcae20ad1b39675d2e6d49c7296095d1098f3"
   "ec64ac4416b0a16fa302d781d0fb869b3ae6882c"
   "9007629d448613c939e94dae330edf6b09f81ee8"
+  "19f00c8d7b4f7fdcbc275e62567e02facddf81f3"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
