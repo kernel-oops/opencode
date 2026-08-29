@@ -1320,8 +1320,12 @@ const layer = Layer.effect(
                 ...(skills ? [{ source: "skill" as const, text: skills }] : []),
                 ...(lastUser.system ? [{ source: "plugin" as const, text: lastUser.system }] : []),
               ],
-              complete: reviewLineage.complete && storedTranscript.complete,
-              contextSafeForGate: reviewLineage.complete && storedTranscript.complete,
+              // Compaction and bounding can make historical untrusted evidence explicitly lossy, but they do not
+              // revoke the current persisted human admission. The reviewer still receives untrusted.complete=false
+              // and must assess the exact action under the selected risk policy.
+              trustedComplete: reviewLineage.complete,
+              untrustedComplete: reviewLineage.complete && storedTranscript.complete,
+              contextSafeForGate: reviewLineage.complete,
             })
             const system = [
               ...env,
