@@ -609,6 +609,10 @@ describe("generic built-in risk allow gate", () => {
             canonicalTarget: "/tmp/external/a.ts",
             canonicalRoot: "/tmp/external",
             kind: "file",
+            targetDevice: "1",
+            targetInode: "2",
+            rootDevice: "1",
+            rootInode: "3",
           },
           readBinding: {
             version: 1,
@@ -629,6 +633,10 @@ describe("generic built-in risk allow gate", () => {
             canonicalTarget: "/tmp/external/a.ts",
             canonicalRoot: "/tmp/external",
             kind: "file",
+            targetDevice: "1",
+            targetInode: "2",
+            rootDevice: "1",
+            rootInode: "3",
           },
           searchBinding: {
             version: 1,

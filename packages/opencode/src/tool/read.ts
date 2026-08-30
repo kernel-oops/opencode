@@ -11,6 +11,7 @@ import { Instruction } from "../session/instruction"
 import { isBinaryFile, isReadAttachmentMime, isPdfAttachment, sniffAttachmentMime } from "@/util/media"
 import { bindProjectTextFile, closeBoundProjectTextFile, readBoundProjectTextFile } from "./read-bound-file"
 import { closeBoundExternalTextFile, readBoundExternalTextFile } from "./external-read-bound-file"
+import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -279,7 +280,11 @@ export const ReadTool = Tool.define<
           ),
         )
 
-        const external = yield* assertExternalDirectoryEffect(ctx, filepath, {
+        const canonical = FSUtil.resolve(filepath)
+        const externalTarget = (yield* Effect.promise(() => trustedCanonicalAlias(filepath, canonical)))
+          ? canonical
+          : filepath
+        const external = yield* assertExternalDirectoryEffect(ctx, externalTarget, {
           bindRead: true,
           bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
           kind: stat?.type === "Directory" ? "directory" : "file",
@@ -303,11 +308,18 @@ export const ReadTool = Tool.define<
                 permission: "read",
                 patterns: [path.relative(instance.worktree, filepath)],
                 always: ["*"],
-                metadata: verification && verification.readBinding ? { readBinding: verification.readBinding } : {},
+                metadata:
+                  verification && verification.readBinding && verification.readScope
+                    ? { readBinding: verification.readBinding, readScope: verification.readScope }
+                    : {},
                 action: {
                   identity: "read",
                   arguments: boundArguments ?? input,
-                  cwd: stat?.type === "Directory" ? FSUtil.resolve(filepath) : path.dirname(FSUtil.resolve(filepath)),
+                  cwd: boundArguments
+                    ? path.dirname(path.resolve(filepath))
+                    : stat?.type === "Directory"
+                      ? FSUtil.resolve(filepath)
+                      : path.dirname(FSUtil.resolve(filepath)),
                   complete: Boolean(boundArguments),
                 },
               })

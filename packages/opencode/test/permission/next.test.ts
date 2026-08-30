@@ -32,7 +32,8 @@ import { MockLanguageModelV3 } from "ai/test"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { simulateReadableStream } from "ai"
 import { createHash } from "node:crypto"
-import { chmod, realpath, stat, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises"
+import { statSync } from "node:fs"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { buildPermissionReviewAdmission } from "../../src/permission/admission"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -410,6 +411,21 @@ const genericGrepRequest = (
   },
 })
 
+const externalScopeIdentity = (target: string, root: string) => {
+  try {
+    const targetInfo = statSync(target, { bigint: true })
+    const rootInfo = statSync(root, { bigint: true })
+    return {
+      targetDevice: targetInfo.dev.toString(),
+      targetInode: targetInfo.ino.toString(),
+      rootDevice: rootInfo.dev.toString(),
+      rootInode: rootInfo.ino.toString(),
+    }
+  } catch {
+    return {}
+  }
+}
+
 const externalGrepRequest = (
   sessionID: SessionID,
   messageID: MessageID,
@@ -417,16 +433,19 @@ const externalGrepRequest = (
   input: { pattern: string; path: string; include?: string },
   kind: "directory" | "file" = "directory",
 ) => {
-  const root = kind === "file" ? path.dirname(input.path) : input.path
+  const invocationTarget = kind === "file" && input.include ? path.join(input.path, input.include) : input.path
+  const target = invocationTarget
+  const root = kind === "file" ? path.dirname(target) : target
   const metadata = {
-    filepath: input.path,
+    filepath: target,
     parentDir: root,
     tool: "grep",
     readScope: {
       version: 1,
-      canonicalTarget: input.path,
+      canonicalTarget: target,
       canonicalRoot: root,
       kind,
+      ...externalScopeIdentity(target, root),
     },
     searchBinding: {
       version: 1,
@@ -465,40 +484,43 @@ const genericExternalGrepRequest = (
   directory: string,
   input: { pattern: string; path: string; include?: string },
   kind: "directory" | "file" = "directory",
-) => ({
-  sessionID,
-  tool: { messageID, callID: `grep_${messageID}` },
-  permission: "grep",
-  patterns: [input.pattern],
-  metadata: { pattern: input.pattern, path: input.path },
-  always: [],
-  ruleset: [],
-  review: {
-    origin: "tool" as const,
-    action: resolveReviewAction({
-      builtin: true,
-      permission: "grep",
-      permissionMetadata: { pattern: input.pattern, path: input.path },
-      identity: "grep",
-      arguments: input,
-      directory,
-      requested: {
+) => {
+  const target = kind === "file" && input.include ? path.join(input.path, input.include) : input.path
+  return {
+    sessionID,
+    tool: { messageID, callID: `grep_${messageID}` },
+    permission: "grep",
+    patterns: [input.pattern],
+    metadata: { pattern: input.pattern, path: input.path },
+    always: [],
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: resolveReviewAction({
+        builtin: true,
+        permission: "grep",
+        permissionMetadata: { pattern: input.pattern, path: input.path },
         identity: "grep",
-        arguments: {
-          contract: "pinned-external-search-v1",
-          mode: "bound",
-          kind,
-          executor: kind === "file" ? "ripgrep-inherited-readonly-fd-v1" : "ripgrep-procfd-cwd-v1",
-          bindingId: "11111111111111111111111111111111",
-          invocation: input,
-          effects: [],
+        arguments: input,
+        directory,
+        requested: {
+          identity: "grep",
+          arguments: {
+            contract: "pinned-external-search-v1",
+            mode: "bound",
+            kind,
+            executor: kind === "file" ? "ripgrep-inherited-readonly-fd-v1" : "ripgrep-procfd-cwd-v1",
+            bindingId: "11111111111111111111111111111111",
+            invocation: input,
+            effects: [],
+          },
+          cwd: kind === "file" ? path.dirname(target) : target,
+          complete: true,
         },
-        cwd: kind === "file" ? path.dirname(input.path) : input.path,
-        complete: true,
-      },
-    }),
-  },
-})
+      }),
+    },
+  }
+}
 
 const externalGlobRequest = (
   sessionID: SessionID,
@@ -515,6 +537,7 @@ const externalGlobRequest = (
       canonicalTarget: input.path,
       canonicalRoot: input.path,
       kind: "directory",
+      ...externalScopeIdentity(input.path, input.path),
     },
     searchBinding: {
       version: 1,
@@ -605,6 +628,7 @@ const externalReadScopeRequest = (
       canonicalTarget: filePath,
       canonicalRoot: parentDir,
       kind: "file",
+      ...externalScopeIdentity(filePath, parentDir),
     },
     ...(bound
       ? {
@@ -646,12 +670,20 @@ const genericReadRequest = (
   bound = false,
 ) => {
   const input = { filePath }
+  const parentDir = path.dirname(filePath)
   const metadata = bound
     ? {
         readBinding: {
           version: 1,
           contract: "pinned-external-text-v1",
           bindingId: "00000000000000000000000000000000",
+        },
+        readScope: {
+          version: 1,
+          canonicalTarget: filePath,
+          canonicalRoot: parentDir,
+          kind: "file",
+          ...externalScopeIdentity(filePath, parentDir),
         },
       }
     : {}
@@ -4798,7 +4830,7 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
-      const grep = { pattern: "first", path: first }
+      const grep = { pattern: "first", path: external, include: "first.log" }
       yield* reviewerAsk(
         externalGrepRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, grep, "file"),
       )
@@ -4911,6 +4943,61 @@ it.instance(
       expect(logs).toContain('"readScopeCode":"read_scope_reused"')
       expect(logs).not.toContain(external)
       expect(logs).not.toContain(sibling)
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  30_000,
+)
+
+it.instance(
+  "delegated reviewer - replacing an external parent while Luna runs cannot mint scope for the replacement",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const external = yield* tmpdirScoped()
+      const moved = `${external}-reviewed`
+      yield* Effect.addFinalizer(() => Effect.promise(() => rm(moved, { recursive: true, force: true })))
+      const first = path.join(external, "first.log")
+      const second = path.join(external, "second.log")
+      yield* Effect.promise(() =>
+        Promise.all([writeFile(first, "reviewed first"), writeFile(second, "reviewed second")]),
+      )
+
+      const grep = { pattern: "first", path: external, include: "first.log" }
+      const request = externalGrepRequest(
+        seeded.child.id,
+        seeded.childAssistantID,
+        seeded.child.directory,
+        grep,
+        "file",
+      )
+      const delayed = delayedObviousAllow()
+      const review = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+      yield* Effect.promise(() => delayed.started)
+      yield* Effect.promise(async () => {
+        await rename(external, moved)
+        await mkdir(external)
+        await Promise.all([writeFile(first, "replacement first"), writeFile(second, "replacement second")])
+      })
+      delayed.release()
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain("read_scope_minted")
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(review))).toBeInstanceOf(PermissionV1.RejectedError)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          throw new Error("provider failure")
+        },
+      })
+      const read = yield* reviewerAsk(
+        externalReadScopeRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, second),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(read))).toBeInstanceOf(PermissionV1.RejectedError)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain("read_scope_reused")
     }),
   withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
   30_000,

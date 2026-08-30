@@ -37,6 +37,8 @@ import { PermissionReviewer } from "./reviewer"
 import { InstanceRef } from "@/effect/instance-ref"
 import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type EvidenceInput } from "./reviewer-input"
 import { auditCorrelationKey } from "./audit-correlation"
+import { exactSearchIncludeTarget } from "@/util/exact-search-include"
+import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
 
 export const Event = PermissionV1.Event
 
@@ -139,8 +141,8 @@ interface State {
       rootSessionID: string
       rootTurnID: string
       directory: string
-      device: number
-      inode: number
+      device: string
+      inode: string
     }>
   >
 }
@@ -340,6 +342,12 @@ const layer = Layer.effect(
       return yield* Effect.tryPromise(() => stat(value)).pipe(Effect.catch(() => Effect.succeed(undefined)))
     })
 
+    const pathIdentity = Effect.fn("Permission.pathIdentity")(function* (value: string) {
+      return yield* Effect.tryPromise(() => stat(value, { bigint: true })).pipe(
+        Effect.catch(() => Effect.succeed(undefined)),
+      )
+    })
+
     type ReadScopeRequest = {
       rootSessionID: string
       rootTurnID: string
@@ -348,8 +356,8 @@ const layer = Layer.effect(
       boundRead: boolean
       canonicalTarget: string
       canonicalRoot: string
-      device: number
-      inode: number
+      device: string
+      inode: string
     }
 
     const readScopeAuthority = (turn: TurnState) =>
@@ -364,13 +372,15 @@ const layer = Layer.effect(
     const readonlyTarget = (
       action: PermissionReviewSnapshot["action"],
       directory: string,
-    ): { identity: "glob" | "grep" | "read"; raw: string } | undefined => {
+    ): { identity: "glob" | "grep" | "read"; raw: string; exactIncluded?: string } | undefined => {
       const registered = PermissionReviewer.registeredReadonlyInvocation(action)
       if (!registered) return
       const raw =
         registered.identity === "read" ? registered.invocation.filePath : (registered.invocation.path ?? directory)
       if (typeof raw !== "string" || raw.length === 0 || hasParentSegment(raw)) return
-      return { identity: registered.identity, raw }
+      const exactIncluded =
+        registered.identity === "grep" ? exactSearchIncludeTarget(registered.invocation, directory) : undefined
+      return { identity: registered.identity, raw, exactIncluded }
     }
 
     const inspectExternalReadScope = Effect.fn("Permission.inspectExternalReadScope")(function* (input: {
@@ -425,11 +435,27 @@ const layer = Layer.effect(
         searchBinding.executor === "ripgrep-inherited-readonly-fd-v1"
       if ((target.identity === "glob" || target.identity === "grep") && !boundSearch) return
       const scope = metadata.readScope
-      if (!exactKeys(scope, ["canonicalRoot", "canonicalTarget", "kind", "version"])) return
+      if (
+        !exactKeys(scope, [
+          "canonicalRoot",
+          "canonicalTarget",
+          "kind",
+          "rootDevice",
+          "rootInode",
+          "targetDevice",
+          "targetInode",
+          "version",
+        ])
+      )
+        return
       if (
         scope.version !== 1 ||
         typeof scope.canonicalTarget !== "string" ||
         typeof scope.canonicalRoot !== "string" ||
+        typeof scope.targetDevice !== "string" ||
+        typeof scope.targetInode !== "string" ||
+        typeof scope.rootDevice !== "string" ||
+        typeof scope.rootInode !== "string" ||
         (scope.kind !== "file" && scope.kind !== "directory") ||
         metadata.filepath !== scope.canonicalTarget ||
         metadata.parentDir !== scope.canonicalRoot ||
@@ -438,16 +464,34 @@ const layer = Layer.effect(
       )
         return
       const lexical = path.resolve(input.directory, target.raw)
-      if (lexical !== scope.canonicalTarget || !contains(scope.canonicalRoot, scope.canonicalTarget)) return
+      const canonicalLexical = yield* canonicalPath(lexical)
+      const canonicalIncluded = target.exactIncluded ? yield* canonicalPath(target.exactIncluded) : undefined
+      const lexicalTrusted =
+        canonicalLexical === scope.canonicalTarget &&
+        (yield* Effect.promise(() => trustedCanonicalAlias(lexical, canonicalLexical)))
+      const includedTrusted =
+        target.exactIncluded !== undefined &&
+        canonicalIncluded === scope.canonicalTarget &&
+        (yield* Effect.promise(() => trustedCanonicalAlias(target.exactIncluded!, canonicalIncluded)))
+      if (!lexicalTrusted && !includedTrusted) return
+      if (!contains(scope.canonicalRoot, scope.canonicalTarget)) return
       const canonicalTarget = yield* canonicalPath(scope.canonicalTarget)
       const canonicalRoot = yield* canonicalPath(scope.canonicalRoot)
       if (canonicalTarget !== scope.canonicalTarget || canonicalRoot !== scope.canonicalRoot) return
       const targetInfo = yield* pathInfo(canonicalTarget)
       const rootInfo = yield* pathInfo(canonicalRoot)
+      const targetIdentity = yield* pathIdentity(canonicalTarget)
+      const rootIdentity = yield* pathIdentity(canonicalRoot)
       if (
         !targetInfo ||
         !rootInfo ||
+        !targetIdentity ||
+        !rootIdentity ||
         !rootInfo.isDirectory() ||
+        scope.targetDevice !== String(targetIdentity.dev) ||
+        scope.targetInode !== String(targetIdentity.ino) ||
+        scope.rootDevice !== String(rootIdentity.dev) ||
+        scope.rootInode !== String(rootIdentity.ino) ||
         (scope.kind === "directory" ? !targetInfo.isDirectory() : !targetInfo.isFile()) ||
         (target.identity === "glob" && scope.kind !== "directory") ||
         (scope.kind === "directory"
@@ -466,8 +510,8 @@ const layer = Layer.effect(
         boundRead,
         canonicalTarget,
         canonicalRoot,
-        device: rootInfo.dev,
-        inode: rootInfo.ino,
+        device: String(rootIdentity.dev),
+        inode: String(rootIdentity.ino),
       }
     })
 
@@ -483,11 +527,12 @@ const layer = Layer.effect(
         if (!contains(scope.directory, target)) continue
         const canonical = yield* canonicalPath(scope.directory)
         const info = canonical ? yield* pathInfo(canonical) : undefined
+        const identity = canonical ? yield* pathIdentity(canonical) : undefined
         if (
           canonical === scope.directory &&
           info?.isDirectory() &&
-          info.dev === scope.device &&
-          info.ino === scope.inode
+          String(identity?.dev) === scope.device &&
+          String(identity?.ino) === scope.inode
         )
           matches.push(scope)
       }
@@ -502,7 +547,13 @@ const layer = Layer.effect(
       if (!request) return false
       if (request.identity !== "read" || request.kind !== "file" || !request.boundRead) return false
       const matches = yield* matchingReadScopes(current, turn, request.canonicalTarget)
-      return matches.length === 1
+      const match = matches[0]
+      return (
+        matches.length === 1 &&
+        match?.directory === request.canonicalRoot &&
+        match.device === request.device &&
+        match.inode === request.inode
+      )
     })
 
     const readScopeAllowsPrimary = Effect.fn("Permission.readScopeAllowsPrimary")(function* (input: {
@@ -522,28 +573,70 @@ const layer = Layer.effect(
       )
         return false
       const metadata = input.info.metadata
-      if (!plainRecord(metadata) || !exactKeys(metadata, ["readBinding"]) || !plainRecord(metadata.readBinding))
+      if (
+        !plainRecord(metadata) ||
+        !exactKeys(metadata, ["readBinding", "readScope"]) ||
+        !plainRecord(metadata.readBinding) ||
+        !plainRecord(metadata.readScope)
+      )
         return false
       const readBinding = metadata.readBinding
+      const scope = metadata.readScope
       if (
         !exactKeys(readBinding, ["bindingId", "contract", "version"]) ||
         readBinding.version !== 1 ||
         readBinding.contract !== "pinned-external-text-v1" ||
         typeof readBinding.bindingId !== "string" ||
-        !/^[0-9a-f]{32}$/u.test(readBinding.bindingId)
+        !/^[0-9a-f]{32}$/u.test(readBinding.bindingId) ||
+        !exactKeys(scope, [
+          "canonicalRoot",
+          "canonicalTarget",
+          "kind",
+          "rootDevice",
+          "rootInode",
+          "targetDevice",
+          "targetInode",
+          "version",
+        ]) ||
+        scope.version !== 1 ||
+        scope.kind !== "file" ||
+        typeof scope.canonicalTarget !== "string" ||
+        typeof scope.canonicalRoot !== "string" ||
+        typeof scope.targetDevice !== "string" ||
+        typeof scope.targetInode !== "string" ||
+        typeof scope.rootDevice !== "string" ||
+        typeof scope.rootInode !== "string"
       )
         return false
       const lexical = path.resolve(input.directory, target.raw)
       const canonicalTarget = yield* canonicalPath(lexical)
       if (!canonicalTarget) return false
       const targetInfo = yield* pathInfo(canonicalTarget)
-      if (!targetInfo) return false
+      const targetIdentity = yield* pathIdentity(canonicalTarget)
+      if (!targetInfo || !targetIdentity) return false
       if (!targetInfo.isFile()) return false
       const expectedCwd = targetInfo.isDirectory() ? canonicalTarget : path.dirname(canonicalTarget)
       const canonicalCwd = yield* canonicalPath(input.snapshot.action.cwd)
-      if (canonicalCwd !== expectedCwd || input.snapshot.action.cwd !== expectedCwd) return false
+      const rootIdentity = canonicalCwd ? yield* pathIdentity(canonicalCwd) : undefined
+      if (
+        canonicalCwd !== expectedCwd ||
+        scope.canonicalTarget !== canonicalTarget ||
+        scope.canonicalRoot !== canonicalCwd ||
+        scope.targetDevice !== String(targetIdentity.dev) ||
+        scope.targetInode !== String(targetIdentity.ino) ||
+        scope.rootDevice !== String(rootIdentity?.dev) ||
+        scope.rootInode !== String(rootIdentity?.ino) ||
+        !(yield* Effect.promise(() => trustedCanonicalAlias(input.snapshot.action.cwd!, canonicalCwd)))
+      )
+        return false
       const matches = yield* matchingReadScopes(input.current, input.turn, canonicalTarget)
-      return matches.length === 1
+      const match = matches[0]
+      return (
+        matches.length === 1 &&
+        match?.directory === scope.canonicalRoot &&
+        match.device === scope.rootDevice &&
+        match.inode === scope.rootInode
+      )
     })
 
     type ReadScopeCode =

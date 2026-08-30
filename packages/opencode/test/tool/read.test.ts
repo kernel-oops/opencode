@@ -774,6 +774,24 @@ describe("tool.read external_directory permission", () => {
     }),
   )
 
+  it.live("keeps a root-owned final file symlink on the legacy human-gated path", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const filePath = "/etc/os-release"
+      const info = yield* Effect.promise(() => fs.lstat(filePath))
+      if (!info.isSymbolicLink()) return
+      const dir = yield* tmpdirScoped({ git: true })
+      const captured = asks()
+
+      yield* exec(dir, { filePath, limit: 1 }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(
+        "readBinding",
+      )
+      expect(captured.items.find((item) => item.permission === "read")?.metadata).toEqual({})
+    }),
+  )
+
   it.live("binds ordinary external text but declines media, binary and oversized files", () =>
     Effect.gen(function* () {
       if (process.platform !== "linux") return

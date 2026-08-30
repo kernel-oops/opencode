@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { describe, expect } from "bun:test"
 import path from "path"
-import { mkdir, rename, symlink, writeFile } from "node:fs/promises"
+import { mkdir, rename, stat, symlink, writeFile } from "node:fs/promises"
 import { Effect, Exit } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import type { Tool } from "@/tool/tool"
@@ -105,8 +105,19 @@ describe("tool.assertExternalDirectory", () => {
         const target = path.join(outside, "file.txt")
         yield* Effect.promise(() => writeFile(target, "content"))
         const { requests, ctx } = makeCtx()
+        const targetInfo = yield* Effect.promise(() => stat(target, { bigint: true }))
+        const rootInfo = yield* Effect.promise(() => stat(outside, { bigint: true }))
 
-        yield* assertExternalDirectoryEffect(ctx, target, { kind: "file", tool: "read" })
+        yield* assertExternalDirectoryEffect(ctx, target, {
+          kind: "file",
+          tool: "read",
+          scopeIdentity: {
+            targetDevice: targetInfo.dev.toString(),
+            targetInode: targetInfo.ino.toString(),
+            rootDevice: rootInfo.dev.toString(),
+            rootInode: rootInfo.ino.toString(),
+          },
+        })
 
         const metadata = requests[0]?.metadata
         expect(metadata).toEqual({
@@ -118,6 +129,10 @@ describe("tool.assertExternalDirectory", () => {
             canonicalTarget: target,
             canonicalRoot: outside,
             kind: "file",
+            targetDevice: targetInfo.dev.toString(),
+            targetInode: targetInfo.ino.toString(),
+            rootDevice: rootInfo.dev.toString(),
+            rootInode: rootInfo.ino.toString(),
           },
         })
       }),

@@ -13,11 +13,19 @@ import {
 
 type Kind = "file" | "directory"
 
+type ScopeIdentity = {
+  readonly targetDevice: string
+  readonly targetInode: string
+  readonly rootDevice: string
+  readonly rootInode: string
+}
+
 type Options = {
   bypass?: boolean
   bindRead?: boolean
   kind?: Kind
   tool?: "glob" | "grep" | "read"
+  scopeIdentity?: ScopeIdentity
   searchBinding?: {
     readonly version: 1
     readonly contract: "pinned-external-search-v1"
@@ -45,6 +53,10 @@ export type ExternalDirectoryVerification =
         readonly canonicalTarget: string
         readonly canonicalRoot: string
         readonly kind: Kind
+        readonly targetDevice: string
+        readonly targetInode: string
+        readonly rootDevice: string
+        readonly rootInode: string
       }
       readonly readBinding?: {
         readonly version: 1
@@ -93,6 +105,10 @@ export const verifyExternalDirectoryEffect = Effect.fn("Tool.verifyExternalDirec
       verification.readScope.canonicalTarget === verification.canonicalTarget &&
       verification.readScope.canonicalRoot === verification.canonicalRoot &&
       verification.readScope.kind === verification.kind &&
+      verification.readScope.targetDevice === String(verification.targetDevice) &&
+      verification.readScope.targetInode === String(verification.targetInode) &&
+      verification.readScope.rootDevice === String(verification.rootDevice) &&
+      verification.readScope.rootInode === String(verification.rootInode) &&
       verification.lexicalTarget === verification.canonicalTarget
     : true
   const exactBinding = verification.readBinding
@@ -145,7 +161,7 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
   const rootInfo = root
     ? yield* Effect.tryPromise(() => stat(root)).pipe(Effect.catch(() => Effect.succeed(undefined)))
     : undefined
-  const readScope =
+  const scopeCandidate =
     process.platform === "linux" &&
     options?.tool !== undefined &&
     resolved !== undefined &&
@@ -154,17 +170,34 @@ export const assertExternalDirectoryEffect = Effect.fn("Tool.assertExternalDirec
     root === dir &&
     rootInfo?.isDirectory() &&
     ((kind === "directory" && info?.isDirectory()) || (kind === "file" && info?.isFile()))
-      ? {
-          version: 1 as const,
-          canonicalTarget: resolved,
-          canonicalRoot: root,
-          kind,
-        }
+      ? { canonicalTarget: resolved, canonicalRoot: root, kind }
       : undefined
   const candidateBoundRead =
-    readScope && options?.bindRead === true && options.tool === "read" && kind === "file"
-      ? yield* Effect.promise(() => bindExternalTextFile(readScope.canonicalTarget))
+    scopeCandidate && options?.bindRead === true && options.tool === "read" && kind === "file"
+      ? yield* Effect.promise(() => bindExternalTextFile(scopeCandidate.canonicalTarget))
       : undefined
+  const scopeIdentity =
+    options?.scopeIdentity ??
+    (candidateBoundRead
+      ? {
+          targetDevice: candidateBoundRead.fileGeneration.dev.toString(),
+          targetInode: candidateBoundRead.fileGeneration.ino.toString(),
+          rootDevice: candidateBoundRead.rootGeneration.dev.toString(),
+          rootInode: candidateBoundRead.rootGeneration.ino.toString(),
+        }
+      : undefined)
+  const readScope =
+    scopeCandidate &&
+    scopeIdentity &&
+    info &&
+    rootInfo &&
+    scopeIdentity.targetDevice === String(info.dev) &&
+    scopeIdentity.targetInode === String(info.ino) &&
+    scopeIdentity.rootDevice === String(rootInfo.dev) &&
+    scopeIdentity.rootInode === String(rootInfo.ino)
+      ? { version: 1 as const, ...scopeCandidate, ...scopeIdentity }
+      : undefined
+  if (candidateBoundRead && !readScope) yield* Effect.promise(() => closeBoundExternalTextFile(candidateBoundRead))
   const boundRead = readScope && candidateBoundRead ? candidateBoundRead : undefined
   const readBinding = boundRead
     ? {
