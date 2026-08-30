@@ -27,6 +27,8 @@ import {
   type BoundGrepSnapshot,
 } from "./grep-bound-files"
 import * as Tool from "./tool"
+import { exactSearchIncludeTarget } from "@/util/exact-search-include"
+import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
 
 const RESULT_LIMIT = 100
 const EXTERNAL_GREP_FD = 3
@@ -109,15 +111,36 @@ export const GrepTool = Tool.define(
             ? (input.path ?? ins.directory)
             : path.join(ins.directory, input.path ?? ".")
           const lexical = path.resolve(requested)
-          const search = FSUtil.resolve(lexical)
-          const requestedInfo = yield* fs.stat(search).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          const requestedSearch = FSUtil.resolve(lexical)
+          const requestedSearchInfo = yield* fs
+            .stat(requestedSearch)
+            .pipe(Effect.catch(() => Effect.succeed(undefined)))
+          const aliasTrusted = yield* Effect.promise(() => trustedCanonicalAlias(lexical, requestedSearch))
+          const exactIncludeLexical =
+            aliasTrusted && requestedSearchInfo?.type === "Directory" && !containsPath(requestedSearch, ins)
+              ? exactSearchIncludeTarget(input, ins.directory)
+              : undefined
+          const exactIncludeTarget = exactIncludeLexical
+            ? path.join(requestedSearch, path.basename(exactIncludeLexical))
+            : undefined
+          const exactIncludeSearch = exactIncludeTarget ? FSUtil.resolve(exactIncludeTarget) : undefined
+          const exactIncludeInfo =
+            exactIncludeTarget &&
+            exactIncludeSearch === exactIncludeTarget &&
+            path.dirname(exactIncludeTarget) === requestedSearch
+              ? yield* fs.stat(exactIncludeSearch).pipe(Effect.catch(() => Effect.succeed(undefined)))
+              : undefined
+          const search = exactIncludeInfo?.type === "File" ? exactIncludeSearch! : requestedSearch
+          const requestedInfo = exactIncludeInfo?.type === "File" ? exactIncludeInfo : requestedSearchInfo
           const cwd = requestedInfo?.type === "Directory" ? search : path.dirname(search)
           const isExternal = !containsPath(search, ins)
+          const reviewCwd =
+            isExternal && requestedInfo?.type === "File" ? path.dirname(exactIncludeLexical ?? lexical) : cwd
 
           const projectDirectoryEligible = !isExternal && requestedInfo?.type === "Directory" && lexical === search
           return yield* Effect.acquireUseRelease(
             Effect.promise(async (): Promise<SearchBinding | undefined> => {
-              if (isExternal && requestedInfo?.type === "File") {
+              if (isExternal && aliasTrusted && requestedInfo?.type === "File") {
                 const value = await bindExternalTextFile(search)
                 return value ? { kind: "file", value } : undefined
               }
@@ -153,6 +176,15 @@ export const GrepTool = Tool.define(
                   kind: requestedInfo?.type === "Directory" ? "directory" : "file",
                   tool: "grep",
                   searchBinding,
+                  scopeIdentity:
+                    externalBinding?.kind === "file"
+                      ? {
+                          targetDevice: externalBinding.value.fileGeneration.dev.toString(),
+                          targetInode: externalBinding.value.fileGeneration.ino.toString(),
+                          rootDevice: externalBinding.value.rootGeneration.dev.toString(),
+                          rootInode: externalBinding.value.rootGeneration.ino.toString(),
+                        }
+                      : undefined,
                 })
                 const render = (rows: { path: string; line: number; text: string }[]) => {
                   if (rows.length === 0) return empty
@@ -189,7 +221,7 @@ export const GrepTool = Tool.define(
                       ...(input.path === undefined ? {} : { path: input.path }),
                       ...(input.include === undefined ? {} : { include: input.include }),
                     },
-                    action: { identity: "grep", arguments: arguments_, cwd, complete },
+                    action: { identity: "grep", arguments: arguments_, cwd: reviewCwd, complete },
                   })
 
                 const legacy = Effect.gen(function* () {
@@ -237,7 +269,7 @@ export const GrepTool = Tool.define(
                           ? path.basename(search)
                           : undefined,
                     pattern: input.pattern,
-                    include: input.include,
+                    include: binding?.kind === "file" ? undefined : input.include,
                     limit: RESULT_LIMIT,
                     inheritedReadOnlyFds:
                       binding?.kind === "file"

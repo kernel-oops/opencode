@@ -867,6 +867,118 @@ describe("tool.grep", () => {
     }),
   )
 
+  it.instance("treats a literal include in an external directory as one descriptor-bound file", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const test = yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const requested = path.join(outside, "requested.txt")
+      const hidden = path.join(outside, "sibling-secret.txt")
+      yield* Effect.promise(() =>
+        Promise.all([Bun.write(requested, "needle reviewed-value"), Bun.write(hidden, "needle sibling-hidden-secret")]),
+      )
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const args = { pattern: "needle", path: outside, include: "requested.txt" }
+
+      const result = yield* grep.execute(args, captured.next)
+
+      expect(result.metadata.matches).toBe(1)
+      expect(result.output).toContain(requested)
+      expect(result.output).toContain("reviewed-value")
+      expect(result.output).not.toContain("sibling-hidden-secret")
+      const external = captured.items.find((item) => item.permission === "external_directory")
+      expect(external?.metadata).toMatchObject({
+        filepath: requested,
+        parentDir: outside,
+        searchBinding: {
+          contract: "pinned-external-search-v1",
+          mode: "file",
+          executor: "ripgrep-inherited-readonly-fd-v1",
+        },
+      })
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          permission: "external_directory",
+          permissionMetadata: external?.metadata,
+          identity: "grep",
+          arguments: args,
+          directory: test.directory,
+        }).complete,
+      ).toBe(true)
+      const primary = captured.items.find((item) => item.permission === "grep")
+      expect(
+        resolveReviewAction({
+          builtin: true,
+          permission: "grep",
+          permissionMetadata: primary?.metadata,
+          identity: "grep",
+          arguments: args,
+          directory: test.directory,
+          requested: primary?.action,
+        }).complete,
+      ).toBe(true)
+      expect(primary?.action?.arguments).toMatchObject({
+        contract: "pinned-external-search-v1",
+        kind: "file",
+        invocation: args,
+      })
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("requested.txt"))).toBe(false)
+    }),
+  )
+
+  it.instance("does not attest a literal external include that resolves through a file symlink", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const target = path.join(outside, "target.txt")
+      const linked = path.join(outside, "linked.txt")
+      yield* Effect.promise(async () => {
+        await Bun.write(target, "needle target-value")
+        await fs.symlink(target, linked)
+      })
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      yield* grep.execute({ pattern: "needle", path: outside, include: "linked.txt" }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(
+        "searchBinding",
+      )
+      expect(captured.items.find((item) => item.permission === "grep")?.action?.complete).toBe(false)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("target.txt"))).toBe(false)
+    }),
+  )
+
+  it.instance("does not attest a literal external include through a user-controlled directory alias", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      yield* TestInstance
+      const outside = yield* tmpdirScoped()
+      const aliasRoot = yield* tmpdirScoped()
+      const alias = path.join(aliasRoot, "linked-directory")
+      yield* Effect.promise(async () => {
+        await Bun.write(path.join(outside, "requested.txt"), "needle target-value")
+        await fs.symlink(outside, alias)
+      })
+      const captured = asks()
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+
+      yield* grep.execute({ pattern: "needle", path: alias, include: "requested.txt" }, captured.next)
+
+      expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(
+        "searchBinding",
+      )
+      expect(captured.items.find((item) => item.permission === "grep")?.action?.complete).toBe(false)
+      expect((yield* Effect.promise(openFileLinks)).some((item) => item.includes("requested.txt"))).toBe(false)
+    }),
+  )
+
   it.instance("holds an external directory descriptor without attesting automatic completeness", () =>
     Effect.gen(function* () {
       if (process.platform !== "linux") return

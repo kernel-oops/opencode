@@ -2,6 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
 import path from "node:path"
 import { types } from "node:util"
+import { exactSearchIncludeTarget } from "@/util/exact-search-include"
 import {
   validateExceptionalRiskAssessment,
   validateObviousRiskAssessment,
@@ -205,7 +206,9 @@ function boundExternalSearchRequested(input: {
     return false
   const raw = input.arguments.path ?? input.directory
   if (typeof raw !== "string" || raw.length === 0) return false
-  const target = path.resolve(input.directory, raw)
+  const rawTarget = path.resolve(input.directory, raw)
+  const includedTarget = exactSearchIncludeTarget(input.arguments, input.directory)
+  const target = includedTarget && requested.cwd === path.dirname(includedTarget) ? includedTarget : rawTarget
   if (contains(input.directory, target)) return false
   return requested.arguments.kind === "file" && requested.cwd === path.dirname(target)
 }
@@ -266,14 +269,40 @@ function boundExternalReadRequested(input: {
 }
 
 function primaryReadBindingMetadata(value: unknown) {
-  if (!record(value) || !exactKeys(value, ["readBinding"]) || !record(value.readBinding)) return false
+  if (
+    !record(value) ||
+    !exactKeys(value, ["readBinding", "readScope"]) ||
+    !record(value.readBinding) ||
+    !record(value.readScope)
+  )
+    return false
   const binding = value.readBinding
+  const scope = value.readScope
   return (
     exactKeys(binding, ["bindingId", "contract", "version"]) &&
     binding.version === 1 &&
     binding.contract === boundExternalReadContract &&
     typeof binding.bindingId === "string" &&
-    /^[0-9a-f]{32}$/u.test(binding.bindingId)
+    /^[0-9a-f]{32}$/u.test(binding.bindingId) &&
+    exactKeys(scope, [
+      "canonicalRoot",
+      "canonicalTarget",
+      "kind",
+      "rootDevice",
+      "rootInode",
+      "targetDevice",
+      "targetInode",
+      "version",
+    ]) &&
+    scope.version === 1 &&
+    scope.kind === "file" &&
+    typeof scope.canonicalTarget === "string" &&
+    typeof scope.canonicalRoot === "string" &&
+    typeof scope.targetDevice === "string" &&
+    typeof scope.targetInode === "string" &&
+    typeof scope.rootDevice === "string" &&
+    typeof scope.rootInode === "string" &&
+    path.dirname(scope.canonicalTarget) === scope.canonicalRoot
   )
 }
 
@@ -286,11 +315,24 @@ function externalSearchBindingMetadata(value: unknown, identity: string) {
     value.tool !== identity ||
     !record(binding) ||
     !record(scope) ||
-    !exactKeys(scope, ["canonicalRoot", "canonicalTarget", "kind", "version"]) ||
+    !exactKeys(scope, [
+      "canonicalRoot",
+      "canonicalTarget",
+      "kind",
+      "rootDevice",
+      "rootInode",
+      "targetDevice",
+      "targetInode",
+      "version",
+    ]) ||
     scope.version !== 1 ||
     scope.kind !== "file" ||
     typeof scope.canonicalTarget !== "string" ||
     typeof scope.canonicalRoot !== "string" ||
+    typeof scope.targetDevice !== "string" ||
+    typeof scope.targetInode !== "string" ||
+    typeof scope.rootDevice !== "string" ||
+    typeof scope.rootInode !== "string" ||
     value.filepath !== scope.canonicalTarget ||
     value.parentDir !== scope.canonicalRoot
   )
@@ -322,11 +364,24 @@ function externalReadBindingMetadata(value: unknown) {
     binding.contract !== "pinned-external-text-v1" ||
     typeof binding.bindingId !== "string" ||
     !/^[0-9a-f]{32}$/u.test(binding.bindingId) ||
-    !exactKeys(scope, ["canonicalRoot", "canonicalTarget", "kind", "version"]) ||
+    !exactKeys(scope, [
+      "canonicalRoot",
+      "canonicalTarget",
+      "kind",
+      "rootDevice",
+      "rootInode",
+      "targetDevice",
+      "targetInode",
+      "version",
+    ]) ||
     scope.version !== 1 ||
     scope.kind !== "file" ||
     typeof scope.canonicalTarget !== "string" ||
     typeof scope.canonicalRoot !== "string" ||
+    typeof scope.targetDevice !== "string" ||
+    typeof scope.targetInode !== "string" ||
+    typeof scope.rootDevice !== "string" ||
+    typeof scope.rootInode !== "string" ||
     !path.isAbsolute(scope.canonicalTarget) ||
     !path.isAbsolute(scope.canonicalRoot)
   )
