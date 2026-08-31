@@ -749,7 +749,10 @@ export function isGenericRiskAllowCandidate(input: Parameters<typeof isGenericRi
   return input.assessment.outcome === "allow" && isGenericRiskCandidate(input)
 }
 
-function bashExternalArguments(value: unknown, cwd: unknown) {
+export function isCompleteExternalDirectoryBashAction(action: PermissionReviewSnapshot["action"]) {
+  if (action.identity !== "bash") return false
+  const value = action.arguments
+  const cwd = action.cwd
   if (!record(value) || !exactKeys(value, ["command", "shell", "timeout", "workdir"])) return false
   return (
     typeof value.command === "string" &&
@@ -775,7 +778,7 @@ export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof i
   const trusted = input.snapshot.trusted
   const argumentsValid = contract
     ? argumentsComplete(contract, action.arguments) && registeredReadonlyInvocation(action) !== undefined
-    : action.identity === "bash" && bashExternalArguments(action.arguments, action.cwd)
+    : isCompleteExternalDirectoryBashAction(action)
   return (
     input.settled &&
     !("failure" in validated) &&
@@ -793,6 +796,7 @@ export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof i
     typeof action.cwd === "string" &&
     action.cwd.length > 0 &&
     path.isAbsolute(action.cwd) &&
+    (action.identity !== "bash" || input.policy === "exceptional-risk-only-v1") &&
     input.snapshot.context_safe_for_gate &&
     trusted.complete &&
     trusted.omitted_items === 0 &&

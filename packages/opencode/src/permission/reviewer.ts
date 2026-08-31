@@ -37,6 +37,7 @@ export { isObviousRiskCandidate, obviousRiskRewriteFeedback } from "./obvious-ri
 export {
   genericRiskCandidateRejection,
   type GenericRiskCandidateRejection,
+  isCompleteExternalDirectoryBashAction,
   isExternalDirectoryRiskAllowCandidate,
   isGenericRiskAllowCandidate,
   isGenericRiskCandidate,

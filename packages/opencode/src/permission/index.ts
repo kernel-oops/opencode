@@ -80,9 +80,18 @@ export interface Interface {
   }) => Effect.Effect<boolean, unknown>
 }
 
+interface BashScopeRequest {
+  rootSessionID: string
+  rootTurnID: string
+  directories: string[]
+}
+
 interface PendingEntry {
   info: PermissionV1.Request
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+  externalBashRequest: boolean
+  reply?: PermissionV1.Reply
+  bashScopeRequest?: BashScopeRequest
 }
 
 interface ReviewLease {
@@ -145,6 +154,14 @@ interface State {
       inode: string
     }>
   >
+  bashExternalScopes: Map<
+    string,
+    {
+      rootSessionID: string
+      rootTurnID: string
+      directories: string[]
+    }
+  >
 }
 
 const MAX_EVIDENCE_ITEMS = 64
@@ -152,6 +169,9 @@ const MAX_EVIDENCE_BYTES = 8 * 1024
 const MAX_TRUSTED_EVIDENCE_BYTES = 40 * 1024
 const MAX_EVIDENCE_SESSIONS = 64
 const MAX_READ_SCOPE_ROOTS = 8
+const MAX_BASH_SCOPE_ROOTS = 32
+const MAX_BASH_SCOPE_DIRECTORIES = 16
+const MAX_BASH_SCOPE_DIRECTORY_BYTES = 4 * 1024
 let rewriteClaim = 0
 
 export const REVIEW_TIMEOUT = "30 seconds"
@@ -241,6 +261,7 @@ const layer = Layer.effect(
           activeTurns: new Map(),
           taskReceipts: new Map(),
           readScopes: new Map(),
+          bashExternalScopes: new Map(),
         }
 
         yield* Effect.addFinalizer(() =>
@@ -257,6 +278,7 @@ const layer = Layer.effect(
             state.activeTurns.clear()
             state.taskReceipts.clear()
             state.readScopes.clear()
+            state.bashExternalScopes.clear()
           }),
         )
 
@@ -688,6 +710,92 @@ const layer = Layer.effect(
         origin: input.origin,
         ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
         readScopeCode: input.code,
+      })
+    })
+
+    type BashScopeCode = "bash_scope_minted" | "bash_scope_extended" | "bash_scope_reused" | "bash_scope_capacity"
+
+    const inspectExternalBashScope = (input: {
+      info: PermissionV1.Request
+      snapshot: PermissionReviewSnapshot
+      turn: TurnState
+    }): BashScopeRequest | undefined => {
+      if (
+        input.info.permission !== "external_directory" ||
+        input.snapshot.action.permission !== "external_directory" ||
+        input.snapshot.action.origin !== "tool" ||
+        !PermissionReviewer.isCompleteExternalDirectoryBashAction(input.snapshot.action) ||
+        !readScopeAuthority(input.turn)
+      )
+        return
+      const metadata = input.info.metadata
+      if (!plainRecord(metadata) || !exactKeys(metadata, ["command", "directories", "patterns"])) return
+      const command = input.snapshot.action.arguments
+      if (!plainRecord(command) || metadata.command !== command.command) return
+      if (!Array.isArray(metadata.directories) || !Array.isArray(metadata.patterns)) return
+      if (
+        metadata.directories.length === 0 ||
+        metadata.directories.length > MAX_BASH_SCOPE_DIRECTORIES ||
+        metadata.patterns.length !== metadata.directories.length ||
+        input.info.patterns.length !== metadata.directories.length
+      )
+        return
+      const directories: string[] = []
+      for (let index = 0; index < metadata.directories.length; index++) {
+        const directory = metadata.directories[index]
+        const pattern = metadata.patterns[index]
+        const infoPattern = input.info.patterns[index]
+        if (
+          typeof directory !== "string" ||
+          directory.length === 0 ||
+          Buffer.byteLength(directory, "utf8") > MAX_BASH_SCOPE_DIRECTORY_BYTES ||
+          !path.isAbsolute(directory)
+        )
+          return
+        const normalised = path.resolve(directory)
+        const expected = path.join(normalised, "*").replaceAll("\\", "/")
+        if (pattern !== expected || infoPattern !== expected || directories.includes(normalised)) return
+        directories.push(normalised)
+      }
+      return {
+        rootSessionID: input.turn.rootSessionID,
+        rootTurnID: input.turn.rootTurnID,
+        directories,
+      }
+    }
+
+    const rememberBashScope = (current: State, request: BashScopeRequest): BashScopeCode => {
+      const key = turnKey(request.rootSessionID, request.rootTurnID)
+      const existing = current.bashExternalScopes.get(key)?.directories ?? []
+      let directories = [...existing]
+      let changed = false
+      for (const requested of request.directories) {
+        if (directories.some((root) => contains(root, requested))) continue
+        const next = directories.filter((root) => !contains(requested, root))
+        if (next.length >= MAX_BASH_SCOPE_ROOTS) return "bash_scope_capacity"
+        directories = [...next, requested]
+        changed = true
+      }
+      if (!changed) return "bash_scope_reused"
+      remember(current.bashExternalScopes, key, {
+        rootSessionID: request.rootSessionID,
+        rootTurnID: request.rootTurnID,
+        directories,
+      })
+      return existing.length === 0 ? "bash_scope_minted" : "bash_scope_extended"
+    }
+
+    const auditBashScope = Effect.fn("Permission.auditBashScope")(function* (input: {
+      info: PermissionV1.Request
+      origin: PermissionReviewContext["origin"]
+      code: BashScopeCode
+    }) {
+      const auditCorrelationKey = correlation(input.info, input.origin)
+      yield* Effect.logInfo("permission bash external scope", {
+        permission: input.info.permission,
+        origin: input.origin,
+        ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
+        bashScopeCode: input.code,
       })
     })
 
@@ -1263,14 +1371,15 @@ const layer = Layer.effect(
       const current = yield* InstanceState.get(state)
       const { approved, pending } = current
       const { ruleset, review: source, ...request } = input
+      const externalBashRequest = request.permission === "external_directory" && source?.action?.identity === "bash"
       let needsAsk = false
       const rules: PermissionReviewContext["rules"] = []
 
       for (const [patternIndex, pattern] of request.patterns.entries()) {
         const configured = evaluate(request.permission, pattern, ruleset)
-        const learned = evaluate(request.permission, pattern, approved)
+        const learned = externalBashRequest ? undefined : evaluate(request.permission, pattern, approved)
         // Learned approvals may satisfy asks, but configured allow/deny decisions remain authoritative.
-        const rule = configured.action === "ask" && learned.action === "allow" ? learned : configured
+        const rule = configured.action === "ask" && learned?.action === "allow" ? learned : configured
         const reviewedPattern = safeReviewString(pattern)
         const reviewedRule = {
           permission: rule.permission,
@@ -1363,6 +1472,7 @@ const layer = Layer.effect(
       })
       const reviewTurn = turn
       const reviewActionBinding = JSON.stringify(snapshot.action)
+      const initialBashScopeRequest = inspectExternalBashScope({ info, snapshot, turn })
       const externalReadScopeRequest = permissionSession
         ? yield* inspectExternalReadScope({
             info,
@@ -1573,7 +1683,8 @@ const layer = Layer.effect(
       const evaluatorPermitDecision = evaluator?.run?.isSettled() ? evaluatorDecision : undefined
       const needsReviewer =
         !readScopeGate &&
-        ((!evaluatorEnforcing && !evaluatorPermitOnly) ||
+        (externalBashRequest ||
+          (!evaluatorEnforcing && !evaluatorPermitOnly) ||
           (evaluatorEnforcing && evaluatorDecision === "noop") ||
           (evaluatorPermitOnly && evaluatorPermitDecision !== "allow" && evaluatorPermitDecision !== "deny"))
       if (reviewerConfig?.mode === "audit-only" && needsReviewer && remaining > 0) {
@@ -1742,7 +1853,8 @@ const layer = Layer.effect(
                 directory: permissionSession.directory,
               }).pipe(Effect.catchCause(() => Effect.succeed(false)))
             : false
-          return { externalReadScopeRequest, readScopeGate, readScopePrimary }
+          const bashScopeRequest = inspectExternalBashScope({ info, snapshot, turn: reviewTurn })
+          return { externalReadScopeRequest, readScopeGate, readScopePrimary, bashScopeRequest }
         }),
       )
       // inspectThenRevalidateAuthority performs the persisted check as its final yielded operation. Do not add an
@@ -1751,9 +1863,11 @@ const layer = Layer.effect(
       const inspectedExternalReadScopeRequest = finalAuthority.inspection?.externalReadScopeRequest
       const inspectedReadScopeGate = finalAuthority.inspection?.readScopeGate ?? false
       const inspectedReadScopePrimary = finalAuthority.inspection?.readScopePrimary ?? false
+      const inspectedBashScopeRequest = finalAuthority.inspection?.bashScopeRequest
       const finalExternalReadScopeRequest = authorityStillCurrent ? inspectedExternalReadScopeRequest : undefined
       const finalReadScopeGate = authorityStillCurrent && inspectedReadScopeGate
       const finalReadScopePrimary = authorityStillCurrent && inspectedReadScopePrimary
+      const finalBashScopeRequest = authorityStillCurrent ? inspectedBashScopeRequest : undefined
       const builtinResult = builtin?.reviewResult
       const pluginPermits = pluginResult === undefined || pluginResult === "allow"
       const evaluatorPermits = !evaluatorEnforcing || evaluatorDecision === "allow" || evaluatorDecision === "noop"
@@ -1819,7 +1933,8 @@ const layer = Layer.effect(
         })
       const externalDirectoryAllowCandidate =
         externalDirectoryReviewCandidate &&
-        (snapshot.action.identity === "bash" || finalExternalReadScopeRequest !== undefined)
+        ((snapshot.action.identity === "bash" && finalBashScopeRequest !== undefined) ||
+          finalExternalReadScopeRequest !== undefined)
       if (pluginResult === "deny") result = "deny"
       else if (
         (evaluatorEnforcing && evaluatorDecision === "deny") ||
@@ -1854,6 +1969,7 @@ const layer = Layer.effect(
       } else if (builtinResult && "assessment" in builtinResult) {
         result = builtinResult.assessment.outcome === "deny" ? "deny" : "ask"
       } else if (
+        !externalBashRequest &&
         ((evaluatorEnforcing && evaluatorDecision === "allow") ||
           (evaluatorPermitOnly && evaluatorPermitDecision === "allow")) &&
         pluginPermits
@@ -1869,6 +1985,7 @@ const layer = Layer.effect(
       else result = "ask"
 
       let readScopeCode: ReadScopeCode | undefined
+      let bashScopeCode: BashScopeCode | undefined
       if (
         result === "allow" &&
         !finalReadScopeGate &&
@@ -1882,9 +1999,20 @@ const layer = Layer.effect(
       } else if (result === "allow" && finalReadScopeGate) {
         readScopeCode = "read_scope_reused"
       }
+      if (
+        result === "allow" &&
+        externalDirectoryAllowCandidate &&
+        snapshot.action.identity === "bash" &&
+        riskPolicyAssessment?.outcome === "allow" &&
+        reviewerConfig?.automatic_allow === "policy-gated" &&
+        otherSourcesPermit &&
+        finalBashScopeRequest
+      )
+        bashScopeCode = rememberBashScope(current, finalBashScopeRequest)
 
       const latencyMs = (yield* Clock.currentTimeMillis) - started
       if (readScopeCode) yield* auditReadScope({ info, origin: review.origin, code: readScopeCode })
+      if (bashScopeCode) yield* auditBashScope({ info, origin: review.origin, code: bashScopeCode })
       if (pluginResult === "error") {
         yield* Effect.logError("permission ask plugin failed or returned invalid status")
       }
@@ -2019,11 +2147,26 @@ const layer = Layer.effect(
         ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
         patternCount: info.patterns.length,
       })
-      return yield* Effect.acquireUseRelease(
-        Effect.sync(() => pending.set(id, { info, deferred })),
+      const pendingEntry: PendingEntry = {
+        info,
+        deferred,
+        externalBashRequest,
+        bashScopeRequest: initialBashScopeRequest,
+      }
+      yield* Effect.acquireUseRelease(
+        Effect.sync(() => pending.set(id, pendingEntry)),
         () => events.publish(Event.Asked, info).pipe(Effect.andThen(Deferred.await(deferred))),
         () => Effect.sync(() => pending.delete(id)),
       )
+      if (
+        pendingEntry.bashScopeRequest &&
+        (pendingEntry.reply === "once" || pendingEntry.reply === "always") &&
+        (yield* safelyRevalidateAuthority())
+      ) {
+        const code = rememberBashScope(current, pendingEntry.bashScopeRequest)
+        yield* auditBashScope({ info, origin: review.origin, code })
+      }
+      return
     })
 
     const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
@@ -2056,14 +2199,15 @@ const layer = Layer.effect(
             return result
           }
 
+          existing.reply = input.reply
           yield* Deferred.succeed(existing.deferred, undefined)
-          if (input.reply === "once") return result
+          if (input.reply === "once" || existing.externalBashRequest) return result
 
           for (const pattern of existing.info.always) {
             approved.push({ permission: existing.info.permission, pattern, action: "allow" })
           }
           for (const [id, item] of pending.entries()) {
-            if (item.info.sessionID !== existing.info.sessionID) continue
+            if (item.externalBashRequest || item.info.sessionID !== existing.info.sessionID) continue
             const ok = item.info.patterns.every(
               (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
             )

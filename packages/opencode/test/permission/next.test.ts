@@ -274,7 +274,7 @@ const withBashEvaluator = (input: {
     | false
     | {
         mode: "audit-only" | "enforce"
-        policy: "obvious-risk-only-v1"
+        policy: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
         automatic_allow?: "never" | "policy-gated"
         automatic_rewrite?: "never" | "once-per-turn"
       }
@@ -346,6 +346,35 @@ const bashRequest = (session: string, directory: string, complete = true, turnID
   ruleset: [],
   review: bashAction(directory, complete),
 })
+
+const externalBashRequest = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  directory: string,
+  externalDirectories: string[],
+  command = "rg TODO /tmp/external",
+) => {
+  const directories = externalDirectories.map((item) => path.resolve(item))
+  const patterns = directories.map((item) => path.join(item, "*").replaceAll("\\", "/"))
+  return {
+    sessionID,
+    tool: { messageID, callID: `external_bash_${messageID}` },
+    permission: "external_directory",
+    patterns,
+    metadata: { command, directories, patterns },
+    always: patterns,
+    ruleset: [],
+    review: {
+      origin: "tool" as const,
+      action: {
+        identity: "bash",
+        arguments: { command, timeout: 120_000, workdir: directory, shell: "/bin/bash" },
+        cwd: directory,
+        complete: true,
+      },
+    },
+  }
+}
 
 const projectSearchAction = (
   identity: "glob" | "grep",
@@ -5676,6 +5705,318 @@ it.instance(
     policy: "exceptional-risk-only-v1",
     automatic_allow: "policy-gated",
     automatic_rewrite: "once-per-turn",
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - external Bash always receives fresh Luna review and records related roots",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "External Bash scope" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const first = yield* tmpdirScoped()
+      const child = path.join(first, "child")
+      const unrelated = yield* tmpdirScoped()
+      yield* Effect.promise(() => mkdir(child))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(externalBashRequest(sessionID, turnID, test.directory, [first], "rg TODO first"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      yield* reviewerAsk(externalBashRequest(sessionID, turnID, test.directory, [child], "rg TODO child"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      yield* reviewerAsk(externalBashRequest(sessionID, turnID, test.directory, [unrelated], "file unrelated"))
+
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"bashScopeCode":"bash_scope_minted"')
+      expect(logs).toContain('"bashScopeCode":"bash_scope_reused"')
+      expect(logs).toContain('"bashScopeCode":"bash_scope_extended"')
+      expect(logs.match(/"dispositionAuthority":"automatic_allow"/gu)).toHaveLength(3)
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "allow" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  45_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - human external Bash approval is turn scoped and never becomes a learned global allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const external = yield* tmpdirScoped()
+      const firstSession = (yield* sessions.create({ title: "Manual external Bash scope" })).id
+      const firstTurn = yield* captureTrustedPersistedTurn({ sessionID: firstSession, rootSessionID: firstSession })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput(
+          "human_review",
+          "intent_unclear_or_conflicting",
+          "request_specific_authorisation",
+        ),
+      })
+      const first = yield* reviewerAsk(
+        externalBashRequest(firstSession, firstTurn, test.directory, [external], "inspect external"),
+      ).pipe(Effect.forkScoped)
+      const firstPending = yield* waitForPending(1)
+      yield* reply({ requestID: firstPending[0]!.id, reply: "always" })
+      yield* Fiber.join(first)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "specifically_authorised_operation", "none"),
+      })
+      yield* reviewerAsk(externalBashRequest(firstSession, firstTurn, test.directory, [external], "inspect again"))
+
+      const secondSession = (yield* sessions.create({ title: "Independent external Bash scope" })).id
+      const secondTurn = yield* captureTrustedPersistedTurn({ sessionID: secondSession, rootSessionID: secondSession })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput(
+          "human_review",
+          "intent_unclear_or_conflicting",
+          "request_specific_authorisation",
+        ),
+      })
+      const second = yield* reviewerAsk(
+        externalBashRequest(secondSession, secondTurn, test.directory, [external], "inspect external"),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(second)
+
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"bashScopeCode":"bash_scope_minted"')
+      expect(logs).toContain('"bashScopeCode":"bash_scope_reused"')
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "allow" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  20_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - permit-only evaluator ask remains inconclusive and requires fresh Luna allow",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "External Bash evaluator ask" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(externalBashRequest(sessionID, turnID, test.directory, [external], "inspect external"))
+
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"result":"ask"')
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).toContain('"bashScopeCode":"bash_scope_minted"')
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "ask" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - learned external Read approval cannot resolve a pending external Bash request",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "External Bash pending isolation" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      const externalFile = path.join(external, "evidence.txt")
+      yield* Effect.promise(() => writeFile(externalFile, "evidence"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () =>
+          obviousReviewerOutput("human_review", "intent_unclear_or_conflicting", "request_specific_authorisation"),
+      })
+
+      const readFiber = yield* reviewerAsk(
+        externalReadScopeRequest(sessionID, turnID, test.directory, externalFile),
+      ).pipe(Effect.forkScoped)
+      const bashFiber = yield* reviewerAsk(
+        externalBashRequest(sessionID, turnID, test.directory, [external], "inspect external"),
+      ).pipe(Effect.forkScoped)
+      const pending = yield* waitForPending(2)
+      const readPending = pending.find((item) => "filepath" in item.metadata)
+      expect(readPending).toBeDefined()
+      yield* reply({ requestID: readPending!.id, reply: "always" })
+      yield* Fiber.join(readFiber)
+
+      const remaining = yield* list()
+      expect(remaining).toHaveLength(1)
+      expect(remaining[0]!.id).toBe(pending.find((item) => "command" in item.metadata)!.id)
+      yield* rejectAll()
+      yield* Fiber.await(bashFiber)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  20_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - malformed external Bash scope and Luna human review remain explicit prompts",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const external = yield* tmpdirScoped()
+      const sessionID = (yield* sessions.create({ title: "Rejected external Bash scope" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const malformedRequest = externalBashRequest(sessionID, turnID, test.directory, [external], "inspect external")
+      malformedRequest.metadata.directories[0] = "relative/external"
+      const malformed = yield* reviewerAsk(malformedRequest).pipe(Effect.forkScoped)
+      const malformedPending = yield* waitForPending(1)
+      yield* reply({ requestID: malformedPending[0]!.id, reply: "always" })
+      yield* Fiber.join(malformed)
+
+      const independentSession = (yield* sessions.create({ title: "Malformed Bash approval isolation" })).id
+      const independentTurn = yield* captureTrustedPersistedTurn({
+        sessionID: independentSession,
+        rootSessionID: independentSession,
+      })
+      const externalFile = path.join(external, "evidence.txt")
+      yield* Effect.promise(() => writeFile(externalFile, "evidence"))
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput(
+          "human_review",
+          "intent_unclear_or_conflicting",
+          "request_specific_authorisation",
+        ),
+      })
+      const learnedEscape = yield* reviewerAsk(
+        externalReadScopeRequest(independentSession, independentTurn, test.directory, externalFile),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(learnedEscape)
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput(
+          "human_review",
+          "privilege_identity_or_security_boundary",
+          "request_specific_authorisation",
+        ),
+      })
+      const risky = yield* reviewerAsk(
+        externalBashRequest(sessionID, turnID, test.directory, [external], "sudo install helper"),
+      ).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(risky)
+
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain('"bashScopeCode"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  20_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - static deny stops external Bash before Luna",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const external = yield* tmpdirScoped()
+      const sessionID = (yield* sessions.create({ title: "Denied external Bash scope" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const request = {
+        ...externalBashRequest(sessionID, turnID, test.directory, [external], "inspect external"),
+        ruleset: [{ permission: "external_directory", pattern: "*", action: "deny" as const }],
+      }
+
+      expect(yield* fail(reviewerAsk(request))).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain('"bashScopeCode"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - malformed external Bash provenance forces Luna but remains human gated",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const external = yield* tmpdirScoped()
+      const sessionID = (yield* sessions.create({ title: "Malformed external Bash provenance" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const base = externalBashRequest(sessionID, turnID, test.directory, [external], "inspect external")
+      const request = { ...base, review: { ...base.review, origin: "doom_loop" as const } }
+
+      const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).not.toContain('"bashScopeCode"')
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "allow" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
   }),
   15_000,
 )
