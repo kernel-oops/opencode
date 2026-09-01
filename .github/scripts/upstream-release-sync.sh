@@ -48,6 +48,7 @@ readonly PATCH_BRANCHES=(
   "compacted-session-authority"
   "external-exact-include"
   "bash-external-scope"
+  "general-project-text-read"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -76,6 +77,7 @@ readonly PATCH_IDS=(
   "80468be8039fc410f261679a1026d8bb972508e1"
   "99ba9c009b245dcff39ecea03376185a10dd6ce0"
   "c1dc8b1e759d8b6ec072e2d118f271a95b65fee4"
+  "a5b4e07670244a14348dd59af75bbd1db8db700c"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -104,6 +106,7 @@ readonly PATCH_TIPS=(
   "19f00c8d7b4f7fdcbc275e62567e02facddf81f3"
   "5f08bb940ec5fcd1a72d280c5728f271aae958e0"
   "eb95a3b4710276f8d46e747eefa09952d4918650"
+  "b2bb5f86e55a8999b81ab74d53a68da67b042f95"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
