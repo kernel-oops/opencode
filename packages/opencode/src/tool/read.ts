@@ -8,7 +8,14 @@ import DESCRIPTION from "./read.txt"
 import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect, verifyExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
-import { isBinaryFile, isReadAttachmentMime, isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import {
+  isBinaryContent,
+  isBinaryFile,
+  isReadAttachmentContent,
+  isReadAttachmentMime,
+  isPdfAttachment,
+  sniffAttachmentMime,
+} from "@/util/media"
 import { bindProjectTextFile, closeBoundProjectTextFile, readBoundProjectTextFile } from "./read-bound-file"
 import { closeBoundExternalTextFile, readBoundExternalTextFile } from "./external-read-bound-file"
 import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
@@ -453,7 +460,7 @@ export const ReadTool = Tool.define<
             })
             const bytes = yield* Effect.promise(() => readBoundProjectTextFile(target))
             const sample = bytes.subarray(0, SAMPLE_BYTES)
-            if (isBinaryFile(target.path, sample)) {
+            if (isReadAttachmentContent(sample) || isBinaryContent(sample)) {
               return yield* Effect.fail(new Error(`Cannot read binary file: ${target.path}`))
             }
             const file = boundLines(bytes, {

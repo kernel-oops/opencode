@@ -1,6 +1,7 @@
 import { constants, watch, type FSWatcher } from "node:fs"
 import { lstat, open, statfs, type FileHandle } from "node:fs/promises"
 import path from "node:path"
+import { isBinaryContent, isReadAttachmentContent } from "@/util/media"
 import {
   digestExactBytes,
   generation,
@@ -12,8 +13,7 @@ import {
 
 const MAX_BOUND_TEXT_BYTES = 1024 * 1024
 const MAX_BOUND_PATH_COMPONENTS = 64
-
-const TEXT_EXTENSIONS = new Set([".inc", ".php", ".phpt", ".phtml"])
+const SAMPLE_BYTES = 4096
 const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]
 // Node's fs.watch is not a fail-closed remote-filesystem contract. Keep this route to local Linux filesystems
 // whose notification semantics are exercised here; every other filesystem remains on the human-authorised path.
@@ -48,7 +48,7 @@ export async function bindProjectTextFile(
   input: string,
   options: { readonly createWatcher?: typeof watch } = {},
 ): Promise<BoundProjectTextFile | undefined> {
-  if (process.platform !== "linux" || !TEXT_EXTENSIONS.has(path.extname(input).toLowerCase())) return undefined
+  if (process.platform !== "linux") return undefined
   const filepath = path.isAbsolute(input) ? path.resolve(input) : path.resolve(root, input)
   const target = path.relative(root, filepath)
   if (!target || target === ".." || target.startsWith(`..${path.sep}`) || path.isAbsolute(target)) return undefined
@@ -110,6 +110,13 @@ export async function bindProjectTextFile(
       fileGeneration.mountID !== mount
     )
       return undefined
+    const sampleSize = Math.min(Number(stat.size), SAMPLE_BYTES)
+    const sample = Buffer.allocUnsafe(sampleSize)
+    if (sampleSize > 0) {
+      const sampled = await file.read(sample, 0, sampleSize, 0)
+      if (sampled.bytesRead !== sampleSize) return undefined
+    }
+    if (isReadAttachmentContent(sample) || isBinaryContent(sample)) return undefined
     const contentDigest = await digestExactBytes(file, Number(fileGeneration.size))
     if (!sameGeneration(fileGeneration, await generation(file))) return undefined
     const result = {
