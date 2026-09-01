@@ -220,7 +220,7 @@ describe("tool.read pinned project text review", () => {
     }),
   )
 
-  it.live("allows the exact bounded PHP read shape with a truthful action", () =>
+  it.live("allows the exact bounded project text read shape with a truthful action", () =>
     Effect.gen(function* () {
       if (process.platform !== "linux") return
       const dir = yield* tmpdirScoped()
@@ -278,6 +278,96 @@ describe("tool.read pinned project text review", () => {
           snapshot,
         }),
       ).toBe(true)
+    }),
+  )
+
+  it.live("binds Twig and extensionless project text without an extension allow-list", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const files = [
+        ["_detailed_figure_row.html.twig", "{% set figure = detailedFigure %}\n"],
+        ["Dockerfile", "FROM scratch\n"],
+      ] as const
+
+      for (const [name, content] of files) {
+        const filepath = path.join(dir, name)
+        yield* put(filepath, content)
+        const captured = asks()
+        const args = { filePath: filepath, offset: 1, limit: 180 }
+
+        const result = yield* exec(dir, args, captured.next)
+        const action = resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: args,
+          directory: dir,
+          requested: captured.items.at(-1)?.action,
+        })
+
+        expect(result.output).toContain(content.trim())
+        expect(action).toMatchObject({
+          identity: "read",
+          cwd: dir,
+          complete: true,
+          arguments: {
+            filePath: filepath,
+            offset: 1,
+            limit: 180,
+            target: name,
+            mode: "pinned-project-text-v4",
+          },
+        })
+      }
+    }),
+  )
+
+  it.live("binds project text even when its filename has a binary or attachment extension", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const files = ["ordinary.dat", "ordinary.pdf", "ordinary.png"]
+
+      for (const name of files) {
+        const filepath = path.join(dir, name)
+        yield* put(filepath, `plain text in ${name}\n`)
+        const captured = asks()
+        const args = { filePath: filepath, offset: 1, limit: 20 }
+
+        const result = yield* exec(dir, args, captured.next)
+        const action = resolveReviewAction({
+          builtin: true,
+          identity: "read",
+          arguments: args,
+          directory: dir,
+          requested: captured.items.at(-1)?.action,
+        })
+
+        expect(result.output).toContain(`plain text in ${name}`)
+        expect(action).toMatchObject({
+          identity: "read",
+          complete: true,
+          arguments: { target: name, mode: "pinned-project-text-v4" },
+        })
+      }
+    }),
+  )
+
+  it.live("declines project media and binary bindings", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const dir = yield* tmpdirScoped()
+      const files = [
+        ["manual.txt", Buffer.from("%PDF-1.4\n% project document\n")],
+        ["image.txt", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+        ["payload.twig", Buffer.from([0x00, 0x01, 0x02, 0x03])],
+      ] as const
+
+      for (const [name, content] of files) {
+        const filepath = path.join(dir, name)
+        yield* put(filepath, content)
+        expect(yield* Effect.promise(() => bindProjectTextFile(dir, filepath))).toBeUndefined()
+      }
     }),
   )
 

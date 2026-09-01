@@ -20,6 +20,10 @@ export function isReadAttachmentMime(mime: string) {
   return READ_IMAGE_ATTACHMENT_MIMES.has(mime) || isPdfAttachment(mime)
 }
 
+export function isReadAttachmentContent(bytes: Uint8Array) {
+  return isReadAttachmentMime(sniffAttachmentMime(bytes, ""))
+}
+
 export function sniffAttachmentMime(bytes: Uint8Array, fallback: string) {
   if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png"
   if (startsWith(bytes, [0xff, 0xd8, 0xff])) return "image/jpeg"
@@ -67,6 +71,10 @@ export function isBinaryFile(filepath: string, bytes: Uint8Array) {
       return true
   }
 
+  return isBinaryContent(bytes)
+}
+
+export function isBinaryContent(bytes: Uint8Array) {
   if (bytes.length === 0) return false
 
   let nonPrintableCount = 0
