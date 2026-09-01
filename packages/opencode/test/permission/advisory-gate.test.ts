@@ -729,13 +729,31 @@ describe("generic built-in risk allow gate", () => {
         permission: "external_directory",
         assessment,
         snapshot: bash,
+        policy: "exceptional-risk-only-v1",
       }),
     ).toBe(true)
+    expect(
+      isExternalDirectoryRiskAllowCandidate({
+        settled: true,
+        permission: "external_directory",
+        assessment,
+        snapshot: bash,
+        policy: "obvious-risk-only-v1",
+      }),
+    ).toBe(false)
     for (const candidate of [
       { ...bash, action: { ...bash.action, identity: "write" } },
       { ...bash, action: { ...bash.action, complete: false } },
       { ...bash, action: { ...bash.action, omitted_items: 1 } },
       { ...bash, action: { ...bash.action, cwd: "relative/project" } },
+      {
+        ...bash,
+        action: { ...bash.action, arguments: { ...bashAction.arguments, workdir: "/tmp/other" } },
+      },
+      {
+        ...bash,
+        action: { ...bash.action, arguments: { ...bashAction.arguments, extra: true } },
+      },
       { ...bash, trusted: { ...bash.trusted, complete: false } },
     ]) {
       expect(
@@ -744,6 +762,7 @@ describe("generic built-in risk allow gate", () => {
           permission: "external_directory",
           assessment,
           snapshot: candidate,
+          policy: "exceptional-risk-only-v1",
         }),
       ).toBe(false)
     }
