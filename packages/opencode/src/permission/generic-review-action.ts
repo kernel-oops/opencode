@@ -17,6 +17,7 @@ interface Contract {
 }
 
 const contracts: Readonly<Record<string, Contract>> = {
+  glob: { permissions: ["glob"], cwd: "session", arguments: "invocation", requested: true },
   grep: { permissions: ["grep"], cwd: "session", arguments: "project_literal_grep", requested: true },
   read: { permissions: ["read"], cwd: "session", arguments: "project_text_file", requested: true },
   websearch: { permissions: ["websearch"], cwd: "not_applicable", arguments: "query" },
@@ -578,29 +579,36 @@ export function resolveReviewAction(input: {
   readonly requested?: PermissionV1.ReviewAction
 }): PermissionV1.ReviewAction {
   if (!input.builtin) return { identity: input.identity, arguments: input.arguments, complete: false }
+  const invocationFallback = () => {
+    if (!record(input.arguments)) return { identity: input.identity, arguments: input.arguments, complete: false }
+    return {
+      identity: input.identity,
+      arguments: { contract: invocationContract, effects_bound: false, invocation: input.arguments },
+      cwd: input.directory,
+      complete: true,
+    }
+  }
   const externalIdentity =
     input.permission === "external_directory" ? metadataTool(input.permissionMetadata) : undefined
-  const externalContractExpected =
-    input.permission === "external_directory" && Object.hasOwn(externalDirectoryContracts, input.identity)
   const contractIdentity = input.permission === "external_directory" ? externalIdentity : input.identity
   const contract =
     contractIdentity === input.identity
       ? input.permission === "external_directory"
         ? externalDirectoryContracts[contractIdentity]
         : contracts[contractIdentity]
-      : undefined
+      : contracts[input.identity]
   if (
     input.permission === "external_directory" &&
     (externalIdentity === "glob" || externalIdentity === "grep") &&
     !externalSearchBindingMetadata(input.permissionMetadata, externalIdentity)
   )
-    return { identity: input.identity, arguments: input.arguments, complete: false }
+    return invocationFallback()
   if (
     input.permission === "external_directory" &&
     externalIdentity === "read" &&
     !externalReadBindingMetadata(input.permissionMetadata)
   )
-    return { identity: input.identity, arguments: input.arguments, complete: false }
+    return invocationFallback()
   if (input.requested) {
     const boundExternalSearch = boundExternalSearchRequested({ ...input, requested: input.requested })
     if (boundExternalSearch) return input.requested
@@ -615,8 +623,6 @@ export function resolveReviewAction(input: {
       !contains(input.directory, input.requested.cwd)
     )
       return { identity: input.identity, arguments: input.arguments, complete: false }
-    if (externalContractExpected && !contract)
-      return { identity: input.identity, arguments: input.arguments, complete: false }
     if (
       contract &&
       (!record(input.requested) || !exactKeys(input.requested, ["arguments", "complete", "cwd", "identity"]))
@@ -624,17 +630,22 @@ export function resolveReviewAction(input: {
       return { identity: input.identity, arguments: input.arguments, complete: false }
     if (input.requested.identity !== input.identity)
       return { identity: input.identity, arguments: input.arguments, complete: false }
-    if (contract && !requestedArgumentsComplete(contract, input.arguments, input.requested.arguments))
-      return { ...input.requested, complete: false }
-    if (contract && !requestedActionComplete(contract, input.arguments, input.requested, input.directory))
-      return { ...input.requested, complete: false }
     if (!contract)
-      return input.identity === "read" || input.identity === "glob" || input.identity === "grep"
-        ? { ...input.requested, complete: false }
-        : input.requested
+      return input.requested.complete
+        ? input.requested
+        : { identity: input.identity, arguments: input.arguments, complete: false }
+    if (contract && !requestedArgumentsComplete(contract, input.arguments, input.requested.arguments))
+      return invocationFallback()
+    if (contract && !requestedActionComplete(contract, input.arguments, input.requested, input.directory))
+      return invocationFallback()
+    if (
+      (input.identity === "read" || input.identity === "glob" || input.identity === "grep") &&
+      !input.requested.complete
+    )
+      return invocationFallback()
     return input.requested
   }
-  if (contract?.requested) return { identity: input.identity, arguments: input.arguments, complete: false }
+  if (contract?.requested) return invocationFallback()
   if (!contract) return { identity: input.identity, arguments: input.arguments, complete: false }
   const arguments_ =
     contract.arguments === "invocation"

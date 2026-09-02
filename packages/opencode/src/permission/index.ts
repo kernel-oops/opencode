@@ -3,8 +3,8 @@ import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { ConfigPermissionReviewerV1 } from "@opencode-ai/core/v1/config/permission-reviewer"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Option, Scope } from "effect"
-import { randomUUID } from "crypto"
+import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Option, Schema, Scope } from "effect"
+import { createHmac, randomBytes, randomUUID } from "crypto"
 import { realpath, stat } from "node:fs/promises"
 import { and, eq } from "drizzle-orm"
 import os from "os"
@@ -39,6 +39,25 @@ import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type Evi
 import { auditCorrelationKey } from "./audit-correlation"
 import { exactSearchIncludeTarget } from "@/util/exact-search-include"
 import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
+import { builtinToolProvenance, verifyQuestionCompletion } from "@/session/tool-provenance"
+
+const QuestionPrompt = Schema.Struct({
+  question: Schema.String,
+  header: Schema.String,
+  options: Schema.mutable(
+    Schema.Array(
+      Schema.Struct({
+        label: Schema.String,
+        description: Schema.String,
+      }),
+    ),
+  ),
+  multiple: Schema.optional(Schema.Boolean),
+})
+const QuestionParameters = Schema.Struct({
+  questions: Schema.mutable(Schema.Array(QuestionPrompt)),
+})
+const QuestionAnswer = Schema.mutable(Schema.Array(Schema.String))
 
 export const Event = PermissionV1.Event
 
@@ -242,6 +261,7 @@ const layer = Layer.effect(
     const reviewer = yield* PermissionReviewer.Service
     const bashEvaluator = yield* BashPermissionEvaluator.Service
     const { db } = yield* Database.Service
+    const actionBindingKey = randomBytes(32)
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         const scope = yield* Scope.Scope
@@ -336,6 +356,46 @@ const layer = Layer.effect(
       if (prototype !== Object.prototype && prototype !== null) return false
       return Object.values(Object.getOwnPropertyDescriptors(value)).every((item) => "value" in item)
     }
+
+    const exactActionBinding = (value: unknown) => {
+      try {
+        const serialised = JSON.stringify(value)
+        if (serialised === undefined) return
+        return createHmac("sha256", actionBindingKey).update(serialised).digest("hex")
+      } catch {
+        return
+      }
+    }
+
+    const questionAnswerEvidence = Effect.fn("Permission.questionAnswerEvidence")(function* (
+      sessionID: SessionID,
+      turnID: MessageID,
+    ) {
+      const messages = yield* sessions.messages({ sessionID })
+      const evidence: EvidenceInput[] = []
+      for (const message of messages) {
+        if (message.info.role !== "assistant" || message.info.parentID !== turnID) continue
+        for (const part of message.parts) {
+          if (part.type !== "tool" || part.tool !== "question" || part.state.status !== "completed") continue
+          if (builtinToolProvenance(part) !== "question") continue
+          if (!verifyQuestionCompletion(part)) continue
+          if (!plainRecord(part.state.input) || !plainRecord(part.state.metadata)) continue
+          if (!Schema.is(QuestionParameters)(part.state.input)) continue
+          const questions = part.state.input.questions
+          const answers = part.state.metadata.answers
+          if (!Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length) continue
+          if (questions.length > 16) continue
+          for (const [index, question] of questions.entries()) {
+            const answer = answers[index]
+            if (!Schema.is(QuestionAnswer)(answer)) continue
+            const text = `Question: ${question.question}\nUser answer: ${answer.length ? answer.join(", ") : "Unanswered"}`
+            if (Buffer.byteLength(text, "utf8") > MAX_EVIDENCE_BYTES) continue
+            evidence.push({ source: "human", text })
+          }
+        }
+      }
+      return evidence
+    })
 
     const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => {
       const actual = Reflect.ownKeys(value)
@@ -908,10 +968,17 @@ const layer = Layer.effect(
           if (parent.id !== edge.root_session_id || edge.parent_turn_id !== edge.root_turn_id) return
           const admission = parentTurnData.permissionReview?.admission
           if (!validPermissionReviewAdmission(admission) || !admission.complete) return
+          const answers = yield* questionAnswerEvidence(
+            SessionID.make(edge.root_session_id),
+            MessageID.make(edge.root_turn_id),
+          )
           return {
             rootSessionID: edge.root_session_id,
             rootTurnID: edge.root_turn_id,
-            trusted: admission.text.map((text) => ({ source: "human" as const, text, id: edge.root_turn_id })),
+            trusted: [
+              ...admission.text.map((text) => ({ source: "human" as const, text, id: edge.root_turn_id })),
+              ...answers,
+            ],
           }
         }
         sessionID = parent.id
@@ -929,18 +996,12 @@ const layer = Layer.effect(
       if (Option.isNone(turn) || turn.value.info.role !== "user") return
       const admission = turn.value.info.permissionReview?.admission
       if (!validPermissionReviewAdmission(admission) || !admission.complete) return
+      const answers = yield* questionAnswerEvidence(sessionID, turnID)
       return {
         rootSessionID: sessionID,
         rootTurnID: turnID,
-        trusted: admission.text.map((text) => ({ source: "human" as const, text, id: turnID })),
+        trusted: [...admission.text.map((text) => ({ source: "human" as const, text, id: turnID })), ...answers],
       }
-    })
-
-    const directAuthorityExists = Effect.fn("Permission.directAuthorityExists")(function* (
-      sessionID: SessionID,
-      turnID: MessageID,
-    ) {
-      return (yield* resolveDirectAuthority(sessionID, turnID)) !== undefined
     })
 
     const sameEvidence = (left: readonly EvidenceInput[], right: readonly EvidenceInput[]) =>
@@ -996,16 +1057,14 @@ const layer = Layer.effect(
             Effect.catchCause(() => Effect.succeed(undefined)),
           )
         : undefined
-      const directTrusted =
-        directPromptAdmission && Option.isSome(persisted) && persisted.value.info.role === "user"
-          ? persisted.value.info.permissionReview!.admission.text.map((text) => ({
-              source: "human" as const,
-              text,
-              id: input.turnID,
-            }))
-          : undefined
+      const directAuthority = directPromptAdmission
+        ? yield* resolveDirectAuthority(SessionID.make(input.sessionID), MessageID.make(input.turnID)).pipe(
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          )
+        : undefined
+      const directTrusted = directAuthority?.trusted
       const trusted = boundedTrustedEvidence(delegated?.trusted ?? directTrusted ?? input.trusted)
-      const authorityComplete = directPromptAdmission || delegated !== undefined
+      const authorityComplete = directAuthority !== undefined || delegated !== undefined
       const trustedInputComplete = input.trustedComplete ?? input.complete ?? true
       const untrustedInputComplete = input.untrustedComplete ?? input.complete ?? true
       const effectiveRootSessionID = delegated?.rootSessionID ?? input.rootSessionID
@@ -1441,10 +1500,12 @@ const layer = Layer.effect(
         contextSafeForGate: false,
       }
       if (turn.directPromptAdmission) {
-        const direct = yield* directAuthorityExists(SessionID.make(info.sessionID), MessageID.make(turn.turnID)).pipe(
-          Effect.catchCause(() => Effect.succeed(false)),
+        const direct = yield* resolveDirectAuthority(SessionID.make(info.sessionID), MessageID.make(turn.turnID)).pipe(
+          Effect.catchCause(() => Effect.succeed(undefined)),
         )
-        if (!direct) turn = { ...turn, trusted: [], trustedComplete: false, contextSafeForGate: false }
+        turn = direct
+          ? { ...turn, trusted: direct.trusted, trustedComplete: true }
+          : { ...turn, trusted: [], trustedComplete: false, contextSafeForGate: false }
       } else if (turn.delegatedPromptAdmission) {
         const delegated = yield* resolveDelegatedAuthority({
           childSessionID: info.sessionID,
@@ -1454,6 +1515,7 @@ const layer = Layer.effect(
           ? { ...turn, trusted: delegated.trusted, trustedComplete: true }
           : { ...turn, trusted: [], trustedComplete: false, contextSafeForGate: false }
       }
+      if (activeTurnKey) current.turns.set(activeTurnKey, turn)
       const snapshot = buildPermissionReviewSnapshot({
         permission: info.permission,
         origin: source?.origin ?? "unknown",
@@ -1472,6 +1534,7 @@ const layer = Layer.effect(
       })
       const reviewTurn = turn
       const reviewActionBinding = JSON.stringify(snapshot.action)
+      const sourceActionBinding = exactActionBinding(source?.action)
       const initialBashScopeRequest = inspectExternalBashScope({ info, snapshot, turn })
       const externalReadScopeRequest = permissionSession
         ? yield* inspectExternalReadScope({
@@ -1785,6 +1848,8 @@ const layer = Layer.effect(
         })
         if (JSON.stringify(currentSnapshot.action) !== reviewActionBinding)
           return rejectAuthority("authority_action_changed")
+        if (exactActionBinding(source?.action) !== sourceActionBinding)
+          return rejectAuthority("authority_action_changed")
         if (info.tool) {
           const persistedToolMessage = yield* sessions
             .findMessage(info.sessionID, (message) => message.info.id === info.tool!.messageID)
@@ -1904,6 +1969,16 @@ const layer = Layer.effect(
           directory: permissionSession?.directory,
           allowExternalReadScope: finalReadScopePrimary,
         })
+      const semanticRiskCandidate =
+        authorityStillCurrent &&
+        automaticRiskConfig &&
+        riskPolicy === "exceptional-risk-only-v1" &&
+        source?.origin === "tool" &&
+        !(info.permission === "external_directory" && source.action?.identity === "bash") &&
+        source.action?.complete === true &&
+        sourceActionBinding !== undefined &&
+        builtin?.run.isSettled() === true &&
+        riskPolicyAssessment?.outcome === "allow"
       const genericCandidateRejection =
         authorityRejection ??
         (automaticRiskConfig &&
@@ -1949,7 +2024,7 @@ const layer = Layer.effect(
         if (
           riskPolicyAssessment.outcome === "allow" &&
           reviewerConfig?.automatic_allow === "policy-gated" &&
-          (bashRiskCandidate || genericRiskCandidate || externalDirectoryAllowCandidate) &&
+          (semanticRiskCandidate || bashRiskCandidate || genericRiskCandidate || externalDirectoryAllowCandidate) &&
           otherSourcesPermit
         ) {
           result = "allow"
