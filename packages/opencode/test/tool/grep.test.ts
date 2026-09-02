@@ -260,8 +260,17 @@ describe("tool.grep", () => {
             arguments: args,
             directory: test.directory,
             requested: { ...request.action!, arguments: argumentsValue },
-          }).complete,
-        ).toBe(false)
+          }),
+        ).toEqual({
+          identity: "grep",
+          arguments: {
+            contract: "registered-builtin-invocation-v1",
+            effects_bound: false,
+            invocation: args,
+          },
+          cwd: test.directory,
+          complete: true,
+        })
       }
       expect(
         isGenericRiskAllowCandidate({
@@ -513,7 +522,7 @@ describe("tool.grep", () => {
     }),
   )
 
-  it.instance("fails closed when retained plugin arguments are mutated", () =>
+  it.instance("falls back to the exact lower-assurance invocation when retained plugin arguments are mutated", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       yield* Effect.promise(() => Bun.write(path.join(test.directory, "Calendar.php"), "PUBLISHED-TTL\n"))
@@ -537,7 +546,16 @@ describe("tool.grep", () => {
       }
 
       const result = yield* grep.execute(args, next)
-      expect(resolved?.complete).toBe(false)
+      expect(resolved).toEqual({
+        identity: "grep",
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation: args,
+        },
+        cwd: test.directory,
+        complete: true,
+      })
       expect(result.output).toContain("PUBLISHED-TTL")
     }),
   )
@@ -635,7 +653,7 @@ describe("tool.grep", () => {
     }),
   )
 
-  it.instance("falls back to human authorisation for a hard-linked candidate", () =>
+  it.instance("retains the exact pinned directory action for a hard-linked search candidate", () =>
     Effect.gen(function* () {
       if (process.platform === "win32") return
       const test = yield* TestInstance
@@ -653,16 +671,22 @@ describe("tool.grep", () => {
       yield* grep.execute(args, captured.next)
       const action = resolveReviewAction({
         builtin: true,
+        permission: "grep",
         identity: "grep",
         arguments: args,
         directory: test.directory,
         requested: captured.items[0]?.action,
       })
-      expect(action.complete).toBe(false)
+      expect(captured.items[0]?.action).toMatchObject({
+        identity: "grep",
+        arguments: { contract: "pinned-project-search-v1" },
+        complete: true,
+      })
+      expect(action).toEqual(captured.items[0]?.action)
     }),
   )
 
-  it.instance("keeps an explicit child directory outside the generic root contract", () =>
+  it.instance("retains an exact pinned child-directory action", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const child = path.join(test.directory, "child")
@@ -678,6 +702,7 @@ describe("tool.grep", () => {
       const request = captured.items.at(-1)
       const action = resolveReviewAction({
         builtin: true,
+        permission: "grep",
         identity: "grep",
         arguments: args,
         directory: test.directory,
@@ -693,12 +718,19 @@ describe("tool.grep", () => {
         untrusted: [],
         contextSafeForGate: true,
       })
-      expect(action.cwd).toBe(child)
-      expect(snapshot.action.complete).toBe(false)
+      expect(request?.action).toMatchObject({
+        identity: "grep",
+        arguments: { contract: "pinned-project-search-v1" },
+        cwd: child,
+        complete: true,
+      })
+      expect(action).toEqual(request?.action)
+      expect(snapshot.action.cwd).toBe(child)
       expect(
         isGenericRiskAllowCandidate({
           settled: true,
           permission: "grep",
+          directory: test.directory,
           assessment: {
             outcome: "allow",
             reason_code: "routine_or_low_impact",
@@ -706,7 +738,7 @@ describe("tool.grep", () => {
           },
           snapshot,
         }),
-      ).toBe(false)
+      ).toBe(true)
     }),
   )
 
@@ -804,8 +836,17 @@ describe("tool.grep", () => {
           arguments: args,
           directory: test.directory,
           requested: captured.items.at(-1)?.action,
-        }).complete,
-      ).toBe(false)
+        }),
+      ).toEqual({
+        identity: "grep",
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation: args,
+        },
+        cwd: test.directory,
+        complete: true,
+      })
     }),
   )
 

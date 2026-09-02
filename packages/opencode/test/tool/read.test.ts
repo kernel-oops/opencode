@@ -577,7 +577,7 @@ describe("tool.read pinned project text review", () => {
     }),
   )
 
-  it.live("keeps symlinked PHP files on the legacy human-gated path", () =>
+  it.live("keeps symlinked PHP files off the pinned path and uses the exact lower-assurance invocation", () =>
     Effect.gen(function* () {
       if (process.platform === "win32") return
       const dir = yield* tmpdirScoped()
@@ -592,15 +592,25 @@ describe("tool.read pinned project text review", () => {
 
       const read = captured.items.find((item) => item.permission === "read")
       expect(read?.action).toMatchObject({ identity: "read", complete: false })
+      const args = { filePath: filepath, offset: 1, limit: 20 }
       expect(
         resolveReviewAction({
           builtin: true,
           identity: "read",
-          arguments: { filePath: filepath, offset: 1, limit: 20 },
+          arguments: args,
           directory: dir,
           requested: read?.action,
-        }).complete,
-      ).toBe(false)
+        }),
+      ).toEqual({
+        identity: "read",
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation: args,
+        },
+        cwd: dir,
+        complete: true,
+      })
     }),
   )
 
