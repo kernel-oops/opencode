@@ -24,6 +24,11 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { resolveReviewAction } from "@/permission/generic-review-action"
+import {
+  BUILTIN_TOOL_PROVENANCE_METADATA,
+  QUESTION_COMPLETION_PROVENANCE_METADATA,
+  signQuestionCompletion,
+} from "./tool-provenance"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -133,6 +138,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { args },
             )
             const result = yield* item.execute(args, ctx)
+            const genuineQuestionAnswers =
+              item.builtin && item.id === "question" ? structuredClone(result.metadata.answers) : undefined
             const output = {
               ...result,
               attachments: result.attachments?.map((attachment) => ({
@@ -147,6 +154,28 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
+            if (item.id === "question") {
+              yield* input.processor.updateToolCall(options.toolCallId, (match) => {
+                const metadata = { ...match.metadata }
+                delete metadata[BUILTIN_TOOL_PROVENANCE_METADATA]
+                delete metadata[QUESTION_COMPLETION_PROVENANCE_METADATA]
+                if (item.builtin && genuineQuestionAnswers !== undefined) {
+                  const completion = signQuestionCompletion({
+                    sessionID: ctx.sessionID,
+                    messageID: input.processor.message.id,
+                    callID: options.toolCallId,
+                    toolID: item.id,
+                    input: args,
+                    answers: genuineQuestionAnswers,
+                  })
+                  if (completion) {
+                    metadata[BUILTIN_TOOL_PROVENANCE_METADATA] = item.id
+                    metadata[QUESTION_COMPLETION_PROVENANCE_METADATA] = completion
+                  }
+                }
+                return { ...match, metadata }
+              })
+            }
             if (options.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }

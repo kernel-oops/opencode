@@ -141,7 +141,7 @@ describe("generic built-in risk allow gate", () => {
     },
   } satisfies PermissionReviewSnapshot
 
-  test("constructs complete actions only for trusted allowlisted built-ins", () => {
+  test("constructs complete invocation actions for registered built-ins", () => {
     expect(
       resolveReviewAction({
         builtin: true,
@@ -157,9 +157,13 @@ describe("generic built-in risk allow gate", () => {
       }),
     ).toEqual({
       identity: "glob",
-      arguments: { pattern: "*.md" },
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: { pattern: "*.md" },
+      },
       cwd: "/tmp/project",
-      complete: false,
+      complete: true,
     })
     expect(
       resolveReviewAction({
@@ -176,9 +180,13 @@ describe("generic built-in risk allow gate", () => {
       }),
     ).toEqual({
       identity: "grep",
-      arguments: { pattern: "TODO" },
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: { pattern: "TODO" },
+      },
       cwd: "/tmp/project",
-      complete: false,
+      complete: true,
     })
     expect(
       resolveReviewAction({
@@ -187,7 +195,7 @@ describe("generic built-in risk allow gate", () => {
         arguments: { pattern: "*.md" },
         directory: "/tmp/project",
       }).complete,
-    ).toBe(false)
+    ).toBe(true)
     expect(
       resolveReviewAction({
         builtin: true,
@@ -220,7 +228,7 @@ describe("generic built-in risk allow gate", () => {
     })
   })
 
-  test("keeps symlink-following read actions incomplete and human-gated", () => {
+  test("uses a lower-assurance invocation for unbound read while the specialised gate stays false", () => {
     const action = { identity: "read", arguments: { filePath: "README.md" } }
     expect(
       resolveReviewAction({
@@ -229,7 +237,16 @@ describe("generic built-in risk allow gate", () => {
         arguments: action.arguments,
         directory: "/tmp/project",
       }),
-    ).toEqual({ ...action, complete: false })
+    ).toEqual({
+      identity: "read",
+      arguments: {
+        contract: "registered-builtin-invocation-v1",
+        effects_bound: false,
+        invocation: action.arguments,
+      },
+      cwd: "/tmp/project",
+      complete: true,
+    })
     expect(
       isGenericRiskAllowCandidate({
         settled: true,
@@ -285,7 +302,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("requires exact bound project search contracts and rejects unbound filesystem invocations", () => {
+  test("prefers exact bound project search contracts and falls back to exact invocations", () => {
     const searches = [
       {
         identity: "glob",
@@ -370,7 +387,16 @@ describe("generic built-in risk allow gate", () => {
         directory: "/tmp/project",
         requested: { identity: item.identity, arguments: item.invocation, cwd: item.cwd, complete: true },
       })
-      expect(action.complete).toBe(false)
+      expect(action).toEqual({
+        identity: item.identity,
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation: item.invocation,
+        },
+        cwd: "/tmp/project",
+        complete: true,
+      })
     }
 
     const invocation = searches[1].invocation
@@ -403,7 +429,7 @@ describe("generic built-in risk allow gate", () => {
           directory: "/tmp/project",
           requested,
         }).complete,
-      ).toBe(false)
+      ).toBe(true)
     }
   })
 
@@ -505,7 +531,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("never upgrades explicit incomplete, custom, lossy, or mismatched fallback actions", () => {
+  test("upgrades registered incomplete invocations but rejects custom, lossy, or mismatched actions", () => {
     const invocation = { filePath: "a.ts", content: "value" }
     const requested = {
       identity: "write",
@@ -521,7 +547,7 @@ describe("generic built-in risk allow gate", () => {
         directory: "/tmp/project",
         requested,
       }).complete,
-    ).toBe(false)
+    ).toBe(true)
     expect(
       resolveReviewAction({
         builtin: false,
@@ -682,6 +708,16 @@ describe("generic built-in risk allow gate", () => {
 
       const inherited = Object.create({ tool: identity }) as Record<string, unknown>
       const accessor = Object.defineProperty({}, "tool", { get: () => identity }) as Record<string, unknown>
+      const fallback = {
+        identity,
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation,
+        },
+        cwd: "/tmp/project",
+        complete: true,
+      }
       for (const permissionMetadata of [undefined, {}, { tool: "other" }, { tool: 1 }, inherited, accessor]) {
         expect(
           resolveReviewAction({
@@ -692,7 +728,7 @@ describe("generic built-in risk allow gate", () => {
             arguments: invocation,
             directory: "/tmp/project",
           }),
-        ).toEqual({ identity, arguments: invocation, complete: false })
+        ).toEqual(fallback)
         expect(
           resolveReviewAction({
             builtin: true,
@@ -703,7 +739,7 @@ describe("generic built-in risk allow gate", () => {
             directory: "/tmp/project",
             requested: action,
           }),
-        ).toEqual({ identity, arguments: invocation, complete: false })
+        ).toEqual(fallback)
       }
     }
 
@@ -768,7 +804,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("keeps unattested glob and grep explicit paths incomplete and human-gated", () => {
+  test("represents unattested glob and grep paths as exact lower-assurance invocations", () => {
     for (const identity of ["glob", "grep"]) {
       for (const path of [".", "link-to-external"]) {
         const argumentsValue = { pattern: "*", path }
@@ -779,7 +815,16 @@ describe("generic built-in risk allow gate", () => {
             arguments: argumentsValue,
             directory: "/tmp/project",
           }),
-        ).toEqual({ identity, arguments: argumentsValue, complete: false })
+        ).toEqual({
+          identity,
+          arguments: {
+            contract: "registered-builtin-invocation-v1",
+            effects_bound: false,
+            invocation: argumentsValue,
+          },
+          cwd: "/tmp/project",
+          complete: true,
+        })
         expect(
           isGenericRiskAllowCandidate({
             settled: true,
@@ -801,7 +846,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("keeps unbound search actions human-authorised even when claimed at the exact session directory", () => {
+  test("allows Luna to assess unbound exact search invocations without a specialised contract", () => {
     for (const identity of ["glob", "grep"]) {
       const argumentsValue = { pattern: "*", path: "/tmp/project" }
       const action = resolveReviewAction({
@@ -811,7 +856,7 @@ describe("generic built-in risk allow gate", () => {
         directory: "/tmp/project",
         requested: { identity, arguments: argumentsValue, cwd: "/tmp/project", complete: true },
       })
-      expect(action.complete).toBe(false)
+      expect(action.complete).toBe(true)
       const exact = buildPermissionReviewSnapshot({
         permission: identity,
         origin: "tool",
@@ -829,7 +874,7 @@ describe("generic built-in risk allow gate", () => {
           assessment,
           snapshot: exact,
         }),
-      ).toBe(false)
+      ).toBe(identity === "glob")
       const child = resolveReviewAction({
         builtin: true,
         identity,
@@ -854,7 +899,7 @@ describe("generic built-in risk allow gate", () => {
           assessment,
           snapshot: childSnapshot,
         }),
-      ).toBe(false)
+      ).toBe(identity === "glob")
       expect(
         resolveReviewAction({
           builtin: true,
@@ -868,11 +913,11 @@ describe("generic built-in risk allow gate", () => {
             complete: true,
           },
         }).complete,
-      ).toBe(false)
+      ).toBe(true)
     }
   })
 
-  test("accepts only a truthful built-in pinned project text action", () => {
+  test("prefers a truthful pinned project text action and falls back to exact invocation", () => {
     const input = { filePath: "/tmp/project/src/page.php", offset: 10, limit: 20 }
     const action = {
       identity: "read",
@@ -928,8 +973,13 @@ describe("generic built-in risk allow gate", () => {
           arguments: input,
           directory: "/tmp/project",
           requested: invalid,
-        }).complete,
-      ).toBe(false)
+        }),
+      ).toEqual({
+        identity: "read",
+        arguments: { contract: "registered-builtin-invocation-v1", effects_bound: false, invocation: input },
+        cwd: "/tmp/project",
+        complete: true,
+      })
     }
     expect(
       resolveReviewAction({
@@ -958,7 +1008,7 @@ describe("generic built-in risk allow gate", () => {
           directory: "/tmp/project",
           requested: { ...action, arguments: argumentsValue },
         }).complete,
-      ).toBe(false)
+      ).toBe(true)
     }
     expect(accessed).toBe(false)
   })
