@@ -10,8 +10,7 @@ import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { SessionTools } from "@/session/tools"
-import { Tool } from "@/tool/tool"
-import { ToolRegistry } from "@/tool/registry"
+import { ToolRegistry, type Registered } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -46,13 +45,21 @@ const fakePlugin = Plugin.Service.of({
   init: () => Effect.void,
   list: () => Effect.succeed([]),
   trigger: (_name, _input, output) => Effect.succeed(output),
+  preparePermissionAsk: () => Effect.succeed(undefined),
 } satisfies Plugin.Interface)
 
 const fakePermission = Permission.Service.of({
   ask: () => Effect.void,
   reply: () => Effect.void,
   list: () => Effect.succeed([]),
+  captureTurn: () => Effect.void,
+  captureUntrusted: () => Effect.void,
+  authoriseTaskDelegation: () => Effect.succeed(undefined),
+  captureTaskDelegation: () => Effect.void,
+  canResumeTask: () => Effect.succeed(false),
 } satisfies Permission.Interface)
+
+const fakeSession = Session.Service.of({} as Partial<Session.Interface> as Session.Interface)
 
 const fakeTruncate = Truncate.Service.of({
   cleanup: () => Effect.void,
@@ -64,6 +71,7 @@ const fakeTruncate = Truncate.Service.of({
 const layer = Layer.mergeAll(
   Layer.succeed(Plugin.Service, fakePlugin),
   Layer.succeed(Permission.Service, fakePermission),
+  Layer.succeed(Session.Service, fakeSession),
   Layer.succeed(MCP.Service, fakeMcp()),
   Layer.succeed(Truncate.Service, fakeTruncate),
   RuntimeFlags.layer(),
@@ -77,6 +85,7 @@ const layer = Layer.mergeAll(
         Effect.succeed([
           {
             id: "timing",
+            builtin: true,
             description: "updates metadata more than once",
             parameters: Schema.Struct({}),
             jsonSchema: { type: "object", properties: {} },
@@ -86,7 +95,7 @@ const layer = Layer.mergeAll(
                 yield* ctx.metadata({ metadata: { output: "second" } })
                 return { title: "timing", metadata: {}, output: "done" }
               }),
-          } satisfies Tool.Def,
+          } satisfies Registered,
         ]),
     }),
   ),
