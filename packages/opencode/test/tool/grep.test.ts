@@ -669,20 +669,22 @@ describe("tool.grep", () => {
       const args = { pattern: "PUBLISHED-TTL", path: test.directory }
 
       yield* grep.execute(args, captured.next)
+      const request = captured.items[0]
+      if (!request?.action) throw new Error("grep permission action was not captured")
       const action = resolveReviewAction({
         builtin: true,
         permission: "grep",
         identity: "grep",
         arguments: args,
         directory: test.directory,
-        requested: captured.items[0]?.action,
+        requested: request.action,
       })
-      expect(captured.items[0]?.action).toMatchObject({
+      expect(request.action).toMatchObject({
         identity: "grep",
         arguments: { contract: "pinned-project-search-v1" },
         complete: true,
       })
-      expect(action).toEqual(captured.items[0]?.action)
+      expect(action).toEqual(request.action)
     }),
   )
 
@@ -700,13 +702,14 @@ describe("tool.grep", () => {
       yield* grep.execute(args, captured.next)
 
       const request = captured.items.at(-1)
+      if (!request?.action) throw new Error("grep permission action was not captured")
       const action = resolveReviewAction({
         builtin: true,
         permission: "grep",
         identity: "grep",
         arguments: args,
         directory: test.directory,
-        requested: request?.action,
+        requested: request.action,
       })
       const snapshot = buildPermissionReviewSnapshot({
         permission: "grep",
@@ -718,13 +721,13 @@ describe("tool.grep", () => {
         untrusted: [],
         contextSafeForGate: true,
       })
-      expect(request?.action).toMatchObject({
+      expect(request.action).toMatchObject({
         identity: "grep",
         arguments: { contract: "pinned-project-search-v1" },
         cwd: child,
         complete: true,
       })
-      expect(action).toEqual(request?.action)
+      expect(action).toEqual(request.action)
       expect(snapshot.action.cwd).toBe(child)
       expect(
         isGenericRiskAllowCandidate({
