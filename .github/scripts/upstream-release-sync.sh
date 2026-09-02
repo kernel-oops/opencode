@@ -50,6 +50,8 @@ readonly PATCH_BRANCHES=(
   "bash-external-scope"
   "general-project-text-read"
   "low-prompt-luna-authority"
+  "low-prompt-question-schema-compat"
+  "v26-session-tools-test-compat"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -80,6 +82,8 @@ readonly PATCH_IDS=(
   "c1dc8b1e759d8b6ec072e2d118f271a95b65fee4"
   "a5b4e07670244a14348dd59af75bbd1db8db700c"
   "a35ecfb7e7ccc6e46e93533d5221bd2c9f3c58a3"
+  "aaf3a7356c813b06556c833eea5cbaca71f05aa1"
+  "146824dd441018f1917c0ef02b2cabd6c3993d3f"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -110,6 +114,8 @@ readonly PATCH_TIPS=(
   "eb95a3b4710276f8d46e747eefa09952d4918650"
   "b2bb5f86e55a8999b81ab74d53a68da67b042f95"
   "de13e385434be26f68ab232bc13e3d73863d477b"
+  "88ab5e2c14452a02076d2dee8d1c704ec99632c7"
+  "2f66107ab60e46c23e72ef851eb9125403ac34fa"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
@@ -146,6 +152,7 @@ readonly REVIEWED_TESTS=(
   "packages/opencode/test/server/instance-eviction.test.ts"
   "packages/opencode/test/server/project-init-git.test.ts"
   "packages/opencode/test/session/prompt.test.ts"
+  "packages/opencode/test/session/tools.test.ts"
   "packages/opencode/test/session/schema-decoding.test.ts"
   "packages/opencode/test/tool/registry.test.ts"
   "packages/opencode/test/tool/shell.test.ts"
