@@ -39,12 +39,25 @@ import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type Evi
 import { auditCorrelationKey } from "./audit-correlation"
 import { exactSearchIncludeTarget } from "@/util/exact-search-include"
 import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
-import { Question } from "@/question"
 import { builtinToolProvenance, verifyQuestionCompletion } from "@/session/tool-provenance"
 
-const QuestionParameters = Schema.Struct({
-  questions: Schema.mutable(Schema.Array(Question.Prompt)),
+const QuestionPrompt = Schema.Struct({
+  question: Schema.String,
+  header: Schema.String,
+  options: Schema.mutable(
+    Schema.Array(
+      Schema.Struct({
+        label: Schema.String,
+        description: Schema.String,
+      }),
+    ),
+  ),
+  multiple: Schema.optional(Schema.Boolean),
 })
+const QuestionParameters = Schema.Struct({
+  questions: Schema.mutable(Schema.Array(QuestionPrompt)),
+})
+const QuestionAnswer = Schema.mutable(Schema.Array(Schema.String))
 
 export const Event = PermissionV1.Event
 
@@ -374,7 +387,7 @@ const layer = Layer.effect(
           if (questions.length > 16) continue
           for (const [index, question] of questions.entries()) {
             const answer = answers[index]
-            if (!Schema.is(Question.Answer)(answer)) continue
+            if (!Schema.is(QuestionAnswer)(answer)) continue
             const text = `Question: ${question.question}\nUser answer: ${answer.length ? answer.join(", ") : "Unanswered"}`
             if (Buffer.byteLength(text, "utf8") > MAX_EVIDENCE_BYTES) continue
             evidence.push({ source: "human", text })
