@@ -52,6 +52,7 @@ readonly PATCH_BRANCHES=(
   "low-prompt-luna-authority"
   "low-prompt-question-schema-compat"
   "v26-session-tools-test-compat"
+  "low-prompt-test-semantics"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -84,6 +85,7 @@ readonly PATCH_IDS=(
   "a35ecfb7e7ccc6e46e93533d5221bd2c9f3c58a3"
   "aaf3a7356c813b06556c833eea5cbaca71f05aa1"
   "146824dd441018f1917c0ef02b2cabd6c3993d3f"
+  "826f0bdf14aaebd3496da6682f8daaed90d9015a"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -116,6 +118,7 @@ readonly PATCH_TIPS=(
   "de13e385434be26f68ab232bc13e3d73863d477b"
   "88ab5e2c14452a02076d2dee8d1c704ec99632c7"
   "2f66107ab60e46c23e72ef851eb9125403ac34fa"
+  "74248cf968a43261ad20c9bc1bde967bf4b0b0c4"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
