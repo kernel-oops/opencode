@@ -816,12 +816,14 @@ const genericLiteralGrepRequest = (sessionID: SessionID, turnID: MessageID, dire
 const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn")(function* (input: {
   sessionID: SessionID
   rootSessionID: SessionID
+  text?: string
   untrustedComplete?: boolean
   contextSafeForGate?: boolean
 }) {
   const sessions = yield* Session.Service
   const permission = yield* Permission.Service
   const turnID = MessageID.ascending()
+  const text = input.text ?? "Find Markdown files"
   const message: SessionV1.User = {
     id: turnID,
     sessionID: input.sessionID,
@@ -830,7 +832,7 @@ const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn"
     agent: "build",
     model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
     permissionReview: {
-      admission: buildPermissionReviewAdmission([{ type: "text", text: "Find Markdown files" }]),
+      admission: buildPermissionReviewAdmission([{ type: "text", text }]),
     },
   }
   yield* sessions.updateMessage(message)
@@ -838,7 +840,7 @@ const captureTrustedPersistedTurn = Effect.fn("test.captureTrustedPersistedTurn"
     sessionID: input.sessionID,
     rootSessionID: input.rootSessionID,
     turnID,
-    trusted: [{ source: "human", text: "Find Markdown files" }],
+    trusted: [{ source: "human", text }],
     untrusted: [],
     trustedComplete: true,
     untrustedComplete: input.untrustedComplete,
@@ -6240,9 +6242,13 @@ it.instance(
       const test = yield* TestInstance
       const sessions = yield* Session.Service
       const sessionID = (yield* sessions.create({ title: "Redacted exact Bash" })).id
-      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
       const command =
         "umask 077; printf '%s\\n' 'GOOGLE_OAUTH_CLIENT_SECRET=dummy-value' > var/google-oidc-client-secret; chmod 600 var/google-oidc-client-secret"
+      const turnID = yield* captureTrustedPersistedTurn({
+        sessionID,
+        rootSessionID: sessionID,
+        text: `Run this exact command: ${command}`,
+      })
       const allowed = bashRequest(sessionID, test.directory, true, turnID)
       allowed.patterns[0] = command
       allowed.review.action.arguments.command = command

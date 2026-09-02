@@ -1876,11 +1876,7 @@ const layer = Layer.effect(
           authority.rootSessionID !== active.rootSessionID ||
           authority.rootTurnID !== active.rootTurnID ||
           !sameEvidence(authority.trusted, active.trusted) ||
-          snapshot.trusted.items.length !== authority.trusted.length ||
-          !authority.trusted.every((item, index) => {
-            const reviewed = snapshot.trusted.items[index]
-            return reviewed?.source === item.source && reviewed.text === item.text
-          })
+          JSON.stringify(snapshot.trusted) !== JSON.stringify(currentSnapshot.trusted)
         )
           return rejectAuthority("authority_evidence_changed")
         if (!active.contextSafeForGate) return rejectAuthority("context_unsafe")
