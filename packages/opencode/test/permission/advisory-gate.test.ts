@@ -1182,6 +1182,8 @@ describe("generic built-in risk allow gate", () => {
             action: {
               ...globSnapshot.action,
               ...action,
+              arguments: action.arguments as PermissionReviewSnapshot["action"]["arguments"],
+              cwd: action.cwd ?? undefined,
               permission: identity,
               origin: "tool",
               cwd_status: "exact",
