@@ -23,7 +23,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { resolveReviewAction } from "@/permission/generic-review-action"
+import { resolveReviewAction, type ReviewToolRegistration } from "@/permission/generic-review-action"
 import {
   BUILTIN_TOOL_PROVENANCE_METADATA,
   QUESTION_COMPLETION_PROVENANCE_METADATA,
@@ -67,7 +67,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     toolID: string,
     args: Record<string, unknown>,
     options: ToolExecutionOptions,
-    builtin = false,
+    registration?: ReviewToolRegistration | { readonly kind: "builtin"; readonly resolvedID: string },
   ): Tool.Context => ({
     sessionID: input.session.id,
     abort: options.abortSignal!,
@@ -105,7 +105,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             session: lineage,
             arguments: args,
             action: resolveReviewAction({
-              builtin,
+              builtin: registration?.kind === "builtin",
+              registration: registration?.kind === "builtin" ? undefined : registration,
               permission: req.permission,
               permissionMetadata: req.metadata,
               identity: toolID,
@@ -131,13 +132,19 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       execute(args, options) {
         return run.promise(
           Effect.gen(function* () {
-            const ctx = context(item.id, args, options, item.builtin)
             yield* plugin.trigger(
               "tool.execute.before",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+              { tool: item.id, sessionID: input.session.id, callID: options.toolCallId },
               { args },
             )
-            const result = yield* item.execute(args, ctx)
+            const executionArgs = structuredClone(args)
+            const ctx = context(
+              item.id,
+              executionArgs,
+              options,
+              item.builtin ? { kind: "builtin", resolvedID: item.id } : { kind: "custom", resolvedID: item.id },
+            )
+            const result = yield* item.execute(executionArgs, ctx)
             const genuineQuestionAnswers =
               item.builtin && item.id === "question" ? structuredClone(result.metadata.answers) : undefined
             const output = {
@@ -151,7 +158,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
             yield* plugin.trigger(
               "tool.execute.after",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
+              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args: executionArgs },
               output,
             )
             if (item.id === "question") {
@@ -165,7 +172,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                     messageID: input.processor.message.id,
                     callID: options.toolCallId,
                     toolID: item.id,
-                    input: args,
+                    input: executionArgs,
                     answers: genuineQuestionAnswers,
                   })
                   if (completion) {
@@ -209,7 +216,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(MCP_RESOURCE_TOOLS.list, toRecord(args), opts, true)
+            const ctx = context(MCP_RESOURCE_TOOLS.list, toRecord(args), opts, {
+              kind: "builtin",
+              resolvedID: MCP_RESOURCE_TOOLS.list,
+            })
             const clients = yield* mcp.clients()
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -298,7 +308,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseListMcpResourcesArgs(args)
-            const ctx = context(MCP_RESOURCE_TOOLS.listTemplates, toRecord(args), opts, true)
+            const ctx = context(MCP_RESOURCE_TOOLS.listTemplates, toRecord(args), opts, {
+              kind: "builtin",
+              resolvedID: MCP_RESOURCE_TOOLS.listTemplates,
+            })
             const clients = yield* mcp.clients()
             const resourceServers = Object.entries(clients)
               .filter((entry) => !!entry[1].getServerCapabilities()?.resources)
@@ -391,7 +404,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         return run.promise(
           Effect.gen(function* () {
             const parsed = parseReadMcpResourceArgs(args)
-            const ctx = context(MCP_RESOURCE_TOOLS.read, toRecord(args), opts, true)
+            const ctx = context(MCP_RESOURCE_TOOLS.read, toRecord(args), opts, {
+              kind: "builtin",
+              resolvedID: MCP_RESOURCE_TOOLS.read,
+            })
             const clients = yield* mcp.clients()
             const client = clients[parsed.server]
             if (!client) {
@@ -469,15 +485,23 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     item.execute = (args, opts) =>
       run.promise(
         Effect.gen(function* () {
-          const ctx = context(key, args, opts)
           yield* plugin.trigger(
             "tool.execute.before",
-            { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
+            { tool: key, sessionID: input.session.id, callID: opts.toolCallId },
             { args },
+          )
+          const executionArgs = structuredClone(args)
+          const ctx = context(
+            key,
+            executionArgs,
+            opts,
+            entry.server
+              ? { kind: "mcp", resolvedID: key, server: entry.server, nativeName: entry.def.name }
+              : undefined,
           )
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
-            return yield* Effect.promise(() => execute(args, opts))
+            return yield* Effect.promise(() => execute(executionArgs, opts))
           }).pipe(
             Effect.withSpan("Tool.execute", {
               attributes: {
@@ -490,7 +514,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           )
           yield* plugin.trigger(
             "tool.execute.after",
-            { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
+            { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args: executionArgs },
             result,
           )
 

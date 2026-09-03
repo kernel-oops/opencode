@@ -4435,7 +4435,7 @@ it.instance(
       const filePath = path.join(external, "media.pdf")
       yield* Effect.promise(() => Promise.all([writeFile(textPath, "bound text\n"), writeFile(filePath, "%PDF-1.4\n")]))
       reviewerLanguage = new MockLanguageModelV3({
-        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
 
       yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, textPath))
@@ -5569,6 +5569,46 @@ it.instance(
 )
 
 it.instance(
+  "generic reviewer - registered MCP invocation can be automatically allowed",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Registered Tavily allow" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const identity = "tavily_tavily_search"
+      const action = resolveReviewAction({
+        builtin: false,
+        registration: { kind: "mcp", resolvedID: identity, server: "tavily", nativeName: "tavily_search" },
+        permission: identity,
+        identity,
+        arguments: { query: "SkyDemon CSV headers", max_results: 5 },
+        directory: test.directory,
+      })
+
+      yield* reviewerAsk({
+        sessionID,
+        tool: { messageID: turnID, callID: "call_registered_tavily" },
+        permission: identity,
+        patterns: ["*"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", action },
+      })
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).not.toContain('"candidateRejection":"contract_unknown"')
+    }),
+  withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated" }),
+  15_000,
+)
+
+it.instance(
   "generic reviewer - custom Read, Glob, and Grep name collisions remain human-gated",
   () =>
     Effect.gen(function* () {
@@ -5621,6 +5661,20 @@ it.instance(
       const sessions = yield* Session.Service
       const sessionID = (yield* sessions.create({ title: "Incomplete generic glob" })).id
       const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+
+      let attempts = 0
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          attempts++
+          return attempts === 1
+            ? reviewerOutput("allow")
+            : obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+        },
+      })
+      yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory))
+      expect(attempts).toBe(2)
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain("permission review retry")
 
       reviewerLanguage = new MockLanguageModelV3({ doStream: reviewerOutput("allow") })
       const malformed = yield* reviewerAsk(genericGlobRequest(sessionID, turnID, test.directory)).pipe(

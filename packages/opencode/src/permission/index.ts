@@ -1646,7 +1646,7 @@ const layer = Layer.effect(
               }),
             ),
         ).pipe(Effect.provideService(InstanceRef, instance))
-      const waitReviewer = (timeoutMs: number) =>
+      const waitReviewerOnce = (timeoutMs: number) =>
         prepareReviewer(timeoutMs).pipe(
           Effect.flatMap((run) =>
             run.result.pipe(
@@ -1658,6 +1658,28 @@ const layer = Layer.effect(
             ),
           ),
         )
+      const waitReviewer = (timeoutMs: number) =>
+        Effect.gen(function* () {
+          const first = yield* waitReviewerOnce(timeoutMs)
+          if (
+            !("failure" in first.reviewResult) ||
+            first.reviewResult.failure !== "malformed" ||
+            !first.run.isSettled()
+          )
+            return first
+          const remaining = Math.max(0, deadline - (yield* Clock.currentTimeMillis))
+          if (remaining === 0) return first
+          const auditCorrelationKey = correlation(info, review.origin)
+          yield* Effect.logInfo("permission review retry", {
+            source: "builtin",
+            permission: info.permission,
+            origin: review.origin,
+            ...(auditCorrelationKey ? { auditCorrelationKey } : {}),
+            failure: "malformed",
+            attempt: 1,
+          })
+          return yield* waitReviewerOnce(remaining)
+        })
 
       const evaluatorApplicable = info.permission === "bash" || source?.action?.identity === "bash"
       const waitEvaluator =
