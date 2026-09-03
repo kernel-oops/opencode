@@ -125,6 +125,8 @@ function hydrate(db: Database.Interface["db"], rows: (typeof MessageTable.$infer
 function providerMeta(metadata: Record<string, any> | undefined) {
   if (!metadata) return undefined
   const { providerExecuted: _, ...rest } = metadata
+  delete rest.permissionReviewBuiltinTool
+  delete rest.permissionReviewQuestionCompletion
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 

@@ -319,7 +319,7 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("converts assistant tool completion into tool-call + tool-result messages with attachments", async () => {
+  test("converts assistant tool completion and strips private metadata", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
 
@@ -365,7 +365,11 @@ describe("session.message-v2.toModelMessage", () => {
                 },
               ],
             },
-            metadata: { openai: { tool: "meta" } },
+            metadata: {
+              permissionReviewBuiltinTool: "question",
+              permissionReviewQuestionCompletion: "signed-completion",
+              openai: { tool: "meta" },
+            },
           },
         ] as SessionV1.Part[],
       },
