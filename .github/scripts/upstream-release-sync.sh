@@ -56,6 +56,7 @@ readonly PATCH_BRANCHES=(
   "low-prompt-test-semantics-types"
   "trusted-evidence-redaction-fix"
   "question-provider-metadata-fix"
+  "fix/controlled-local-payload-review"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -92,6 +93,7 @@ readonly PATCH_IDS=(
   "101ac753c78bf6a7cd798f49ac840f7ac150e117"
   "ab455b8e8c6aebc85163df5048bf86a4d97d73e1"
   "dcb7d4126d93b9a0249b1a56f24a4a7792d5e5e3"
+  "b54bcdb3c566414afd90d71a34d76b919dd804a8"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -128,6 +130,7 @@ readonly PATCH_TIPS=(
   "49c0131dd05027108d1b94ab9e3cde5c69cae0f2"
   "a6a7925dbaef0329dd67fee019b4c648229ca91b"
   "10a6c7a0526ad51e95fcd9acba74e05e505e4fd4"
+  "8578d97a2a735055a78289b08414c114c0566265"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
