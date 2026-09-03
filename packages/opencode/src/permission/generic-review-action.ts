@@ -12,7 +12,13 @@ import {
 interface Contract {
   readonly permissions: readonly string[]
   readonly cwd: "session" | "not_applicable"
-  readonly arguments: "project_text_file" | "project_literal_grep" | "mcp_resource" | "query" | "invocation"
+  readonly arguments:
+    | "project_text_file"
+    | "project_literal_grep"
+    | "mcp_resource"
+    | "query"
+    | "invocation"
+    | "registered_tool_invocation"
   readonly requested?: boolean
 }
 
@@ -39,6 +45,7 @@ const externalDirectoryContracts: Readonly<Record<string, Contract>> = {
 }
 
 const invocationContract = "registered-builtin-invocation-v1"
+const registeredToolInvocationContract = "registered-tool-invocation-v1"
 const boundExternalSearchContract = "pinned-external-search-v1"
 const boundProjectSearchContract = "pinned-project-search-v1"
 const boundExternalReadContract = "pinned-external-text-v1"
@@ -57,10 +64,70 @@ function argumentsComplete(contract: Contract, value: unknown) {
       input.effects_bound === false &&
       record(input.invocation)
     )
+  if (contract.arguments === "registered_tool_invocation") return registeredToolInvocationArguments(value)
   if (!exactKeys(input, ["server", "uri"])) return false
   return (
     typeof input.server === "string" && input.server.length > 0 && typeof input.uri === "string" && input.uri.length > 0
   )
+}
+
+export type ReviewToolRegistration =
+  | { readonly kind: "custom"; readonly resolvedID: string }
+  | { readonly kind: "mcp"; readonly resolvedID: string; readonly server: string; readonly nativeName: string }
+
+function registeredToolInvocationArguments(value: unknown, identity?: string) {
+  if (!record(value) || !exactKeys(value, ["contract", "effects_bound", "invocation", "registration"])) return false
+  if (
+    value.contract !== registeredToolInvocationContract ||
+    value.effects_bound !== false ||
+    !record(value.invocation) ||
+    !record(value.registration)
+  )
+    return false
+  const registration = value.registration
+  if (registration.kind === "custom") {
+    if (!exactKeys(registration, ["kind", "resolved_id"])) return false
+  } else if (registration.kind === "mcp") {
+    if (!exactKeys(registration, ["kind", "native_name", "resolved_id", "server"])) return false
+    if (typeof registration.server !== "string" || registration.server.length === 0) return false
+    if (typeof registration.native_name !== "string" || registration.native_name.length === 0) return false
+  } else return false
+  return (
+    typeof registration.resolved_id === "string" &&
+    registration.resolved_id.length > 0 &&
+    (identity === undefined || registration.resolved_id === identity)
+  )
+}
+
+function registeredToolInvocation(input: {
+  readonly registration?: ReviewToolRegistration
+  readonly identity: string
+  readonly arguments: unknown
+  readonly directory: string
+}) {
+  const registration = input.registration
+  if (!registration || registration.resolvedID !== input.identity || !record(input.arguments)) return
+  if (registration.kind === "mcp" && (registration.server.length === 0 || registration.nativeName.length === 0)) return
+  const registrationRecord =
+    registration.kind === "mcp"
+      ? {
+          kind: registration.kind,
+          resolved_id: registration.resolvedID,
+          server: registration.server,
+          native_name: registration.nativeName,
+        }
+      : { kind: registration.kind, resolved_id: registration.resolvedID }
+  return {
+    identity: input.identity,
+    arguments: {
+      contract: registeredToolInvocationContract,
+      effects_bound: false,
+      registration: registrationRecord,
+      invocation: input.arguments,
+    },
+    cwd: input.directory,
+    complete: true,
+  } satisfies PermissionV1.ReviewAction
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -571,6 +638,7 @@ function requestedActionComplete(
 
 export function resolveReviewAction(input: {
   readonly builtin: boolean
+  readonly registration?: ReviewToolRegistration
   readonly permission?: string
   readonly permissionMetadata?: Record<string, unknown>
   readonly identity: string
@@ -578,7 +646,11 @@ export function resolveReviewAction(input: {
   readonly directory: string
   readonly requested?: PermissionV1.ReviewAction
 }): PermissionV1.ReviewAction {
-  if (!input.builtin) return { identity: input.identity, arguments: input.arguments, complete: false }
+  if (!input.builtin) {
+    if (input.permission !== input.identity)
+      return { identity: input.identity, arguments: input.arguments, complete: false }
+    return registeredToolInvocation(input) ?? { identity: input.identity, arguments: input.arguments, complete: false }
+  }
   const invocationFallback = () => {
     if (!record(input.arguments)) return { identity: input.identity, arguments: input.arguments, complete: false }
     return {
@@ -689,11 +761,18 @@ export function genericRiskCandidateRejection(input: GenericRiskInput): GenericR
   const boundExternal = boundExternalSearchArguments(action.identity, action.arguments)
   const boundProject = boundProjectSearchArguments(action.identity, action.arguments)
   const boundRead = boundExternalReadArguments(action.identity, action.arguments)
+  const registeredTool = registeredToolInvocationArguments(action.arguments, action.identity)
   const specialised = contracts[action.identity]
   const contract =
     boundExternal || boundProject || boundRead
       ? ({ permissions: [action.identity], cwd: "session", arguments: "invocation" } satisfies Contract)
-      : specialised
+      : registeredTool
+        ? ({
+            permissions: [action.identity],
+            cwd: "session",
+            arguments: "registered_tool_invocation",
+          } satisfies Contract)
+        : specialised
   if (!contract) return "contract_unknown"
   const validated =
     input.policy === "exceptional-risk-only-v1"

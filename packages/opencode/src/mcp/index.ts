@@ -159,6 +159,8 @@ export interface McpTool {
   readonly def: MCPToolDef
   readonly client: MCPClient
   readonly timeout?: number
+  /** Exact configured server name used to resolve this invocation. */
+  readonly server?: string
 }
 
 export interface Interface {
@@ -681,7 +683,7 @@ const layer = Layer.effect(
         }
         const timeout = requestTimeout(s, clientName, mcpConfig, defaultTimeout)
         for (const def of listed) {
-          result[McpCatalog.toolName(clientName, def.name)] = { def, client, timeout }
+          result[McpCatalog.toolName(clientName, def.name)] = { def, client, timeout, server: clientName }
         }
       }
       return result

@@ -1137,6 +1137,89 @@ describe("generic built-in risk allow gate", () => {
     ).toEqual({ identity: "grep", arguments: grepArguments, complete: false })
   })
 
+  test("accepts exact host registrations without granting built-in provenance", () => {
+    for (const [identity, registration] of [
+      ["custom_search", { kind: "custom", resolvedID: "custom_search" }],
+      [
+        "tavily_tavily_search",
+        {
+          kind: "mcp",
+          resolvedID: "tavily_tavily_search",
+          server: "tavily",
+          nativeName: "tavily_search",
+        },
+      ],
+      ["read", { kind: "custom", resolvedID: "read" }],
+    ] as const) {
+      const action = resolveReviewAction({
+        builtin: false,
+        registration,
+        permission: identity,
+        identity,
+        arguments: { query: "night flight CSV" },
+        directory: "/tmp/project",
+        requested: {
+          identity: "glob",
+          arguments: { pattern: "**/*" },
+          cwd: "/tmp/project",
+          complete: true,
+        },
+      })
+      expect(action.complete).toBe(true)
+      expect(action.arguments).toMatchObject({
+        contract: "registered-tool-invocation-v1",
+        effects_bound: false,
+        registration: { kind: registration.kind, resolved_id: identity },
+        invocation: { query: "night flight CSV" },
+      })
+      expect(
+        isGenericRiskAllowCandidate({
+          settled: true,
+          permission: identity,
+          assessment,
+          snapshot: {
+            ...globSnapshot,
+            action: {
+              ...globSnapshot.action,
+              ...action,
+              permission: identity,
+              origin: "tool",
+              cwd_status: "exact",
+              omitted_items: 0,
+              omitted_bytes: 0,
+            },
+          },
+        }),
+      ).toBe(true)
+    }
+
+    for (const registration of [
+      { kind: "custom" as const, resolvedID: "other" },
+      { kind: "mcp" as const, resolvedID: "search", server: "", nativeName: "search" },
+    ]) {
+      expect(
+        resolveReviewAction({
+          builtin: false,
+          registration,
+          permission: "search",
+          identity: "search",
+          arguments: { query: "test" },
+          directory: "/tmp/project",
+        }).complete,
+      ).toBe(false)
+    }
+    expect(
+      resolveReviewAction({
+        builtin: false,
+        registration: { kind: "custom", resolvedID: "custom_search" },
+        permission: "external_directory",
+        identity: "custom_search",
+        arguments: { query: "test" },
+        directory: "/tmp/project",
+      }).complete,
+    ).toBe(false)
+  })
+
   test("preserves explicit actions only for trusted built-ins", () => {
     const action = {
       identity: "bash",
