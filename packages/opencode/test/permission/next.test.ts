@@ -4435,7 +4435,7 @@ it.instance(
       const filePath = path.join(external, "media.pdf")
       yield* Effect.promise(() => Promise.all([writeFile(textPath, "bound text\n"), writeFile(filePath, "%PDF-1.4\n")]))
       reviewerLanguage = new MockLanguageModelV3({
-        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
       })
 
       yield* reviewerAsk(externalReadScopeRequest(sessionID, turnID, test.directory, textPath))
