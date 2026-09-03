@@ -59,6 +59,7 @@ readonly PATCH_BRANCHES=(
   "fix/controlled-local-payload-review"
   "fix/registered-tool-review"
   "registered-tool-test-compat"
+  "registered-tool-type-compat"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -98,6 +99,7 @@ readonly PATCH_IDS=(
   "b54bcdb3c566414afd90d71a34d76b919dd804a8"
   "75964f1fb88ed789e37e73d4631e6fbff64276ac"
   "e2d7d210dec9752e12f77b8457237048c53fe464"
+  "0a573e577959db00fe5bdab4aefc2e4a782320ee"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -137,6 +139,7 @@ readonly PATCH_TIPS=(
   "8578d97a2a735055a78289b08414c114c0566265"
   "2f46b159a2136baf17be3c2e1b213eb957db329f"
   "8553197720f9d70260514dcee12ea49078ddc51e"
+  "4890a0254a9456f76b670d33e4abe8a8421e1d7b"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
