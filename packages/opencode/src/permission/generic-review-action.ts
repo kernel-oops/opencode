@@ -689,7 +689,7 @@ export function resolveReviewAction(input: {
     const boundExternalRead = boundExternalReadRequested({ ...input, requested: input.requested })
     if (boundExternalRead) return input.requested
     if (
-      (input.identity === "glob" || input.identity === "grep") &&
+      input.identity === "glob" &&
       typeof input.requested.cwd === "string" &&
       path.isAbsolute(input.requested.cwd) &&
       !contains(input.directory, input.requested.cwd)

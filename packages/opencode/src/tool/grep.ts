@@ -159,7 +159,7 @@ export const GrepTool = Tool.define(
                   throw new Error("Project search directory could not be bound safely")
                 const externalBinding = isExternal ? binding : undefined
                 // A directory descriptor does not confine same-device descendant bind mounts. Retain it only to
-                // execute a human-authorised search against the reviewed directory; never attest completeness.
+                // execute a reviewed search against the reviewed directory; never attest effects as bound.
                 const searchBinding =
                   externalBinding?.kind === "file"
                     ? {
