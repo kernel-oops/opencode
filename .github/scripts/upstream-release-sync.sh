@@ -62,6 +62,7 @@ readonly PATCH_BRANCHES=(
   "registered-tool-type-compat"
   "fix/bounded-provider-spend"
   "fix/external-grep-review"
+  "fix/task-delegation-readiness"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -104,6 +105,7 @@ readonly PATCH_IDS=(
   "0a573e577959db00fe5bdab4aefc2e4a782320ee"
   "7713e86f7a6cc8f38ad2274b423d71eff6f63870"
   "c461096f54bc89b82b4cd1fce4670b0314ed42da"
+  "363d5b683bbdf2a4733d445dfb53fad77ce5e5c2"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -146,6 +148,7 @@ readonly PATCH_TIPS=(
   "4890a0254a9456f76b670d33e4abe8a8421e1d7b"
   "7e3c7f2465b1476c9da4f505c361f811b83313d3"
   "ecac5ed97dbd3f0d4534249fd105344b8b5b8523"
+  "237881fa40c8e2d2a978d34eb6d19566d86ff48d"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
