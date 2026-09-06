@@ -1,10 +1,11 @@
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -26,6 +27,13 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Snapshot } from "@/snapshot"
+import { Permission } from "@/permission"
+import { Plugin } from "@/plugin"
+import { MCP } from "@/mcp"
+import { SessionTools } from "@/session/tools"
+import { ToolRegistry, type Registered } from "@/tool/registry"
+import { Truncate } from "@/tool/truncate"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -173,6 +181,7 @@ const root = LayerNode.group([
   Database.node,
   EventV2Bridge.node,
   SessionStatus.node,
+  Snapshot.node,
   CrossSpawnSpawner.node,
 ])
 const replacements = [
@@ -208,6 +217,138 @@ const providerErrorLLM = Layer.succeed(
 )
 const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
+
+const executionFirstLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) =>
+      Stream.unwrap(
+        Effect.promise(async () => {
+          const execute = input.tools.task?.execute
+          if (!execute) throw new Error("task tool is missing execute")
+          const taskInput = {
+            description: "Inspect files",
+            prompt: "Inspect files read-only",
+            subagent_type: "Cat",
+          }
+          const result = await execute(taskInput, {
+            toolCallId: "call_1",
+            abortSignal: new AbortController().signal,
+            messages: [],
+          })
+          return Stream.make(
+            LLMEvent.toolCall({ id: "call_1", name: "task", input: taskInput }),
+            LLMEvent.toolResult({ id: "call_1", name: "task", result: { type: "json", value: result } }),
+            LLMEvent.finish({ reason: "stop" }),
+          )
+        }),
+      ),
+  }),
+)
+const executionFirstEnv = LayerNode.compile(root, [...replacements, [LLM.node, executionFirstLLM]])
+const itExecutionFirst = testEffect(executionFirstEnv)
+
+const streamFirstLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      const execute = input.tools.task?.execute
+      if (!execute) return Stream.fail(new Error("task tool is missing execute"))
+      const taskInput = {
+        description: "Inspect files",
+        prompt: "Inspect files read-only",
+        subagent_type: "Cat",
+      }
+      const result = Stream.fromEffect(
+        Effect.promise(() =>
+          execute(taskInput, {
+            toolCallId: "call_1",
+            abortSignal: new AbortController().signal,
+            messages: [],
+          }),
+        ),
+      ).pipe(
+        Stream.map((value) => LLMEvent.toolResult({ id: "call_1", name: "task", result: { type: "json", value } })),
+      )
+      return Stream.concat(
+        Stream.make(LLMEvent.toolCall({ id: "call_1", name: "task", input: taskInput })),
+        Stream.concat(result, Stream.make(LLMEvent.finish({ reason: "stop" }))),
+      )
+    },
+  }),
+)
+const streamFirstEnv = LayerNode.compile(root, [...replacements, [LLM.node, streamFirstLLM]])
+const itStreamFirst = testEffect(streamFirstEnv)
+
+const delayedErrorInput = {
+  description: "Inspect files",
+  prompt: "Inspect files read-only",
+  subagent_type: "Cat",
+}
+const delayedErrorLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.toolError({
+          id: "call-1",
+          name: "task",
+          message: "task failed",
+          error: new Error("task failed"),
+        }),
+        LLMEvent.toolCall({ id: "call-1", name: "task", input: delayedErrorInput }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const delayedErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, delayedErrorLLM]])
+const itDelayedError = testEffect(delayedErrorEnv)
+
+const doomLoopInput = { command: "echo repeated" }
+const doomLoopRequests: PermissionV1.AskInput[] = []
+const doomLoopLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        ...["call-1", "call-2", "call-3"].flatMap((id) => [
+          LLMEvent.toolCall({ id, name: "bash", input: doomLoopInput }),
+          LLMEvent.toolResult({
+            id,
+            name: "bash",
+            result: { type: "json" as const, value: { title: "bash", metadata: {}, output: "done" } },
+          }),
+        ]),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const doomLoopPermission = Layer.succeed(
+  Permission.Service,
+  Permission.Service.of({
+    ask: (input) => Effect.sync(() => void doomLoopRequests.push(input)),
+    reply: () => Effect.void,
+    list: () => Effect.succeed([]),
+    captureTurn: () => Effect.void,
+    captureUntrusted: () => Effect.void,
+    authoriseTaskDelegation: () => Effect.succeed(undefined),
+    captureTaskDelegation: () => Effect.void,
+    canResumeTask: () => Effect.succeed(false),
+  }),
+)
+const doomLoopEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, doomLoopLLM],
+  [Permission.node, doomLoopPermission],
+])
+const itDoomLoop = testEffect(doomLoopEnv)
+
+const cleanupLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({ stream: () => Stream.make(LLMEvent.finish({ reason: "stop" })) }),
+)
+const cleanupEnv = LayerNode.compile(root, [...replacements, [LLM.node, cleanupLLM]])
+const itCleanup = testEffect(cleanupEnv)
 
 const fragmentFailureLLM = Layer.succeed(
   LLM.Service,
@@ -282,6 +423,46 @@ it.live("session.processor effect tests capture llm input cleanly", () =>
         expect(parts.some((part) => part.type === "text" && part.text === "hello")).toBe(true)
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itDoomLoop.live("session.processor doom-loop review receives the accepted tool arguments", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        doomLoopRequests.length = 0
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "repeat")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "repeat" }],
+          tools: {},
+        })
+
+        expect(doomLoopRequests).toHaveLength(1)
+        const request = doomLoopRequests[0]
+        expect(request?.permission).toBe("doom_loop")
+        expect(request?.metadata).toEqual({ tool: "bash", input: doomLoopInput })
+        expect(request?.review?.arguments).toEqual(doomLoopInput)
+        expect(request?.review?.action).toEqual({ identity: "bash", arguments: doomLoopInput, complete: false })
+      }),
+    { config: cfg },
   ),
 )
 
@@ -867,6 +1048,623 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.time.end).toBeDefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor keeps delayed AI SDK Task input separate from plugin execution input", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const providerInput = {
+          description: "Inspect files",
+          prompt: "Inspect files read-only",
+          subagent_type: "Cat",
+        }
+        const executionInput = { ...providerInput, prompt: "Inspect files after plugin mutation", plugin: true }
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "delegate")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        let executed: Record<string, unknown> | undefined
+        let pluginArgs: Record<string, unknown> | undefined
+        let executedBeforeStreamPersistence = false
+        const fakePlugin = Plugin.Service.of({
+          init: () => Effect.void,
+          list: () => Effect.succeed([]),
+          trigger: (name, _input, output) =>
+            Effect.gen(function* () {
+              if (name === "tool.execute.before") {
+                const before = yield* MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database))
+                executedBeforeStreamPersistence = !before.some(
+                  (part) => part.type === "tool" && part.callID === "call_1" && part.state.status !== "pending",
+                )
+                pluginArgs = (output as { args: Record<string, unknown> }).args
+                pluginArgs.prompt = executionInput.prompt
+                pluginArgs.plugin = true
+              }
+              return output
+            }),
+          preparePermissionAsk: () => Effect.succeed(undefined),
+        } satisfies Plugin.Interface)
+        const fakeRegistry = ToolRegistry.Service.of({
+          ids: () => Effect.succeed(["task"]),
+          all: () => Effect.succeed([]),
+          named: () => Effect.die("unused"),
+          tools: () =>
+            Effect.succeed<Registered[]>([
+              {
+                id: "task",
+                builtin: true,
+                description: "Delegate work",
+                parameters: Schema.Struct({
+                  description: Schema.String,
+                  prompt: Schema.String,
+                  subagent_type: Schema.String,
+                }),
+                jsonSchema: {
+                  type: "object",
+                  properties: {
+                    description: { type: "string" },
+                    prompt: { type: "string" },
+                    subagent_type: { type: "string" },
+                  },
+                  required: ["description", "prompt", "subagent_type"],
+                },
+                execute: (value, ctx) =>
+                  Effect.gen(function* () {
+                    const input = value as Record<string, unknown>
+                    executed = input
+                    const metadata = { sessionId: "ses_child" }
+                    yield* ctx.metadata({ title: input.description as string, metadata })
+                    return { title: input.description as string, metadata, output: "done" }
+                  }),
+              },
+            ]),
+        })
+        const fakeMcp = MCP.Service.of({
+          tools: () => Effect.succeed({}),
+          clients: () => Effect.succeed({}),
+        } as Partial<MCP.Interface> as MCP.Interface)
+        const fakePermission = Permission.Service.of({
+          ask: () => Effect.void,
+          reply: () => Effect.void,
+          list: () => Effect.succeed([]),
+          captureTurn: () => Effect.void,
+          captureUntrusted: () => Effect.void,
+          authoriseTaskDelegation: () => Effect.succeed(undefined),
+          captureTaskDelegation: () => Effect.void,
+          canResumeTask: () => Effect.succeed(false),
+        })
+        const fakeTruncate = Truncate.Service.of({
+          cleanup: () => Effect.void,
+          write: () => Effect.succeed("output.txt"),
+          output: (text: string) => Effect.succeed({ content: text, truncated: false }),
+          limits: () => Effect.succeed({ maxLines: 2_000, maxBytes: 50 * 1_024 }),
+        } satisfies Truncate.Interface)
+
+        yield* llm.tool("task", providerInput)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const tools = yield* SessionTools.resolve({
+          agent: agent(),
+          model: mdl,
+          session: chat,
+          processor: handle,
+          bypassAgentCheck: false,
+          messages: [],
+          promptOps: {} as never,
+        }).pipe(
+          Effect.provideService(Plugin.Service, fakePlugin),
+          Effect.provideService(Permission.Service, fakePermission),
+          Effect.provideService(ToolRegistry.Service, fakeRegistry),
+          Effect.provideService(MCP.Service, fakeMcp),
+          Effect.provideService(Truncate.Service, fakeTruncate),
+          Effect.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+        )
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "delegate" }],
+          tools,
+        })
+
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call_1",
+        )
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(1)
+        expect(executedBeforeStreamPersistence).toBe(true)
+        expect(pluginArgs).toEqual(executionInput)
+        expect(executed).toEqual(executionInput)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.state.status).toBe("completed")
+        if (calls[0]?.state.status === "completed") {
+          expect(calls[0].state.input).toEqual(executionInput)
+          expect(calls[0].state.metadata).toEqual({ sessionId: "ses_child" })
+        }
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itExecutionFirst.live("session.processor registers an executing Task before its SDK stream event is persisted", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const taskInput = {
+          description: "Inspect files",
+          prompt: "Inspect files read-only",
+          subagent_type: "Cat",
+        }
+        const childLink = { sessionId: "ses_child", model: { providerID: "test", modelID: "test-model" } }
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "delegate")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+        let executedBeforeStreamPersistence = false
+        let readyBeforeMetadata = false
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "delegate" }],
+          tools: {
+            task: tool({
+              description: "Delegate work",
+              inputSchema: z.object({
+                description: z.string(),
+                prompt: z.string(),
+                subagent_type: z.string(),
+              }),
+              execute: async (input, options) => {
+                const executionInput = { ...input, prompt: "Inspect files after asynchronous plugin mutation" }
+                await Promise.resolve()
+                const before = await Effect.runPromise(
+                  MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+                )
+                executedBeforeStreamPersistence = !before.some(
+                  (part) => part.type === "tool" && part.callID === options.toolCallId,
+                )
+                await Effect.runPromise(
+                  handle.ensureToolCallReady({
+                    toolCallID: options.toolCallId,
+                    tool: "task",
+                    providerInput: input,
+                    executionInput,
+                  }),
+                )
+                const ready = await Effect.runPromise(
+                  MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+                )
+                const call = ready.find(
+                  (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === options.toolCallId,
+                )
+                readyBeforeMetadata =
+                  call?.state.status === "running" &&
+                  call.tool === "task" &&
+                  JSON.stringify(call.state.input) === JSON.stringify(executionInput)
+                await Effect.runPromise(
+                  handle.updateToolCall(options.toolCallId, (part) => {
+                    if (part.state.status !== "running") return part
+                    return {
+                      ...part,
+                      state: { ...part.state, title: executionInput.description, metadata: childLink },
+                    }
+                  }),
+                )
+                const result = { title: executionInput.description, output: "done", metadata: childLink }
+                await Effect.runPromise(handle.completeToolCall(options.toolCallId, result))
+                return result
+              },
+            }),
+          },
+        })
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const taskParts = parts.filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call_1",
+        )
+        expect(taskParts).toHaveLength(1)
+        const call = taskParts[0]
+        expect(executedBeforeStreamPersistence).toBe(true)
+        expect(readyBeforeMetadata).toBe(true)
+        expect(value).toBe("continue")
+        expect(call?.callID).toBe("call_1")
+        expect(call?.tool).toBe("task")
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status === "completed") {
+          expect(call.state.input).toEqual({ ...taskInput, prompt: "Inspect files after asynchronous plugin mutation" })
+          expect(call.state.metadata).toEqual(childLink)
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itStreamFirst.live("session.processor binds asynchronous Task plugin input after its stream event", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const providerInput = {
+          description: "Inspect files",
+          prompt: "Inspect files read-only",
+          subagent_type: "Cat",
+        }
+        const executionInput = { ...providerInput, prompt: "Inspect files after asynchronous plugin mutation" }
+        const childLink = { sessionId: "ses_child", model: { providerID: "test", modelID: "test-model" } }
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "delegate")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        let streamPersistedProviderInput = false
+        let executionBindingPersisted = false
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "delegate" }],
+          tools: {
+            task: tool({
+              description: "Delegate work",
+              inputSchema: z.object({ description: z.string(), prompt: z.string(), subagent_type: z.string() }),
+              execute: async (input, options) => {
+                await Promise.resolve()
+                const before = await Effect.runPromise(
+                  MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+                )
+                const streamed = before.find(
+                  (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === options.toolCallId,
+                )
+                streamPersistedProviderInput =
+                  streamed?.state.status === "running" &&
+                  JSON.stringify(streamed.state.input) === JSON.stringify(providerInput)
+                await Effect.runPromise(
+                  handle.ensureToolCallReady({
+                    toolCallID: options.toolCallId,
+                    tool: "task",
+                    providerInput: input,
+                    executionInput,
+                  }),
+                )
+                const bound = await Effect.runPromise(
+                  MessageV2.parts(msg.id).pipe(Effect.provideService(Database.Service, database)),
+                )
+                const call = bound.find(
+                  (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === options.toolCallId,
+                )
+                executionBindingPersisted =
+                  call?.state.status === "running" &&
+                  JSON.stringify(call.state.input) === JSON.stringify(executionInput)
+                await Effect.runPromise(
+                  handle.updateToolCall(options.toolCallId, (part) => {
+                    if (part.state.status !== "running") return part
+                    return { ...part, state: { ...part.state, title: executionInput.description, metadata: childLink } }
+                  }),
+                )
+                const result = { title: executionInput.description, output: "done", metadata: childLink }
+                await Effect.runPromise(handle.completeToolCall(options.toolCallId, result))
+                return result
+              },
+            }),
+          },
+        })
+
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call_1",
+        )
+        expect(value).toBe("continue")
+        expect(streamPersistedProviderInput).toBe(true)
+        expect(executionBindingPersisted).toBe(true)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.state.status).toBe("completed")
+        if (calls[0]?.state.status === "completed") {
+          expect(calls[0].state.input).toEqual(executionInput)
+          expect(calls[0].state.metadata).toEqual(childLink)
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itDelayedError.live("session.processor ignores a delayed duplicate Task event after failure", () =>
+  provideTmpdirInstance(
+    (directory) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "failed delegation")
+        const msg = yield* assistant(chat.id, parent.id, directory)
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const childLink = { sessionId: "ses_child" }
+
+        yield* handle.ensureToolCallReady({
+          toolCallID: "call-1",
+          tool: "task",
+          providerInput: delayedErrorInput,
+          executionInput: delayedErrorInput,
+        })
+        yield* handle.updateToolCall("call-1", (part) => {
+          if (part.state.status !== "running") return part
+          return { ...part, state: { ...part.state, title: delayedErrorInput.description, metadata: childLink } }
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "failed delegation" }],
+          tools: {},
+        })
+
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call-1",
+        )
+        expect(value).toBe("continue")
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.state.status).toBe("error")
+        if (calls[0]?.state.status === "error") {
+          expect(calls[0].state.input).toEqual(delayedErrorInput)
+          expect(calls[0].state.metadata).toEqual(childLink)
+          expect(calls[0].state.error).toBe("task failed")
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+it.live("session.processor does not cross-wire parallel Task readiness", () =>
+  provideTmpdirInstance(
+    (directory) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "parallel delegation")
+        const msg = yield* assistant(chat.id, parent.id, directory)
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const first = { description: "first", prompt: "one", subagent_type: "Cat" }
+        const second = { description: "second", prompt: "two", subagent_type: "Luke" }
+
+        yield* Effect.all(
+          [
+            handle.ensureToolCallReady({
+              toolCallID: "call-first",
+              tool: "task",
+              providerInput: first,
+              executionInput: first,
+            }),
+            handle.ensureToolCallReady({
+              toolCallID: "call-second",
+              tool: "task",
+              providerInput: second,
+              executionInput: second,
+            }),
+          ],
+          { concurrency: "unbounded" },
+        )
+
+        const parts = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(parts).toHaveLength(2)
+        expect(parts.find((part) => part.callID === "call-first")?.state).toMatchObject({
+          status: "running",
+          input: first,
+        })
+        expect(parts.find((part) => part.callID === "call-second")?.state).toMatchObject({
+          status: "running",
+          input: second,
+        })
+
+        const childLink = {
+          parentSessionId: chat.id,
+          sessionId: "ses_first_child",
+          background: true,
+          jobId: "ses_first_child",
+        }
+        yield* handle.updateToolCall("call-first", (part) => {
+          if (part.state.status !== "running") return part
+          return { ...part, state: { ...part.state, title: first.description, metadata: childLink } }
+        })
+        yield* handle.ensureToolCallReady({
+          toolCallID: "call-first",
+          tool: "task",
+          providerInput: first,
+          executionInput: first,
+        })
+        const running = (yield* MessageV2.parts(msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call-first",
+        )
+        expect(running?.state.status).toBe("running")
+        if (running?.state.status === "running") expect(running.state.metadata).toEqual(childLink)
+
+        const providerMismatch = yield* handle
+          .ensureToolCallReady({
+            toolCallID: "call-first",
+            tool: "task",
+            providerInput: second,
+            executionInput: first,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(providerMismatch)).toBe(true)
+
+        const executionMismatch = yield* handle
+          .ensureToolCallReady({
+            toolCallID: "call-first",
+            tool: "task",
+            providerInput: first,
+            executionInput: second,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(executionMismatch)).toBe(true)
+
+        yield* handle.completeToolCall("call-first", {
+          title: first.description,
+          output: "done",
+          metadata: childLink,
+        })
+        const completed = (yield* MessageV2.parts(msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool" && part.callID === "call-first",
+        )
+        expect(completed?.state.status).toBe("completed")
+        if (completed?.state.status === "completed") expect(completed.state.metadata).toEqual(childLink)
+      }),
+    { config: cfg },
+  ),
+)
+
+itCleanup.live("session.processor rejects queued Task registration once cleanup is closing", () =>
+  provideTmpdirInstance(
+    (directory) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const snapshots = yield* Snapshot.Service
+        const persistEntered = yield* Deferred.make<void>()
+        const persistRelease = yield* Deferred.make<void>()
+        const cleanupEntered = yield* Deferred.make<void>()
+        const cleanupRelease = yield* Deferred.make<void>()
+        const originalUpdatePart = session.updatePart
+        const originalTrack = snapshots.track
+        const originalPatch = snapshots.patch
+        Object.assign(session, {
+          updatePart: (part: SessionV1.Part) => {
+            const update = originalUpdatePart(part)
+            if (part.type !== "tool" || part.callID !== "call-held" || part.state.status !== "running") return update
+            return Deferred.succeed(persistEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(persistRelease)),
+              Effect.andThen(update),
+            )
+          },
+        })
+        Object.assign(snapshots, {
+          track: () => Effect.succeed("cleanup-hash"),
+          patch: () =>
+            Deferred.succeed(cleanupEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(cleanupRelease)),
+              Effect.as({ hash: "cleanup-patch", files: [] }),
+            ),
+        })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "delegate")
+        const msg = yield* assistant(chat.id, parent.id, directory)
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const heldInput = { description: "held", prompt: "one", subagent_type: "Cat" }
+        const queuedInput = { description: "queued", prompt: "two", subagent_type: "Luke" }
+        const held = yield* handle
+          .ensureToolCallReady({
+            toolCallID: "call-held",
+            tool: "task",
+            providerInput: heldInput,
+            executionInput: heldInput,
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(persistEntered)
+
+        const queued = yield* handle
+          .ensureToolCallReady({
+            toolCallID: "call-queued",
+            tool: "task",
+            providerInput: queuedInput,
+            executionInput: queuedInput,
+          })
+          .pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+
+        const processing = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "delegate" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(cleanupEntered)
+
+        yield* Deferred.succeed(persistRelease, undefined)
+        yield* Fiber.join(held)
+        const queuedExit = yield* Fiber.await(queued)
+        expect(Exit.isFailure(queuedExit)).toBe(true)
+        if (Exit.isSuccess(queuedExit)) throw new Error("queued readiness unexpectedly succeeded")
+        expect(Cause.squash(queuedExit.cause)).toHaveProperty("message", "Session processor is closing")
+        yield* Deferred.succeed(cleanupRelease, undefined)
+        expect(yield* Fiber.join(processing)).toBe("continue")
+
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(calls.map((part) => part.callID)).toEqual(["call-held"])
+        expect(calls[0]?.state.status).toBe("error")
+        if (calls[0]?.state.status === "error") expect(calls[0].state.metadata?.interrupted).toBe(true)
+
+        Object.assign(session, { updatePart: originalUpdatePart })
+        Object.assign(snapshots, { track: originalTrack, patch: originalPatch })
+      }),
+    { config: cfg },
   ),
 )
 

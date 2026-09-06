@@ -73,6 +73,11 @@ export type StartInput = {
 export type ExtendInput = {
   id: string
   run: Effect.Effect<string, unknown>
+  /**
+   * Checked synchronously at the commit point while the registry is locked.
+   * Keep this short and non-re-entrant; throwing fails the extension.
+   */
+  shouldAccept?: () => boolean
 }
 
 export type WaitInput = {
@@ -262,6 +267,7 @@ export const make = Effect.gen(function* () {
           (jobs): readonly [ExtendResult, Map<string, Active>] => {
             const job = jobs.get(input.id)
             if (!job || job.info.status !== "running") return [{ extended: false }, jobs]
+            if (input.shouldAccept && !input.shouldAccept()) return [{ extended: false }, jobs]
             return [
               { extended: true, previous: job.tail, scope: job.scope, tail, token: job.token, sequence: job.next },
               new Map(jobs).set(input.id, {

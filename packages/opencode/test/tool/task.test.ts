@@ -467,6 +467,7 @@ describe("tool.task", () => {
 
   it.instance("execute cancels child session when abort signal fires", () =>
     Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -507,11 +508,119 @@ describe("tool.task", () => {
         .pipe(Effect.forkChild)
 
       const input = yield* Effect.promise(() => ready.promise)
+      const job = yield* jobs.get(input.sessionID)
+      expect(job?.status).toBe("running")
       abort.abort()
       expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
 
       const exit = yield* Fiber.await(fiber)
-      expect(Exit.isSuccess(exit)).toBe(true)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect((yield* jobs.get(input.sessionID))?.status).toBe("cancelled")
+    }),
+  )
+
+  it.instance("does not submit a child when cancellation occurs during prompt resolution", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const resolving = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const cancelled = yield* Deferred.make<string>()
+      const abort = new AbortController()
+      let submitted = false
+      const promptOps: TaskPromptOps = {
+        cancel: (sessionID) => Deferred.succeed(cancelled, sessionID).pipe(Effect.asVoid),
+        resolvePromptParts: (template) =>
+          Deferred.succeed(resolving, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as([{ type: "text" as const, text: template }]),
+          ),
+        prompt: (input) =>
+          Effect.sync(() => {
+            submitted = true
+            return reply(input, "unexpected")
+          }),
+      }
+
+      const fiber = yield* def
+        .execute(
+          { description: "inspect bug", prompt: "look into the cache key path", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: abort.signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(resolving)
+      const job = (yield* jobs.list())[0]
+      expect(job?.status).toBe("running")
+      abort.abort()
+      expect(yield* Deferred.await(cancelled)).toBe(job?.id)
+      expect(Exit.isFailure(yield* Fiber.await(fiber))).toBe(true)
+      expect((yield* jobs.get(job!.id))?.status).toBe("cancelled")
+      expect(submitted).toBe(false)
+    }),
+  )
+
+  it.instance("replays an abort missed immediately before listener registration", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const cancelled = yield* Deferred.make<string>()
+      let aborted = false
+      let submitted = false
+      const signal = {
+        get aborted() {
+          return aborted
+        },
+        throwIfAborted() {
+          if (aborted) throw new Error("cancelled")
+        },
+        addEventListener() {
+          // Simulate cancellation after the earlier checks but before listener installation.
+          aborted = true
+        },
+        removeEventListener() {},
+      } as unknown as AbortSignal
+      const exit = yield* def
+        .execute(
+          { description: "inspect bug", prompt: "look into the cache key path", subagent_type: "general" },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                cancel: (sessionID: SessionID) => Deferred.succeed(cancelled, sessionID).pipe(Effect.asVoid),
+                prompt: (input: SessionPrompt.PromptInput) =>
+                  Effect.sync(() => {
+                    submitted = true
+                    return reply(input, "unexpected")
+                  }),
+              },
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* Deferred.await(cancelled)).toBeDefined()
+      expect(submitted).toBe(false)
     }),
   )
 
@@ -740,6 +849,7 @@ describe("tool.task", () => {
       const ready = yield* Deferred.make<void>()
       const done = yield* Deferred.make<void>()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const metadataUpdates: Array<Record<string, unknown>> = []
       let runs = 0
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
@@ -771,7 +881,7 @@ describe("tool.task", () => {
             abort: new AbortController().signal,
             extra: { promptOps },
             messages: [],
-            metadata: () => Effect.void,
+            metadata: (metadata) => Effect.sync(() => metadataUpdates.push(metadata)),
             ask: () => Effect.void,
           },
         )
@@ -782,9 +892,25 @@ describe("tool.task", () => {
       expect(job).toBeDefined()
       if (!job) throw new Error("task job not found")
       expect(job.metadata?.parentSessionId).toBe(chat.id)
+      const initialChildLink = {
+        parentSessionId: chat.id,
+        sessionId: job.id,
+        model: ref,
+      }
+      expect(metadataUpdates).toEqual([{ title: "inspect bug", metadata: initialChildLink }])
       yield* jobs.promote(job.id)
 
       const result = yield* Fiber.join(fiber)
+      const childLink = {
+        ...initialChildLink,
+        background: true,
+        jobId: job.id,
+      }
+      expect(metadataUpdates).toEqual([
+        { title: "inspect bug", metadata: initialChildLink },
+        { title: "inspect bug", metadata: childLink },
+      ])
+      expect(result.metadata).toMatchObject(childLink)
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
@@ -803,6 +929,7 @@ describe("tool.task", () => {
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
+      const abort = new AbortController()
 
       const result = yield* def.execute(
         {
@@ -815,7 +942,7 @@ describe("tool.task", () => {
           sessionID: chat.id,
           messageID: assistant.id,
           agent: "build",
-          abort: new AbortController().signal,
+          abort: abort.signal,
           extra: {
             promptOps: {
               ...stubOps(),
@@ -832,6 +959,9 @@ describe("tool.task", () => {
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
       expect(job?.status).toBe("running")
+      abort.abort()
+      yield* Effect.yieldNow
+      expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
     }),
   )
 
@@ -845,6 +975,7 @@ describe("tool.task", () => {
       const second = defer<void>()
       const updated = defer<SessionPrompt.PromptInput>()
       const injected = defer<SessionPrompt.PromptInput>()
+      const abort = new AbortController()
       let prompts = 0
       const promptOps: TaskPromptOps = {
         ...stubOps(),
@@ -863,7 +994,7 @@ describe("tool.task", () => {
         sessionID: chat.id,
         messageID: assistant.id,
         agent: "build",
-        abort: new AbortController().signal,
+        abort: abort.signal,
         extra: { promptOps },
         messages: [],
         metadata: () => Effect.void,
@@ -892,6 +1023,9 @@ describe("tool.task", () => {
       expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain("Background task updated")
+      abort.abort()
+      yield* Effect.yieldNow
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
       first.resolve()
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
       expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
@@ -906,6 +1040,82 @@ describe("tool.task", () => {
       expect(notification.variant).toBe("xhigh")
       expect(notification.parts[0]?.type).toBe("text")
       if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+    }),
+  )
+
+  background.instance("a missed abort rejects an existing task update without cancelling its job", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const started = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: { ...stubOps(), prompt: () => Effect.never } },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      let aborted = false
+      let resolved = false
+      const signal = {
+        get aborted() {
+          return aborted
+        },
+        throwIfAborted() {
+          if (aborted) throw new Error("cancelled")
+        },
+        addEventListener() {
+          aborted = true
+        },
+        removeEventListener() {},
+      } as unknown as AbortSignal
+      const exit = yield* def
+        .execute(
+          {
+            description: "add investigation scope",
+            prompt: "also inspect cancellation",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: signal,
+            extra: {
+              promptOps: {
+                ...stubOps(),
+                resolvePromptParts: (template: string) =>
+                  Effect.sync(() => {
+                    resolved = true
+                    return [{ type: "text" as const, text: template }]
+                  }),
+              },
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(resolved).toBe(false)
+      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+      yield* jobs.cancel(started.metadata.sessionId)
     }),
   )
 

@@ -86,6 +86,37 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("rejects an extension at the locked commit point without disturbing existing work", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      let ran = false
+      const job = yield* jobs.start({
+        type: "test",
+        run: Deferred.await(latch).pipe(Effect.as("original")),
+      })
+
+      expect(
+        yield* jobs.extend({
+          id: job.id,
+          shouldAccept: () => false,
+          run: Effect.sync(() => {
+            ran = true
+            return "extension"
+          }),
+        }),
+      ).toBe(false)
+      expect(ran).toBe(false)
+      expect((yield* jobs.get(job.id))?.status).toBe("running")
+
+      yield* Deferred.succeed(latch, undefined)
+      expect(yield* jobs.wait({ id: job.id })).toMatchObject({
+        timedOut: false,
+        info: { status: "completed", output: "original" },
+      })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("interrupts live work without promising settlement after the owning process-local scope closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make()

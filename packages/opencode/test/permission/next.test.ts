@@ -4812,7 +4812,14 @@ it.instance(
         pattern: "(?i)(flight.?log|import|export|ocr|delete)",
         path: first,
       }
-      yield* reviewerAsk(externalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file")).pipe(
+      const delayed = delayedObviousAllow()
+      const admitted = yield* reviewerAsk(
+        externalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file"),
+      ).pipe(Effect.forkScoped)
+      yield* Effect.promise(() => delayed.started)
+      expect(yield* list()).toHaveLength(0)
+      delayed.release()
+      yield* Fiber.join(admitted).pipe(
         Effect.timeoutOrElse({
           duration: "5 seconds",
           orElse: () => Effect.fail(new Error("external Grep gate timed out")),
@@ -5322,6 +5329,7 @@ it.instance(
       delayed.release()
 
       expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"candidateRejection":"authority_missing"')
       yield* rejectAll()
       expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
     }),
