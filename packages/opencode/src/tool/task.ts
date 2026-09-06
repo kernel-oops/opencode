@@ -221,6 +221,7 @@ export const TaskTool = Tool.define(
         ...(runInBackground ? { background: true } : {}),
       }
 
+      yield* Effect.sync(() => ctx.abort.throwIfAborted())
       yield* ctx.metadata({
         title: params.description,
         metadata,
@@ -238,8 +239,14 @@ export const TaskTool = Tool.define(
               })
             : undefined
 
+      yield* Effect.sync(() => ctx.abort.throwIfAborted())
+
+      let acceptedBackground = false
+      let protectExisting = Boolean(params.task_id)
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
+        if (!acceptedBackground) yield* Effect.sync(() => ctx.abort.throwIfAborted())
         const parts = yield* ops.resolvePromptParts(params.prompt)
+        if (!acceptedBackground) yield* Effect.sync(() => ctx.abort.throwIfAborted())
         const input = {
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,
@@ -309,78 +316,106 @@ export const TaskTool = Tool.define(
         )
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
-        return {
-          title: params.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: nextSession.id,
-          },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary: "Background task updated",
-            text: BACKGROUND_UPDATED,
-          }),
-        }
-      }
-
-      const info = yield* background.start({
-        id: nextSession.id,
-        type: id,
-        title: params.description,
-        metadata,
-        onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
-          notify(nextSession.id),
-        ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
-      })
-
-      function backgroundResult() {
-        return {
-          title: params.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: info.id,
-          },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary: "Background task started",
-            text: BACKGROUND_STARTED,
-          }),
-        }
-      }
-
-      if (runInBackground) {
-        yield* notify(info.id)
-        return backgroundResult()
-      }
-
       const runCancel = yield* EffectBridge.make()
-      const cancel = ops.cancel(nextSession.id)
+      const cancel = Effect.all([ops.cancel(nextSession.id), background.cancel(nextSession.id)], { discard: true })
 
       function onAbort() {
+        if (acceptedBackground || protectExisting) return
         runCancel.fork(cancel)
       }
 
       return yield* Effect.acquireUseRelease(
         Effect.sync(() => {
           ctx.abort.addEventListener("abort", onAbort)
+          if (ctx.abort.aborted) onAbort()
         }),
         () =>
           Effect.gen(function* () {
+            if (protectExisting) yield* Effect.sync(() => ctx.abort.throwIfAborted())
+            if (
+              yield* background.extend({
+                id: nextSession.id,
+                run: runTask(),
+                shouldAccept: () => !ctx.abort.aborted,
+              })
+            ) {
+              acceptedBackground = true
+              protectExisting = false
+              return {
+                title: params.description,
+                metadata: {
+                  ...metadata,
+                  background: true,
+                  jobId: nextSession.id,
+                },
+                output: renderOutput({
+                  sessionID: nextSession.id,
+                  state: "running",
+                  summary: "Background task updated",
+                  text: BACKGROUND_UPDATED,
+                }),
+              }
+            }
+
+            if (protectExisting) yield* Effect.sync(() => ctx.abort.throwIfAborted())
+            protectExisting = false
+            if (ctx.abort.aborted) onAbort()
+            yield* Effect.sync(() => ctx.abort.throwIfAborted())
+            const info = yield* background.start({
+              id: nextSession.id,
+              type: id,
+              title: params.description,
+              metadata,
+              onPromote: Effect.sync(() => {
+                acceptedBackground = true
+              }).pipe(
+                Effect.andThen(
+                  Effect.all([
+                    ctx.metadata({
+                      title: params.description,
+                      metadata: { ...metadata, background: true, jobId: nextSession.id },
+                    }),
+                    notify(nextSession.id),
+                  ]),
+                ),
+              ),
+              run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+            })
+
+            function backgroundResult() {
+              return {
+                title: params.description,
+                metadata: {
+                  ...metadata,
+                  background: true,
+                  jobId: info.id,
+                },
+                output: renderOutput({
+                  sessionID: nextSession.id,
+                  state: "running",
+                  summary: "Background task started",
+                  text: BACKGROUND_STARTED,
+                }),
+              }
+            }
+
+            if (ctx.abort.aborted) {
+              yield* cancel
+              yield* Effect.sync(() => ctx.abort.throwIfAborted())
+            }
+            if (runInBackground) {
+              acceptedBackground = true
+              yield* notify(info.id)
+              return backgroundResult()
+            }
             const result = yield* Effect.raceFirst(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
               background.waitForPromotion(nextSession.id),
             )
-            if (result?.metadata?.background === true) return backgroundResult()
+            if (result?.metadata?.background === true) {
+              acceptedBackground = true
+              return backgroundResult()
+            }
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
@@ -391,8 +426,7 @@ export const TaskTool = Tool.define(
           }),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit))
-              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            if (Exit.hasInterrupts(exit)) yield* cancel
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {

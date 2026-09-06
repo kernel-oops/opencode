@@ -648,6 +648,7 @@ noLLMServer.instance(
       }
       const processor = {
         message: seeded.assistant,
+        ensureToolCallReady: () => Effect.die("unexpected task"),
         updateToolCall: (_callID: string, update: (part: SessionV1.ToolPart) => SessionV1.ToolPart) =>
           Effect.sync(() => {
             persisted = update(persisted)

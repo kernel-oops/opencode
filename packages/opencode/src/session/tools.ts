@@ -29,6 +29,7 @@ import {
   QUESTION_COMPLETION_PROVENANCE_METADATA,
   signQuestionCompletion,
 } from "./tool-provenance"
+import { isDeepStrictEqual } from "node:util"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -48,7 +49,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "ensureToolCallReady" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -77,19 +78,33 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) =>
-      input.processor.updateToolCall(options.toolCallId, (match) => {
-        if (!["running", "pending"].includes(match.state.status)) return match
-        return {
-          ...match,
-          state: {
-            title: val.title,
-            metadata: val.metadata,
-            status: "running",
-            input: args,
-            time: match.state.status === "running" ? match.state.time : { start: Date.now() },
-          },
-        }
-      }),
+      input.processor
+        .updateToolCall(options.toolCallId, (match) => {
+          if (
+            registration?.kind === "builtin" &&
+            toolID === "task" &&
+            (match.tool !== toolID || match.state.status !== "running" || !isDeepStrictEqual(match.state.input, args))
+          )
+            return match
+          if (!["running", "pending"].includes(match.state.status)) return match
+          return {
+            ...match,
+            state: {
+              title: val.title,
+              metadata: val.metadata,
+              status: "running",
+              input: args,
+              time: match.state.status === "running" ? match.state.time : { start: Date.now() },
+            },
+          }
+        })
+        .pipe(
+          Effect.flatMap((updated) => {
+            if (updated || registration?.kind !== "builtin" || toolID !== "task") return Effect.void
+            return Effect.fail(new Error("Task tool call is not eligible for metadata update"))
+          }),
+          Effect.orDie,
+        ),
     ask: (req) =>
       Effect.gen(function* () {
         const lineage = yield* Session.resolveLineage(sessions, input.session)
@@ -130,14 +145,28 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       description: item.description,
       inputSchema: jsonSchema(schema),
       execute(args, options) {
+        // Tool arguments are a JSON wire contract. Keep the SDK-owned value immutable, and give plugins a detached
+        // JSON-domain copy; plugins must convert richer values such as dates or typed arrays before returning.
+        const providerInput = SessionProcessor.detachToolInput(args)
+        const pluginInput = SessionProcessor.detachToolInput(args)
         return run.promise(
           Effect.gen(function* () {
             yield* plugin.trigger(
               "tool.execute.before",
               { tool: item.id, sessionID: input.session.id, callID: options.toolCallId },
-              { args },
+              { args: pluginInput },
             )
-            const executionArgs = structuredClone(args)
+            const executionArgs = SessionProcessor.detachToolInput(pluginInput)
+            if (item.builtin && item.id === "task") {
+              yield* Effect.sync(() => options.abortSignal?.throwIfAborted())
+              yield* input.processor.ensureToolCallReady({
+                toolCallID: options.toolCallId,
+                tool: item.id,
+                providerInput,
+                executionInput: executionArgs,
+              })
+              yield* Effect.sync(() => options.abortSignal?.throwIfAborted())
+            }
             const ctx = context(
               item.id,
               executionArgs,
@@ -485,12 +514,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     item.execute = (args, opts) =>
       run.promise(
         Effect.gen(function* () {
+          const pluginInput = SessionProcessor.detachToolInput(args)
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: key, sessionID: input.session.id, callID: opts.toolCallId },
-            { args },
+            { args: pluginInput },
           )
-          const executionArgs = structuredClone(args)
+          const executionArgs = SessionProcessor.detachToolInput(pluginInput)
           const ctx = context(
             key,
             executionArgs,

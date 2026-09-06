@@ -1893,8 +1893,8 @@ const layer = Layer.effect(
                 Effect.catchCause(() => Effect.succeed(undefined)),
               )
             : undefined
+        if (!authority) return rejectAuthority("authority_missing")
         if (
-          !authority ||
           authority.rootSessionID !== active.rootSessionID ||
           authority.rootTurnID !== active.rootTurnID ||
           !sameEvidence(authority.trusted, active.trusted) ||

@@ -751,6 +751,7 @@ export type GenericRiskCandidateRejection =
   | "action_scope_invalid"
   | "authority_action_changed"
   | "authority_evidence_changed"
+  | "authority_missing"
   | "authority_revoked"
   | "authority_turn_changed"
   | "context_unsafe"
