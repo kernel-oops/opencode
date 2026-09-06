@@ -433,7 +433,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("requires an exact-file binding and keeps external directory Glob and Grep incomplete", () => {
+  test("keeps external Glob incomplete but admits exact external Grep invocation fallback", () => {
     for (const identity of ["glob", "grep"] as const) {
       const invocation = { pattern: "*.ts", path: "/tmp/external" }
       const envelope = {
@@ -445,16 +445,28 @@ describe("generic built-in risk allow gate", () => {
         effects: [],
         invocation,
       }
-      expect(
-        resolveReviewAction({
-          builtin: true,
-          permission: identity,
-          identity,
-          arguments: invocation,
-          directory: "/tmp/project",
-          requested: { identity, arguments: envelope, cwd: "/tmp/external", complete: true },
-        }).complete,
-      ).toBe(false)
+      const resolved = resolveReviewAction({
+        builtin: true,
+        permission: identity,
+        identity,
+        arguments: invocation,
+        directory: "/tmp/project",
+        requested: { identity, arguments: envelope, cwd: "/tmp/external", complete: true },
+      })
+      if (identity === "glob") {
+        expect(resolved.complete).toBe(false)
+      } else {
+        expect(resolved).toEqual({
+          identity: "grep",
+          arguments: {
+            contract: "registered-builtin-invocation-v1",
+            effects_bound: false,
+            invocation,
+          },
+          cwd: "/tmp/project",
+          complete: true,
+        })
+      }
     }
 
     for (const item of [
@@ -479,7 +491,16 @@ describe("generic built-in risk allow gate", () => {
           complete: false,
         },
       })
-      expect(unbound.complete).toBe(false)
+      expect(unbound).toEqual({
+        identity: "grep",
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation: item.invocation,
+        },
+        cwd: "/tmp/project",
+        complete: true,
+      })
 
       const envelope = {
         contract: "pinned-external-search-v1",

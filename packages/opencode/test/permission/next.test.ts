@@ -6290,6 +6290,61 @@ it.instance(
 )
 
 it.instance(
+  "exceptional-risk reviewer - Luna allow authorises an exact unbound external Grep invocation",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Low-prompt external Grep" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const grepInput = {
+        pattern: "engine|propeller|analyst|extraction",
+        path: "/home/opencode/.local/share/opencode/tool-output",
+        include: "tool_example*",
+      }
+      const action = resolveReviewAction({
+        builtin: true,
+        permission: "grep",
+        permissionMetadata: grepInput,
+        identity: "grep",
+        arguments: grepInput,
+        directory: test.directory,
+        requested: { identity: "grep", arguments: grepInput, cwd: grepInput.path, complete: false },
+      })
+      expect(action).toMatchObject({
+        identity: "grep",
+        arguments: { contract: "registered-builtin-invocation-v1", effects_bound: false, invocation: grepInput },
+        cwd: test.directory,
+        complete: true,
+      })
+
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      yield* reviewerAsk({
+        sessionID,
+        tool: { messageID: turnID, callID: "call_external_grep" },
+        permission: "grep",
+        patterns: [grepInput.pattern],
+        metadata: grepInput,
+        always: [],
+        ruleset: [],
+        review: { origin: "tool", action },
+      })
+
+      expect(yield* list()).toHaveLength(0)
+      expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  15_000,
+)
+
+it.instance(
   "exceptional-risk reviewer - redacted exact Bash remains Luna-authoritative and source mutation fails closed",
   () =>
     Effect.gen(function* () {
