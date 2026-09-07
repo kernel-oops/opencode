@@ -65,6 +65,7 @@ readonly PATCH_BRANCHES=(
   "fix/task-delegation-readiness"
   "fix/external-bash-redaction"
   "fix/semantic-invocation-accidental-harm"
+  "collaboration-reporting"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -110,6 +111,7 @@ readonly PATCH_IDS=(
   "363d5b683bbdf2a4733d445dfb53fad77ce5e5c2"
   "a58e9caa313d2449d24732000466e5a9495edde1"
   "797a26ac327c076e209c7ca12151da0c0facb6b8"
+  "1b7d7e4486cca9c2d40b9c605a10114dbed9603c"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -155,6 +157,7 @@ readonly PATCH_TIPS=(
   "237881fa40c8e2d2a978d34eb6d19566d86ff48d"
   "3f3061b3a771d5e6ff932f71108b4f87c2c6e8e7"
   "caf1f122c6579662055dc5eb7dc721bdc3febfad"
+  "e6686bb2e1f0792d948f98fc59191852a824e4b3"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
