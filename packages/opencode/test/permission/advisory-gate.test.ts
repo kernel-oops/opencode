@@ -823,6 +823,89 @@ describe("generic built-in risk allow gate", () => {
         }),
       ).toBe(false)
     }
+
+    const redactedCommand = "TEST_TOKEN=retainedscan20260907 node --test > /tmp/retained-bridge.log 2>&1"
+    const redactedSourceAction = {
+      ...bashAction,
+      arguments: { ...bashAction.arguments, command: redactedCommand },
+    }
+    const redacted = buildPermissionReviewSnapshot({
+      permission: "external_directory",
+      origin: "tool",
+      patterns: ["/tmp/external/*"],
+      metadata: {
+        command: redactedCommand,
+        directories: ["/tmp/external"],
+        patterns: ["/tmp/external/*"],
+      },
+      action: redactedSourceAction,
+      trusted: [{ source: "human", text: "Run the bounded test and retain its temporary log" }],
+      untrusted: [],
+      contextSafeForGate: true,
+    })
+    expect(redacted.action.complete).toBe(false)
+    expect(redacted.action.omitted_items).toBe(2)
+    expect(
+      isExternalDirectoryRiskAllowCandidate({
+        settled: true,
+        permission: "external_directory",
+        assessment,
+        snapshot: redacted,
+        policy: "exceptional-risk-only-v1",
+        sourceAction: redactedSourceAction,
+      }),
+    ).toBe(true)
+    for (const candidate of [
+      { sourceAction: undefined, snapshot: redacted },
+      {
+        sourceAction: {
+          ...redactedSourceAction,
+          arguments: { ...redactedSourceAction.arguments, command: `${redactedCommand} changed` },
+        },
+        snapshot: redacted,
+      },
+      {
+        sourceAction: redactedSourceAction,
+        snapshot: { ...redacted, action: { ...redacted.action, omitted_items: redacted.action.omitted_items + 1 } },
+      },
+      {
+        sourceAction: redactedSourceAction,
+        snapshot: { ...redacted, action: { ...redacted.action, omitted_bytes: redacted.action.omitted_bytes + 1 } },
+      },
+      { sourceAction: { ...redactedSourceAction, complete: false }, snapshot: redacted },
+      {
+        sourceAction: {
+          ...redactedSourceAction,
+          arguments: { ...redactedSourceAction.arguments, shell: "zsh" },
+        },
+        snapshot: redacted,
+      },
+      {
+        sourceAction: {
+          ...redactedSourceAction,
+          arguments: { ...redactedSourceAction.arguments, workdir: "/tmp/other" },
+        },
+        snapshot: redacted,
+      },
+      {
+        sourceAction: {
+          ...redactedSourceAction,
+          arguments: { ...redactedSourceAction.arguments, timeout: 1 },
+        },
+        snapshot: redacted,
+      },
+    ]) {
+      expect(
+        isExternalDirectoryRiskAllowCandidate({
+          settled: true,
+          permission: "external_directory",
+          assessment,
+          snapshot: candidate.snapshot,
+          policy: "exceptional-risk-only-v1",
+          sourceAction: candidate.sourceAction,
+        }),
+      ).toBe(false)
+    }
   })
 
   test("represents unattested glob and grep paths as exact lower-assurance invocations", () => {

@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import type { PermissionReviewSnapshot } from "@opencode-ai/plugin"
+import { permissionReviewStringProjection } from "./reviewer-input"
 import path from "node:path"
 import { types } from "node:util"
 import { exactSearchIncludeTarget } from "@/util/exact-search-include"
@@ -840,12 +841,16 @@ export function isGenericRiskAllowCandidate(input: Parameters<typeof isGenericRi
   return input.assessment.outcome === "allow" && isGenericRiskCandidate(input)
 }
 
-export function isCompleteExternalDirectoryBashAction(action: PermissionReviewSnapshot["action"]) {
+export function isCompleteExternalDirectoryBashAction(
+  action: PermissionReviewSnapshot["action"],
+  sourceAction?: PermissionV1.ReviewAction,
+) {
   if (action.identity !== "bash") return false
   const value = action.arguments
   const cwd = action.cwd
-  if (!record(value) || !exactKeys(value, ["command", "shell", "timeout", "workdir"])) return false
-  return (
+  const complete =
+    record(value) &&
+    exactKeys(value, ["command", "shell", "timeout", "workdir"]) &&
     typeof value.command === "string" &&
     value.command.length > 0 &&
     typeof value.shell === "string" &&
@@ -855,10 +860,50 @@ export function isCompleteExternalDirectoryBashAction(action: PermissionReviewSn
     typeof value.workdir === "string" &&
     value.workdir.length > 0 &&
     value.workdir === cwd
+  if (complete && action.complete && action.omitted_items === 0 && action.omitted_bytes === 0) return true
+  if (
+    !sourceAction ||
+    sourceAction.identity !== "bash" ||
+    sourceAction.complete !== true ||
+    sourceAction.cwd !== cwd ||
+    !record(sourceAction.arguments) ||
+    !exactKeys(sourceAction.arguments, ["command", "shell", "timeout", "workdir"]) ||
+    typeof sourceAction.arguments.command !== "string" ||
+    sourceAction.arguments.command.length === 0 ||
+    typeof sourceAction.arguments.shell !== "string" ||
+    sourceAction.arguments.shell.length === 0 ||
+    !Number.isSafeInteger(sourceAction.arguments.timeout) ||
+    Number(sourceAction.arguments.timeout) <= 0 ||
+    typeof sourceAction.arguments.workdir !== "string" ||
+    sourceAction.arguments.workdir.length === 0 ||
+    sourceAction.arguments.workdir !== sourceAction.cwd ||
+    !complete ||
+    value.shell !== sourceAction.arguments.shell ||
+    value.timeout !== sourceAction.arguments.timeout ||
+    value.workdir !== sourceAction.arguments.workdir
   )
+    return false
+  const projection = permissionReviewStringProjection(sourceAction.arguments.command)
+  if (projection.complete || value.command !== projection.text) return false
+  const metadata = action.metadata
+  if (
+    !record(metadata) ||
+    !exactKeys(metadata, ["command", "directories", "patterns"]) ||
+    metadata.command !== projection.text ||
+    !Array.isArray(metadata.directories) ||
+    !metadata.directories.every((item) => typeof item === "string") ||
+    !Array.isArray(metadata.patterns) ||
+    !metadata.patterns.every((item) => typeof item === "string") ||
+    !Array.isArray(action.patterns) ||
+    JSON.stringify(metadata.patterns) !== JSON.stringify(action.patterns)
+  )
+    return false
+  return action.complete === false && action.omitted_items === 2 && action.omitted_bytes === projection.omitted * 2
 }
 
-export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof isGenericRiskCandidate>[0]) {
+export function isExternalDirectoryRiskAllowCandidate(
+  input: Parameters<typeof isGenericRiskCandidate>[0] & { readonly sourceAction?: PermissionV1.ReviewAction },
+) {
   if (input.permission !== "external_directory" || input.assessment.outcome !== "allow") return false
   const action = input.snapshot.action
   const contract = externalDirectoryContracts[action.identity]
@@ -869,7 +914,11 @@ export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof i
   const trusted = input.snapshot.trusted
   const argumentsValid = contract
     ? argumentsComplete(contract, action.arguments) && registeredReadonlyInvocation(action) !== undefined
-    : isCompleteExternalDirectoryBashAction(action)
+    : isCompleteExternalDirectoryBashAction(action, input.sourceAction)
+  const actionComplete =
+    action.identity === "bash"
+      ? argumentsValid
+      : action.complete && action.omitted_items === 0 && action.omitted_bytes === 0 && argumentsValid
   return (
     input.settled &&
     !("failure" in validated) &&
@@ -879,10 +928,7 @@ export function isExternalDirectoryRiskAllowCandidate(input: Parameters<typeof i
       action.identity === "grep" ||
       action.identity === "glob" ||
       action.identity === "bash") &&
-    action.complete &&
-    action.omitted_items === 0 &&
-    action.omitted_bytes === 0 &&
-    argumentsValid &&
+    actionComplete &&
     action.cwd_status === "exact" &&
     typeof action.cwd === "string" &&
     action.cwd.length > 0 &&
