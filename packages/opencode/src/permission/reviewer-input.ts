@@ -193,6 +193,10 @@ function replaceSecrets(value: string): Redacted {
   return { text, complete: false, omitted: Math.max(0, before - Buffer.byteLength(text, "utf8")) }
 }
 
+export function permissionReviewStringProjection(value: string): Redacted {
+  return replaceSecrets(value)
+}
+
 function jsonBytes(value: PermissionReviewValue) {
   return Buffer.byteLength(JSON.stringify(value), "utf8")
 }

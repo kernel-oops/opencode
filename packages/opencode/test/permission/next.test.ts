@@ -4924,6 +4924,43 @@ it.effect("permission sequencing - revocation during delayed scope inspection ca
   }),
 )
 
+it.effect("permission sequencing - raw binding mutation during final authority await cannot commit", () =>
+  Effect.gen(function* () {
+    const finalAuthorityStarted = yield* Deferred.make<void>()
+    const releaseFinalAuthority = yield* Deferred.make<void>()
+    let checks = 0
+    let rawBinding = "TEST_TOKEN=aaaaaaaa"
+    const reviewedBinding = rawBinding
+    let finalChecks = 0
+
+    const fiber = yield* inspectThenRevalidateAuthority(
+      () =>
+        Effect.gen(function* () {
+          checks += 1
+          if (checks === 2) {
+            yield* Deferred.succeed(finalAuthorityStarted, undefined)
+            yield* Deferred.await(releaseFinalAuthority)
+          }
+          return true
+        }),
+      () => Effect.succeed({ scope: "/tmp" }),
+      () => {
+        finalChecks += 1
+        return rawBinding === reviewedBinding
+      },
+    ).pipe(Effect.forkScoped)
+
+    yield* Deferred.await(finalAuthorityStarted)
+    rawBinding = "TEST_TOKEN=bbbbbbbb"
+    yield* Deferred.succeed(releaseFinalAuthority, undefined)
+    const result = yield* Fiber.join(fiber)
+
+    expect(result).toEqual({ authorityCurrent: false, inspection: { scope: "/tmp" } })
+    expect(checks).toBe(2)
+    expect(finalChecks).toBe(1)
+  }),
+)
+
 it.instance(
   "delegated reviewer - external read scope is turn-bound, canonical, read-only, and fail-closed",
   () =>
@@ -5981,6 +6018,136 @@ it.instance(
       expect(logs).toContain('"result":"ask"')
       expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
       expect(logs).toContain('"bashScopeCode":"bash_scope_minted"')
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "ask" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - redacted command values do not invalidate exact external Bash scope provenance",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Redacted external Bash scope" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      yield* reviewerAsk(
+        externalBashRequest(
+          sessionID,
+          turnID,
+          test.directory,
+          [external],
+          "TEST_TOKEN=retainedscan20260907 node --test > /tmp/retained-bridge.log 2>&1",
+        ),
+      )
+
+      expect(reviewerLanguage.doStreamCalls).toHaveLength(1)
+      expect(yield* list()).toHaveLength(0)
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).toContain('"dispositionAuthority":"automatic_allow"')
+      expect(logs).toContain('"bashScopeCode":"bash_scope_minted"')
+    }),
+  withBashEvaluator({
+    mode: "permit-only",
+    policy: { decision: "ask" },
+    reviewer: {
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+    },
+  }),
+  15_000,
+)
+
+it.instance(
+  "exceptional-risk reviewer - unsafe raw Bash bindings cannot mint external scope",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessions = yield* Session.Service
+      const sessionID = (yield* sessions.create({ title: "Unsafe raw external Bash bindings" })).id
+      const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+      const external = yield* tmpdirScoped()
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+
+      const circular = externalBashRequest(
+        sessionID,
+        turnID,
+        test.directory,
+        [external],
+        "TEST_TOKEN=aaaaaaaa node --test > /tmp/retained-bridge.log 2>&1",
+      )
+      const circularAction = circular.review.action as unknown as Record<string, unknown>
+      circularAction.loop = circularAction
+      const circularFiber = yield* reviewerAsk(circular).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(circularFiber)
+
+      const executable = externalBashRequest(
+        sessionID,
+        turnID,
+        test.directory,
+        [external],
+        "TEST_TOKEN=aaaaaaaa node --test > /tmp/retained-bridge.log 2>&1",
+      )
+      let serialisationHooks = 0
+      Object.defineProperty(executable.always, "toJSON", {
+        value: () => {
+          serialisationHooks += 1
+          executable.metadata.command = "TEST_TOKEN=bbbbbbbb node --test > /tmp/retained-bridge.log 2>&1"
+          executable.review.action.arguments.command = executable.metadata.command
+          return [...executable.always]
+        },
+      })
+      const executableFiber = yield* reviewerAsk(executable).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(executableFiber)
+
+      const inheritedExecutable = externalBashRequest(
+        sessionID,
+        turnID,
+        test.directory,
+        [external],
+        "TEST_TOKEN=aaaaaaaa node --test > /tmp/retained-bridge.log 2>&1",
+      )
+      const unusualArrayPrototype = Object.create(Array.prototype) as unknown[]
+      Object.defineProperty(unusualArrayPrototype, "toJSON", {
+        value: () => {
+          serialisationHooks += 1
+          inheritedExecutable.metadata.command = "TEST_TOKEN=bbbbbbbb node --test > /tmp/retained-bridge.log 2>&1"
+          inheritedExecutable.review.action.arguments.command = inheritedExecutable.metadata.command
+          return [...inheritedExecutable.always]
+        },
+      })
+      Object.setPrototypeOf(inheritedExecutable.always, unusualArrayPrototype)
+      const inheritedExecutableFiber = yield* reviewerAsk(inheritedExecutable).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      yield* Fiber.await(inheritedExecutableFiber)
+
+      expect(serialisationHooks).toBe(0)
+      expect(executable.metadata.command).toContain("TEST_TOKEN=aaaaaaaa")
+      expect(inheritedExecutable.metadata.command).toContain("TEST_TOKEN=aaaaaaaa")
+      const logs = JSON.stringify(yield* TestConsole.logLines)
+      expect(logs).not.toContain('"bashScopeCode":"bash_scope_minted"')
+      expect(logs).toContain('"candidateRejection":"authority_action_changed"')
     }),
   withBashEvaluator({
     mode: "permit-only",

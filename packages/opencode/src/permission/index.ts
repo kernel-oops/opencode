@@ -213,11 +213,13 @@ type BuiltinResult = PermissionReviewer.AssessmentResult
 export function inspectThenRevalidateAuthority<A, E1, R1, E2, R2>(
   revalidate: () => Effect.Effect<boolean, E1, R1>,
   inspect: () => Effect.Effect<A, E2, R2>,
+  finalise: (inspection: A) => boolean = () => true,
 ) {
   return Effect.gen(function* () {
     if (!(yield* revalidate())) return { authorityCurrent: false, inspection: undefined } as const
     const inspection = yield* inspect()
-    return { authorityCurrent: yield* revalidate(), inspection } as const
+    const authorityCurrent = yield* revalidate()
+    return { authorityCurrent: authorityCurrent && finalise(inspection), inspection } as const
   })
 }
 
@@ -358,8 +360,54 @@ const layer = Layer.effect(
     }
 
     const exactActionBinding = (value: unknown) => {
+      const seen = new Set<object>()
+      const detach = (item: unknown): unknown => {
+        if (item === null || typeof item === "string" || typeof item === "boolean") return item
+        if (typeof item === "number") {
+          if (!Number.isFinite(item)) throw new TypeError("Non-finite binding value")
+          return item
+        }
+        if (typeof item !== "object" || types.isProxy(item) || seen.has(item))
+          throw new TypeError("Unsafe binding value")
+        seen.add(item)
+        try {
+          if (Array.isArray(item)) {
+            if (Object.getPrototypeOf(item) !== Array.prototype) throw new TypeError("Unsafe binding array")
+            const descriptors = Object.getOwnPropertyDescriptors(item)
+            const keys = Reflect.ownKeys(descriptors)
+            if (keys.some((key) => typeof key === "symbol") || keys.length !== item.length + 1)
+              throw new TypeError("Unsafe binding array")
+            const output: unknown[] = []
+            for (let index = 0; index < item.length; index++) {
+              const descriptor = descriptors[String(index)]
+              if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+                throw new TypeError("Unsafe binding array entry")
+              output.push(detach(descriptor.value))
+            }
+            return output
+          }
+          const prototype = Object.getPrototypeOf(item)
+          if (prototype !== Object.prototype && prototype !== null) throw new TypeError("Unsafe binding object")
+          const output: Record<string, unknown> = {}
+          for (const key of Reflect.ownKeys(item)) {
+            if (typeof key === "symbol") throw new TypeError("Unsafe binding key")
+            const descriptor = Object.getOwnPropertyDescriptor(item, key)
+            if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+              throw new TypeError("Unsafe binding property")
+            Object.defineProperty(output, key, {
+              value: detach(descriptor.value),
+              enumerable: true,
+              configurable: true,
+              writable: true,
+            })
+          }
+          return output
+        } finally {
+          seen.delete(item)
+        }
+      }
       try {
-        const serialised = JSON.stringify(value)
+        const serialised = JSON.stringify(detach(value))
         if (serialised === undefined) return
         return createHmac("sha256", actionBindingKey).update(serialised).digest("hex")
       } catch {
@@ -778,20 +826,39 @@ const layer = Layer.effect(
     const inspectExternalBashScope = (input: {
       info: PermissionV1.Request
       snapshot: PermissionReviewSnapshot
+      sourceAction: PermissionV1.ReviewAction | undefined
       turn: TurnState
     }): BashScopeRequest | undefined => {
       if (
         input.info.permission !== "external_directory" ||
         input.snapshot.action.permission !== "external_directory" ||
         input.snapshot.action.origin !== "tool" ||
-        !PermissionReviewer.isCompleteExternalDirectoryBashAction(input.snapshot.action) ||
+        !PermissionReviewer.isCompleteExternalDirectoryBashAction(input.snapshot.action, input.sourceAction) ||
         !readScopeAuthority(input.turn)
       )
         return
       const metadata = input.info.metadata
       if (!plainRecord(metadata) || !exactKeys(metadata, ["command", "directories", "patterns"])) return
-      const command = input.snapshot.action.arguments
-      if (!plainRecord(command) || metadata.command !== command.command) return
+      const sourceAction = input.sourceAction
+      const command = sourceAction?.arguments
+      if (
+        sourceAction?.identity !== "bash" ||
+        sourceAction.complete !== true ||
+        !plainRecord(command) ||
+        !exactKeys(command, ["command", "shell", "timeout", "workdir"]) ||
+        typeof command.command !== "string" ||
+        command.command.length === 0 ||
+        typeof command.shell !== "string" ||
+        command.shell.length === 0 ||
+        !Number.isSafeInteger(command.timeout) ||
+        Number(command.timeout) <= 0 ||
+        typeof command.workdir !== "string" ||
+        command.workdir.length === 0 ||
+        sourceAction.cwd !== command.workdir ||
+        sourceAction.cwd !== input.snapshot.action.cwd ||
+        metadata.command !== command.command
+      )
+        return
       if (!Array.isArray(metadata.directories) || !Array.isArray(metadata.patterns)) return
       if (
         metadata.directories.length === 0 ||
@@ -1535,7 +1602,14 @@ const layer = Layer.effect(
       const reviewTurn = turn
       const reviewActionBinding = JSON.stringify(snapshot.action)
       const sourceActionBinding = exactActionBinding(source?.action)
-      const initialBashScopeRequest = inspectExternalBashScope({ info, snapshot, turn })
+      const rawRequestBinding = exactActionBinding({
+        permission: info.permission,
+        patterns: info.patterns,
+        metadata: info.metadata,
+        always: info.always,
+        tool: info.tool,
+      })
+      const initialBashScopeRequest = inspectExternalBashScope({ info, snapshot, sourceAction: source?.action, turn })
       const externalReadScopeRequest = permissionSession
         ? yield* inspectExternalReadScope({
             info,
@@ -1914,34 +1988,85 @@ const layer = Layer.effect(
             }),
           ),
         )
-      const finalAuthority = yield* inspectThenRevalidateAuthority(safelyRevalidateAuthority, () =>
-        Effect.gen(function* () {
-          const externalReadScopeRequest = permissionSession
-            ? yield* inspectExternalReadScope({
-                info,
-                snapshot,
-                turn: reviewTurn,
-                directory: permissionSession.directory,
-              }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-            : undefined
-          const readScopeGate = yield* readScopeAllowsExternalGate(current, externalReadScopeRequest, reviewTurn).pipe(
-            Effect.catchCause(() => Effect.succeed(false)),
-          )
-          const readScopePrimary = permissionSession
-            ? yield* readScopeAllowsPrimary({
-                current,
-                info,
-                snapshot,
-                turn: reviewTurn,
-                directory: permissionSession.directory,
-              }).pipe(Effect.catchCause(() => Effect.succeed(false)))
-            : false
-          const bashScopeRequest = inspectExternalBashScope({ info, snapshot, turn: reviewTurn })
-          return { externalReadScopeRequest, readScopeGate, readScopePrimary, bashScopeRequest }
-        }),
+      const finaliseAuthorityBindings = () => {
+        if (!rawRequestBinding || (source?.action && !sourceActionBinding))
+          return rejectAuthority("authority_action_changed")
+        if (!activeTurnKey || current.activeTurns.get(info.sessionID) !== activeTurnKey)
+          return rejectAuthority("authority_turn_changed")
+        const active = current.turns.get(activeTurnKey)
+        if (!active || !sameReviewTurn(active, reviewTurn)) return rejectAuthority("authority_turn_changed")
+        const currentSnapshot = buildPermissionReviewSnapshot({
+          permission: info.permission,
+          origin: source?.origin ?? "unknown",
+          patterns: info.patterns,
+          metadata: info.metadata,
+          action: source?.action ?? {
+            identity: info.permission,
+            arguments: source?.arguments,
+            complete: false,
+          },
+          trusted: active.trusted,
+          untrusted: active.untrusted,
+          trustedComplete: active.trustedComplete,
+          untrustedComplete: active.untrustedComplete,
+          contextSafeForGate: active.contextSafeForGate,
+        })
+        if (
+          JSON.stringify(currentSnapshot.action) !== reviewActionBinding ||
+          exactActionBinding(source?.action) !== sourceActionBinding ||
+          exactActionBinding({
+            permission: info.permission,
+            patterns: info.patterns,
+            metadata: info.metadata,
+            always: info.always,
+            tool: info.tool,
+          }) !== rawRequestBinding
+        )
+          return rejectAuthority("authority_action_changed")
+        if (JSON.stringify(snapshot.trusted) !== JSON.stringify(currentSnapshot.trusted))
+          return rejectAuthority("authority_evidence_changed")
+        if (!active.contextSafeForGate) return rejectAuthority("context_unsafe")
+        if (!active.trustedComplete) return rejectAuthority("trusted_evidence_incomplete")
+        return true
+      }
+      const finalAuthority = yield* inspectThenRevalidateAuthority(
+        safelyRevalidateAuthority,
+        () =>
+          Effect.gen(function* () {
+            const externalReadScopeRequest = permissionSession
+              ? yield* inspectExternalReadScope({
+                  info,
+                  snapshot,
+                  turn: reviewTurn,
+                  directory: permissionSession.directory,
+                }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+              : undefined
+            const readScopeGate = yield* readScopeAllowsExternalGate(
+              current,
+              externalReadScopeRequest,
+              reviewTurn,
+            ).pipe(Effect.catchCause(() => Effect.succeed(false)))
+            const readScopePrimary = permissionSession
+              ? yield* readScopeAllowsPrimary({
+                  current,
+                  info,
+                  snapshot,
+                  turn: reviewTurn,
+                  directory: permissionSession.directory,
+                }).pipe(Effect.catchCause(() => Effect.succeed(false)))
+              : false
+            const bashScopeRequest = inspectExternalBashScope({
+              info,
+              snapshot,
+              sourceAction: source?.action,
+              turn: reviewTurn,
+            })
+            return { externalReadScopeRequest, readScopeGate, readScopePrimary, bashScopeRequest }
+          }),
+        finaliseAuthorityBindings,
       )
-      // inspectThenRevalidateAuthority performs the persisted check as its final yielded operation. Do not add an
-      // await between this point and disposition or read-scope mutation.
+      // inspectThenRevalidateAuthority performs the persisted check and the final synchronous raw binding check as
+      // its final operations. Do not add an await between this point and disposition or scope mutation.
       const authorityStillCurrent = finalAuthority.authorityCurrent
       const inspectedExternalReadScopeRequest = finalAuthority.inspection?.externalReadScopeRequest
       const inspectedReadScopeGate = finalAuthority.inspection?.readScopeGate ?? false
@@ -2023,6 +2148,7 @@ const layer = Layer.effect(
           assessment: riskPolicyAssessment,
           snapshot,
           policy: riskPolicy,
+          sourceAction: source?.action,
         })
       const externalDirectoryAllowCandidate =
         externalDirectoryReviewCandidate &&
