@@ -43,7 +43,7 @@ export const WebFetchTool = Tool.define(
             metadata: {
               url: params.url,
               format: params.format,
-              timeout: params.timeout,
+              ...(params.timeout === undefined ? {} : { timeout: params.timeout }),
             },
           })
 

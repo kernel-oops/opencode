@@ -354,17 +354,37 @@ describe("tool.glob", () => {
     }),
   )
 
-  it.instance("holds an external directory descriptor without attesting automatic completeness", () =>
+  it.instance("reviews both external Glob stages as exact invocations without attesting effect confinement", () =>
     Effect.gen(function* () {
       if (process.platform !== "linux") return
-      yield* TestInstance
+      const test = yield* TestInstance
       const outside = yield* tmpdirScoped()
       yield* Effect.promise(() => Bun.write(path.join(outside, "reviewed.ts"), "reviewed"))
       const captured = asks()
       const info = yield* GlobTool
       const glob = yield* info.init()
 
-      const result = yield* glob.execute({ pattern: "*.ts", path: outside }, captured.next)
+      const args = { pattern: "**/*", path: outside }
+      const result = yield* glob.execute(args, captured.next)
+      expect(captured.items.map((request) => request.permission)).toEqual(["external_directory", "glob"])
+      for (const request of captured.items) {
+        const action = resolveReviewAction({
+          builtin: true,
+          identity: "glob",
+          permission: request.permission,
+          permissionMetadata: request.metadata,
+          arguments: args,
+          directory: test.directory,
+          requested: request.action,
+        })
+        expect(action).toEqual({
+          identity: "glob",
+          arguments: { contract: "registered-builtin-invocation-v1", effects_bound: false, invocation: args },
+          cwd: test.directory,
+          complete: true,
+        })
+        expect(request.metadata).not.toHaveProperty("searchBinding")
+      }
 
       expect(result.output).toContain(path.join(outside, "reviewed.ts"))
       expect(captured.items.find((item) => item.permission === "external_directory")?.metadata).not.toHaveProperty(

@@ -76,8 +76,8 @@ export const GlobTool = Tool.define(
                     identity: "glob",
                     arguments: boundArguments ?? input,
                     cwd: search,
-                    // External traversal remains human-authorised: a root descriptor and ripgrep's device-based
-                    // one-file-system boundary do not confine same-device descendant bind mounts.
+                    // This descriptor proves confinement only for project search. External traversal can still
+                    // receive exact-invocation semantic review, without claiming same-device mount confinement.
                     complete: Boolean(boundArguments),
                   },
                 })

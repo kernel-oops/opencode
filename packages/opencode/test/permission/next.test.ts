@@ -1,3 +1,7 @@
+import { HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { WebFetchTool } from "../../src/tool/webfetch"
+import { WebSearchTool } from "../../src/tool/websearch"
+import type { Context as ToolContext } from "../../src/tool/tool"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
@@ -191,6 +195,8 @@ const reviewerOutput = (decision: "allow" | "ask" | "deny") => ({
 const obviousReviewerOutput = (
   outcome: "allow" | "rewrite" | "human_review",
   reason_code:
+    | "broad_unrecoverable_data_loss"
+    | "secret_or_credential_exfiltration"
     | "routine_or_low_impact"
     | "specifically_authorised_operation"
     | "scope_can_be_narrowed"
@@ -5005,7 +5011,8 @@ it.instance(
       )
       const glob = { pattern: "*.log", path: external }
       yield* staysHuman(externalGlobRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, glob))
-      yield* staysHuman(
+      // The boundary remains unconfined, but the primary exact invocation is now semantically reviewable.
+      yield* reviewerAsk(
         genericExternalGlobRequest(seeded.child.id, seeded.childAssistantID, seeded.child.directory, glob),
       )
       yield* reviewerAsk(
@@ -7678,3 +7685,310 @@ it.instance(
   withBashEvaluator({ mode: "enforce", policy: { decision: "allow", capture: true } }),
   15_000,
 )
+
+// Both incident permission stages, with genuine delegated human admission and a mocked Luna verdict.
+for (const outcome of ["allow", "rewrite", "human_review"] as const) {
+  it.instance(
+    `exceptional-risk reviewer - exact external Glob pipeline preserves Luna ${outcome}`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+        const input = { pattern: "**/*", path: "/tmp/dv-quality-audit" }
+        const request = (permission: "glob" | "external_directory") => ({
+          sessionID: seeded.child.id,
+          tool: { messageID: seeded.childAssistantID, callID: "call_incident_glob" },
+          permission,
+          patterns: permission === "glob" ? [input.pattern] : [`${input.path}/*`],
+          always: ["*"],
+          metadata: permission === "glob" ? input : { filepath: input.path, parentDir: input.path, tool: "glob" },
+          ruleset: [],
+          review: {
+            origin: "tool" as const,
+            action: resolveReviewAction({
+              builtin: true,
+              permission,
+              permissionMetadata: { tool: "glob" },
+              identity: "glob",
+              arguments: input,
+              directory: seeded.child.directory,
+              ...(permission === "glob"
+                ? { requested: { identity: "glob", arguments: input, cwd: input.path, complete: false } }
+                : {}),
+            }),
+          },
+        })
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+        })
+        yield* reviewerAsk(request("external_directory"))
+        expect(request("glob").review.action).toEqual({
+          identity: "glob",
+          arguments: { contract: "registered-builtin-invocation-v1", effects_bound: false, invocation: input },
+          cwd: seeded.child.directory,
+          complete: true,
+        })
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () =>
+            obviousReviewerOutput(
+              outcome,
+              outcome === "allow" ? "routine_or_low_impact" : "broad_unrecoverable_data_loss",
+              outcome === "allow"
+                ? "none"
+                : outcome === "rewrite"
+                  ? "inspect_read_only"
+                  : "request_specific_authorisation",
+            ),
+        })
+        const primary = request("glob")
+        if (outcome === "allow") {
+          yield* reviewerAsk(primary)
+          expect(yield* list()).toHaveLength(0)
+          // Even the identical wildcard needs a fresh verdict: no blanket grant was learned.
+          reviewerLanguage = new MockLanguageModelV3({
+            doStream: async () =>
+              obviousReviewerOutput("human_review", "broad_unrecoverable_data_loss", "request_specific_authorisation"),
+          })
+        }
+        const pending = yield* reviewerAsk(primary).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        expect(yield* fail(Fiber.join(pending))).toBeInstanceOf(PermissionV1.RejectedError)
+        const logs = JSON.stringify(yield* TestConsole.logLines)
+        expect(logs).not.toContain('"readScopeCode":"read_scope_minted"')
+        expect(logs).not.toContain('"dispositionAuthority":"automatic_rewrite"')
+      }),
+    withObviousReviewer({
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+      automatic_rewrite: "once-per-turn",
+      bashEvaluator: "disabled",
+    }),
+    15_000,
+  )
+}
+
+it.instance(
+  "exceptional-risk reviewer - exact local helper passes both stages without waiving Luna human review",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory, rootSummary: true })
+      const command =
+        "chmod 600 /tmp/ocr-quality-groups.php; php /tmp/ocr-quality-groups.php; sed -n '577,640p' src/DocumentVerification/DocumentVerificationVerifierResultValidator.php; rg -n 'conflict|canonicalValue' src/Presentation/DetailedFigurePresentationPolicy.php | tail -20"
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+      })
+      const external = externalBashRequest(
+        seeded.child.id,
+        seeded.childAssistantID,
+        seeded.child.directory,
+        ["/tmp"],
+        command,
+      )
+      yield* reviewerAsk(external)
+      const primary = { ...external, permission: "bash", patterns: [command], always: [], metadata: { command } }
+      yield* reviewerAsk(primary)
+      expect(yield* list()).toHaveLength(0)
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () =>
+          obviousReviewerOutput("human_review", "secret_or_credential_exfiltration", "request_specific_authorisation"),
+      })
+      const pending = yield* reviewerAsk(primary).pipe(Effect.forkScoped)
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      yield* rejectAll()
+      expect(yield* fail(Fiber.join(pending))).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    bashEvaluator: "disabled",
+  }),
+  15_000,
+)
+
+for (const scenario of ["absent", "supplied", "undefined-metadata", "mutated-metadata"] as const) {
+  it.instance(
+    `exceptional-risk reviewer - actual WebFetch producer ${scenario} timeout preserves exact raw binding`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const sessions = yield* Session.Service
+        const permission = yield* Permission.Service
+        const sessionID = (yield* sessions.create({ title: "WebFetch metadata binding" })).id
+        const turnID = yield* captureTrustedPersistedTurn({
+          sessionID,
+          rootSessionID: sessionID,
+          text: "Read the JetBrains post",
+        })
+        const args = {
+          url: "https://x.com/jetbrains/status/2095867249059848441",
+          format: "markdown" as const,
+          ...(scenario === "supplied" || scenario === "mutated-metadata" ? { timeout: 17 } : {}),
+        }
+        let requests = 0
+        let metadata: Record<string, unknown> = {}
+        const http = HttpClient.make((request) =>
+          Effect.sync(() => {
+            requests++
+            expect(request.url).toBe(args.url)
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response("mocked post", { headers: { "content-type": "text/plain" } }),
+            )
+          }),
+        )
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () => {
+            if (scenario === "mutated-metadata") metadata.timeout = 18
+            return obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+          },
+        })
+        const ctx: ToolContext = {
+          sessionID,
+          messageID: turnID,
+          callID: "call_webfetch_binding",
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: (request) =>
+            Effect.gen(function* () {
+              metadata = request.metadata
+              expect(metadata).toEqual(args)
+              expect(Object.hasOwn(metadata, "timeout")).toBe(Object.hasOwn(args, "timeout"))
+              if (scenario === "undefined-metadata") metadata.timeout = undefined
+              yield* permission.ask({
+                ...request,
+                sessionID,
+                tool: { messageID: turnID, callID: "call_webfetch_binding" },
+                ruleset: [],
+                review: {
+                  origin: "tool",
+                  action: resolveReviewAction({
+                    builtin: true,
+                    identity: "webfetch",
+                    permission: request.permission,
+                    arguments: args,
+                    directory: test.directory,
+                  }),
+                },
+              })
+            }).pipe(Effect.orDie),
+        }
+        const definition = yield* WebFetchTool.pipe(Effect.provideService(HttpClient.HttpClient, http))
+        const tool = yield* definition.init()
+        const execution = tool.execute(args, ctx)
+        if (scenario === "absent" || scenario === "supplied") {
+          const result = yield* execution
+          expect(result.output).toBe("mocked post")
+          expect(requests).toBe(1)
+          expect(yield* list()).toHaveLength(0)
+          expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+        } else {
+          const pending = yield* execution.pipe(Effect.forkScoped)
+          expect(yield* waitForPending(1)).toHaveLength(1)
+          expect(requests).toBe(0)
+          yield* rejectAll()
+          expect(yield* fail(Fiber.join(pending))).toBeInstanceOf(PermissionV1.RejectedError)
+          expect(JSON.stringify(yield* TestConsole.logLines)).toContain(
+            '"candidateRejection":"authority_action_changed"',
+          )
+        }
+      }),
+    withObviousReviewer({
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+      bashEvaluator: "disabled",
+    }),
+    15_000,
+  )
+}
+
+for (const supplied of [false, true]) {
+  it.instance(
+    `exceptional-risk reviewer - actual WebSearch producer preserves ${supplied ? "supplied" : "absent"} optional metadata`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const sessions = yield* Session.Service
+        const permission = yield* Permission.Service
+        const sessionID = (yield* sessions.create({ title: "WebSearch metadata binding" })).id
+        const turnID = yield* captureTrustedPersistedTurn({
+          sessionID,
+          rootSessionID: sessionID,
+          text: "Search for JetBrains news",
+        })
+        const args = {
+          query: "JetBrains news",
+          ...(supplied
+            ? { numResults: 0, livecrawl: "preferred" as const, type: "fast" as const, contextMaxCharacters: 0 }
+            : {}),
+        }
+        let requests = 0
+        const http = HttpClient.make((request) =>
+          Effect.sync(() => {
+            requests++
+            return HttpClientResponse.fromWeb(
+              request,
+              Response.json({ result: { content: [{ type: "text", text: "mocked search" }] } }),
+            )
+          }),
+        )
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () => obviousReviewerOutput("allow", "routine_or_low_impact", "none"),
+        })
+        const ctx: ToolContext = {
+          sessionID,
+          messageID: turnID,
+          callID: "call_websearch_binding",
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: (request) =>
+            Effect.gen(function* () {
+              expect(request.metadata).toEqual({ ...args, provider: expect.any(String) })
+              expect(Object.keys(request.metadata).sort()).toEqual([...Object.keys(args), "provider"].sort())
+              // Supplied search options have a separate pre-existing query-descriptor limitation.
+              // This case verifies the producer without pretending that descriptor is complete.
+              if (supplied) return
+              yield* permission.ask({
+                ...request,
+                sessionID,
+                tool: { messageID: turnID, callID: "call_websearch_binding" },
+                ruleset: [],
+                review: {
+                  origin: "tool",
+                  action: resolveReviewAction({
+                    builtin: true,
+                    identity: "websearch",
+                    permission: request.permission,
+                    arguments: args,
+                    directory: test.directory,
+                  }),
+                },
+              })
+            }).pipe(Effect.orDie),
+        }
+        const definition = yield* WebSearchTool.pipe(Effect.provideService(HttpClient.HttpClient, http))
+        const tool = yield* definition.init()
+        const result = yield* tool.execute(args, ctx)
+        expect(result.output).toBe("mocked search")
+        expect(requests).toBe(1)
+        expect(yield* list()).toHaveLength(0)
+        if (!supplied)
+          expect(JSON.stringify(yield* TestConsole.logLines)).toContain('"dispositionAuthority":"automatic_allow"')
+      }),
+    withObviousReviewer({
+      mode: "enforce",
+      policy: "exceptional-risk-only-v1",
+      automatic_allow: "policy-gated",
+      bashEvaluator: "disabled",
+    }),
+    15_000,
+  )
+}

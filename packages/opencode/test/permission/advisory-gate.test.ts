@@ -433,7 +433,7 @@ describe("generic built-in risk allow gate", () => {
     }
   })
 
-  test("keeps external Glob incomplete but admits exact external Grep invocation fallback", () => {
+  test("admits exact external search invocations without claiming effect confinement", () => {
     for (const identity of ["glob", "grep"] as const) {
       const invocation = { pattern: "*.ts", path: "/tmp/external" }
       const envelope = {
@@ -453,20 +453,16 @@ describe("generic built-in risk allow gate", () => {
         directory: "/tmp/project",
         requested: { identity, arguments: envelope, cwd: "/tmp/external", complete: true },
       })
-      if (identity === "glob") {
-        expect(resolved.complete).toBe(false)
-      } else {
-        expect(resolved).toEqual({
-          identity: "grep",
-          arguments: {
-            contract: "registered-builtin-invocation-v1",
-            effects_bound: false,
-            invocation,
-          },
-          cwd: "/tmp/project",
-          complete: true,
-        })
-      }
+      expect(resolved).toEqual({
+        identity,
+        arguments: {
+          contract: "registered-builtin-invocation-v1",
+          effects_bound: false,
+          invocation,
+        },
+        cwd: "/tmp/project",
+        complete: true,
+      })
     }
 
     for (const item of [
@@ -549,6 +545,41 @@ describe("generic built-in risk allow gate", () => {
           directory: "/tmp/project",
         }),
       ).toBe(true)
+    }
+  })
+
+  test("separates specialised completeness from exact invocation completeness across built-ins", () => {
+    for (const [identity, permission, invocation] of [
+      ["read", "read", { filePath: "/tmp/helper.php" }],
+      ["glob", "glob", { pattern: "**/*", path: "/tmp/dv-quality-audit" }],
+      ["grep", "grep", { pattern: "conflict|canonicalValue", path: "/tmp/dv-quality-audit" }],
+      ["write", "edit", { filePath: "/tmp/helper.php", content: "<?php echo 'report';" }],
+      ["websearch", "websearch", { query: "PHP documentation" }],
+      ["read_mcp_resource", "read", { server: "local", uri: "file:///tmp/report" }],
+    ] as const) {
+      const input = { builtin: true, identity, permission, arguments: invocation, directory: "/work/project" }
+      const resolved = resolveReviewAction({
+        ...input,
+        requested: {
+          identity,
+          arguments: invocation,
+          cwd: identity === "websearch" || identity === "read_mcp_resource" ? null : "/work/project",
+          complete: false,
+        },
+      })
+      expect(resolved).toEqual({
+        identity,
+        arguments: { contract: "registered-builtin-invocation-v1", effects_bound: false, invocation },
+        cwd: "/work/project",
+        complete: true,
+      })
+      expect(resolveReviewAction({ ...input, builtin: false }).complete).toBe(false)
+      expect(
+        resolveReviewAction({
+          ...input,
+          requested: { identity: "spoof", arguments: invocation, cwd: "/work/project", complete: false },
+        }).complete,
+      ).toBe(false)
     }
   })
 
