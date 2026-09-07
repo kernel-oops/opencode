@@ -652,6 +652,8 @@ export function resolveReviewAction(input: {
       return { identity: input.identity, arguments: input.arguments, complete: false }
     return registeredToolInvocation(input) ?? { identity: input.identity, arguments: input.arguments, complete: false }
   }
+  // Completeness describes the exact registered invocation, not confinement of its ambient effects.
+  // Specialised descriptors are preferred below; their absence must not veto semantic review.
   const invocationFallback = () => {
     if (!record(input.arguments)) return { identity: input.identity, arguments: input.arguments, complete: false }
     return {
@@ -690,13 +692,6 @@ export function resolveReviewAction(input: {
     const boundExternalRead = boundExternalReadRequested({ ...input, requested: input.requested })
     if (boundExternalRead) return input.requested
     if (
-      input.identity === "glob" &&
-      typeof input.requested.cwd === "string" &&
-      path.isAbsolute(input.requested.cwd) &&
-      !contains(input.directory, input.requested.cwd)
-    )
-      return { identity: input.identity, arguments: input.arguments, complete: false }
-    if (
       contract &&
       (!record(input.requested) || !exactKeys(input.requested, ["arguments", "complete", "cwd", "identity"]))
     )
@@ -711,11 +706,7 @@ export function resolveReviewAction(input: {
       return invocationFallback()
     if (contract && !requestedActionComplete(contract, input.arguments, input.requested, input.directory))
       return invocationFallback()
-    if (
-      (input.identity === "read" || input.identity === "glob" || input.identity === "grep") &&
-      !input.requested.complete
-    )
-      return invocationFallback()
+    if (!input.requested.complete) return invocationFallback()
     return input.requested
   }
   if (contract?.requested) return invocationFallback()

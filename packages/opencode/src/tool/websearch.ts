@@ -122,10 +122,12 @@ export const WebSearchTool = Tool.define(
             always: ["*"],
             metadata: {
               query: params.query,
-              numResults: params.numResults,
-              livecrawl: params.livecrawl,
-              type: params.type,
-              contextMaxCharacters: params.contextMaxCharacters,
+              ...(params.numResults === undefined ? {} : { numResults: params.numResults }),
+              ...(params.livecrawl === undefined ? {} : { livecrawl: params.livecrawl }),
+              ...(params.type === undefined ? {} : { type: params.type }),
+              ...(params.contextMaxCharacters === undefined
+                ? {}
+                : { contextMaxCharacters: params.contextMaxCharacters }),
               provider,
             },
           })
