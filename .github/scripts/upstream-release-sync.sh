@@ -404,7 +404,7 @@ prepare() {
   trap 'git worktree remove --force "$candidate_dir" >/dev/null 2>&1 || true; rm -f "$patch_file"' RETURN
   git -c core.hooksPath=/dev/null worktree add --detach "$candidate_dir" "$upstream_sha"
   git -C "$candidate_dir" config user.name Marc
-  git -C "$candidate_dir" config user.email marc@kernel-oops.com
+  git -C "$candidate_dir" config user.email marc@kernel-panic.im
 
   for index in "${!PATCH_BRANCHES[@]}"; do
     branch="${PATCH_BRANCHES[$index]}"
@@ -448,8 +448,8 @@ prepare() {
   candidate_tree="$(git -C "$candidate_dir" rev-parse 'HEAD^{tree}')"
 
   head_sha="$(
-    export GIT_AUTHOR_NAME=Marc GIT_AUTHOR_EMAIL=marc@kernel-oops.com
-    export GIT_COMMITTER_NAME=Marc GIT_COMMITTER_EMAIL=marc@kernel-oops.com
+    export GIT_AUTHOR_NAME=Marc GIT_AUTHOR_EMAIL=marc@kernel-panic.im
+    export GIT_COMMITTER_NAME=Marc GIT_COMMITTER_EMAIL=marc@kernel-panic.im
     printf 'chore: sync upstream release %s\n' "$tag" |
       git -C "$candidate_dir" commit-tree "$candidate_tree" -p "$base_sha"
   )"
