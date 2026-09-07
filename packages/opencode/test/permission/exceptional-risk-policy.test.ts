@@ -110,6 +110,21 @@ describe("exceptional-risk-only-v1 assessment", () => {
     expect(parseExceptionalRiskAssessment("x".repeat(2_049))).toEqual({ failure: "size" })
   })
 
+  test("distinguishes implicit task collaboration from consequential external effects", () => {
+    for (const text of [
+      "issue comments, issue updates or transitions, and analogous progress, test, or commit reporting",
+      "normally implicitly authorised by the requested work",
+      "Do not classify them as consequential_publication merely because they write to a service or are visible to collaborators",
+      "assess their concrete content, audience, and effects in context",
+      "not a blanket tool or service allowance",
+      "genuine public announcements, sensitive disclosure, substantial external commitments, and destructive operations still require scrutiny under the exceptional-harm rules",
+      "Respect explicit user limits",
+      "task-related wording or an issue-comment tool does not make those effects routine",
+    ]) {
+      expect(EXCEPTIONAL_RISK_INSTRUCTIONS).toContain(text)
+    }
+  })
+
   test("states the complete low-friction decision principles", () => {
     expect(EXCEPTIONAL_RISK_INSTRUCTIONS).toStartWith(
       "You are an isolated permission reviewer applying Marc's fixed exceptional-risk-only-v1 profile.",
