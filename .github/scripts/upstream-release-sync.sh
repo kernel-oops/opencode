@@ -63,6 +63,7 @@ readonly PATCH_BRANCHES=(
   "fix/bounded-provider-spend"
   "fix/external-grep-review"
   "fix/task-delegation-readiness"
+  "fix/external-bash-redaction"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -106,6 +107,7 @@ readonly PATCH_IDS=(
   "7713e86f7a6cc8f38ad2274b423d71eff6f63870"
   "c461096f54bc89b82b4cd1fce4670b0314ed42da"
   "363d5b683bbdf2a4733d445dfb53fad77ce5e5c2"
+  "a58e9caa313d2449d24732000466e5a9495edde1"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -149,6 +151,7 @@ readonly PATCH_TIPS=(
   "7e3c7f2465b1476c9da4f505c361f811b83313d3"
   "ecac5ed97dbd3f0d4534249fd105344b8b5b8523"
   "237881fa40c8e2d2a978d34eb6d19566d86ff48d"
+  "3f3061b3a771d5e6ff932f71108b4f87c2c6e8e7"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
