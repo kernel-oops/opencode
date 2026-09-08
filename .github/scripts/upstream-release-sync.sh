@@ -68,6 +68,7 @@ readonly PATCH_BRANCHES=(
   "collaboration-reporting"
   "delegated-correction"
   "security-development-policy"
+  "temporary-read-policy"
 )
 readonly PATCH_IDS=(
   "bfc7dc5221ddf03641a7859102b333454895dd73"
@@ -116,6 +117,7 @@ readonly PATCH_IDS=(
   "1b7d7e4486cca9c2d40b9c605a10114dbed9603c"
   "66b3c39c9ff1339a2083bfe94c61b2ece2582384"
   "46f8c709697c924178d2874170f0307f0c0a8a03"
+  "ed9a116697595214c23969621a1b889af3d3b1ff"
 )
 readonly PATCH_TIPS=(
   "11bf5729c6ac3b55ce4e5a3ba7f5a3ef890be8ac"
@@ -164,6 +166,7 @@ readonly PATCH_TIPS=(
   "e6686bb2e1f0792d948f98fc59191852a824e4b3"
   "4353e2065cfac65edb3ae9ab8214dff88e196392"
   "e6c3aae8bda6610db96f416a1a6a585903e24b3a"
+  "c3bc28d16e43ccc9aec9f27f5b7a16b59440d5fd"
 )
 readonly REVIEWED_TESTS=(
   "packages/core/test/config/config.test.ts"
