@@ -940,6 +940,7 @@ const layer = Layer.effect(
       childTurnID: string
     }) {
       const seen = new Set<string>()
+      const bindings: string[] = []
       let sessionID = SessionID.make(input.childSessionID)
       let turnID = MessageID.make(input.childTurnID)
       let expectedRootSessionID: string | undefined
@@ -1031,6 +1032,10 @@ const layer = Layer.effect(
         )
           return
 
+        const binding = exactActionBinding({ edge, input: taskInput })
+        if (!binding) return
+        bindings.push(binding)
+
         if (parent.parent_id === null) {
           if (parent.id !== edge.root_session_id || edge.parent_turn_id !== edge.root_turn_id) return
           const admission = parentTurnData.permissionReview?.admission
@@ -1042,6 +1047,7 @@ const layer = Layer.effect(
           return {
             rootSessionID: edge.root_session_id,
             rootTurnID: edge.root_turn_id,
+            binding: exactActionBinding(bindings),
             trusted: [
               ...admission.text.map((text) => ({ source: "human" as const, text, id: edge.root_turn_id })),
               ...answers,
@@ -1095,13 +1101,21 @@ const layer = Layer.effect(
       const persisted = yield* sessions
         .findMessage(input.sessionID, (message) => message.info.id === input.turnID)
         .pipe(Effect.catch(() => Effect.succeed(Option.none())))
+      const delegated = session?.parentID
+        ? yield* resolveDelegatedAuthority({ childSessionID: input.sessionID, childTurnID: input.turnID }).pipe(
+            Effect.catchCause(() => Effect.succeed(undefined)),
+          )
+        : undefined
+      // Verified descendants spend the root human turn's durable correction budget, never their own.
+      const correctionSessionID = delegated?.rootSessionID ?? input.sessionID
+      const correctionTurnID = delegated?.rootTurnID ?? input.turnID
       const marker = yield* db
         .select({ turnID: PermissionReviewCorrectionTable.turn_id })
         .from(PermissionReviewCorrectionTable)
         .where(
           and(
-            eq(PermissionReviewCorrectionTable.session_id, input.sessionID),
-            eq(PermissionReviewCorrectionTable.turn_id, MessageID.make(input.turnID)),
+            eq(PermissionReviewCorrectionTable.session_id, SessionID.make(correctionSessionID)),
+            eq(PermissionReviewCorrectionTable.turn_id, MessageID.make(correctionTurnID)),
           ),
         )
         .get()
@@ -1119,11 +1133,6 @@ const layer = Layer.effect(
         persisted.value.info.sessionID === input.sessionID &&
         validPermissionReviewAdmission(persisted.value.info.permissionReview?.admission) &&
         persisted.value.info.permissionReview.admission.complete
-      const delegated = session?.parentID
-        ? yield* resolveDelegatedAuthority({ childSessionID: input.sessionID, childTurnID: input.turnID }).pipe(
-            Effect.catchCause(() => Effect.succeed(undefined)),
-          )
-        : undefined
       const directAuthority = directPromptAdmission
         ? yield* resolveDirectAuthority(SessionID.make(input.sessionID), MessageID.make(input.turnID)).pipe(
             Effect.catchCause(() => Effect.succeed(undefined)),
@@ -1143,7 +1152,6 @@ const layer = Layer.effect(
           : previous?.turnID === input.turnID
             ? previous.rewrite
             : { status: "available" }
-      const previousTurn = current.turns.get(key)
       remember(current.turns, key, {
         trusted: trusted.items,
         untrusted: untrusted.items,
@@ -1152,12 +1160,7 @@ const layer = Layer.effect(
         turnID: input.turnID,
         directPromptAdmission,
         delegatedPromptAdmission: delegated !== undefined,
-        rewrite:
-          previousTurn?.turnID === input.turnID
-            ? previousTurn.rewrite
-            : directPromptAdmission
-              ? rewrite
-              : { status: "used" },
+        rewrite: authorityComplete ? rewrite : { status: "used" },
         trustedComplete: authorityComplete && trustedInputComplete && trusted.complete,
         untrustedComplete: untrustedInputComplete && untrusted.complete,
         // Untrusted evidence may be explicitly lossy after compaction or bounding. Keep that fact in
@@ -1195,7 +1198,12 @@ const layer = Layer.effect(
             review !== null && typeof review === "object" && !Array.isArray(review) && "admission" in review
               ? review.admission
               : undefined
-          if (!message || message.data.role !== "user" || !validPermissionReviewAdmission(admission))
+          if (
+            !message ||
+            message.data.role !== "user" ||
+            !validPermissionReviewAdmission(admission) ||
+            !admission.complete
+          )
             return "invalid" as const
 
           const existing = yield* tx
@@ -1566,6 +1574,7 @@ const layer = Layer.effect(
         untrustedComplete: false,
         contextSafeForGate: false,
       }
+      let delegationBinding: string | undefined
       if (turn.directPromptAdmission) {
         const direct = yield* resolveDirectAuthority(SessionID.make(info.sessionID), MessageID.make(turn.turnID)).pipe(
           Effect.catchCause(() => Effect.succeed(undefined)),
@@ -1578,6 +1587,7 @@ const layer = Layer.effect(
           childSessionID: info.sessionID,
           childTurnID: turn.turnID,
         }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        delegationBinding = delegated?.binding
         turn = delegated
           ? { ...turn, trusted: delegated.trusted, trustedComplete: true }
           : { ...turn, trusted: [], trustedComplete: false, contextSafeForGate: false }
@@ -1921,7 +1931,7 @@ const layer = Layer.effect(
         authorityRejection = code
         return false
       }
-      const revalidateAuthority = Effect.fn("Permission.revalidateAuthority")(function* () {
+      const revalidateAuthority = Effect.fn("Permission.revalidateAuthority")(function* (correction = false) {
         if (!activeTurnKey || current.activeTurns.get(info.sessionID) !== activeTurnKey)
           return rejectAuthority("authority_turn_changed")
         const active = current.turns.get(activeTurnKey)
@@ -1968,6 +1978,14 @@ const layer = Layer.effect(
               )
             : undefined
         if (!authority) return rejectAuthority("authority_missing")
+        // Task arguments are not human authority, but corrective feedback must target
+        // the same validated delegation (including every ancestor Task) that was reviewed.
+        if (
+          correction &&
+          active.delegatedPromptAdmission &&
+          (delegationBinding === undefined || !("binding" in authority) || authority.binding !== delegationBinding)
+        )
+          return rejectAuthority("authority_evidence_changed")
         if (
           authority.rootSessionID !== active.rootSessionID ||
           authority.rootTurnID !== active.rootTurnID ||
@@ -1979,8 +1997,8 @@ const layer = Layer.effect(
         if (!active.trustedComplete) return rejectAuthority("trusted_evidence_incomplete")
         return true
       })
-      const safelyRevalidateAuthority = () =>
-        revalidateAuthority().pipe(
+      const safelyRevalidateAuthority = (correction = false) =>
+        revalidateAuthority(correction).pipe(
           Effect.catchCause(() =>
             Effect.sync(() => {
               authorityRejection = "authority_revoked"
@@ -2177,8 +2195,7 @@ const layer = Layer.effect(
           reviewerConfig?.automatic_rewrite === "once-per-turn" &&
           (bashRiskCandidate || genericRiskCandidate) &&
           otherSourcesPermit &&
-          turn.rootSessionID === info.sessionID &&
-          turn.directPromptAdmission &&
+          (turn.directPromptAdmission || turn.delegatedPromptAdmission) &&
           turn.turnID.length > 0 &&
           turn.rewrite.status === "available"
         ) {
@@ -2265,9 +2282,15 @@ const layer = Layer.effect(
 
       if (result === "allow") return
       if (result === "rewrite" && correctionFeedback) {
+        const authorityUnchanged = yield* safelyRevalidateAuthority(true)
         const token = yield* Effect.sync(() => {
           const active = activeTurnKey ? current.turns.get(activeTurnKey) : undefined
-          if (active?.turnID !== turn.turnID || !active.directPromptAdmission || active.rewrite.status !== "available")
+          if (
+            !authorityUnchanged ||
+            active?.turnID !== turn.turnID ||
+            (!active.directPromptAdmission && !active.delegatedPromptAdmission) ||
+            active.rewrite.status !== "available"
+          )
             return undefined
           const token = ++rewriteClaim
           active.rewrite = { status: "claimed", token }
@@ -2296,7 +2319,7 @@ const layer = Layer.effect(
                   const active = activeTurnKey ? current.turns.get(activeTurnKey) : undefined
                   if (
                     active?.turnID !== turn.turnID ||
-                    !active.directPromptAdmission ||
+                    (!active.directPromptAdmission && !active.delegatedPromptAdmission) ||
                     active.rewrite.status !== "claimed" ||
                     active.rewrite.token !== token
                   )
@@ -2305,10 +2328,11 @@ const layer = Layer.effect(
                   return true
                 })
                 if (!claimed) return false
-                const persisted = yield* persistCorrection({ sessionID: info.sessionID, turnID: turn.turnID }).pipe(
-                  Effect.exit,
-                )
-                const authorityAfterPersist = yield* safelyRevalidateAuthority()
+                const persisted = yield* persistCorrection({
+                  sessionID: SessionID.make(turn.rootSessionID),
+                  turnID: turn.rootTurnID,
+                }).pipe(Effect.exit)
+                const authorityAfterPersist = yield* safelyRevalidateAuthority(true)
                 yield* Effect.sync(() => {
                   const active = activeTurnKey ? current.turns.get(activeTurnKey) : undefined
                   if (
@@ -2318,7 +2342,13 @@ const layer = Layer.effect(
                   )
                     active.rewrite = { status: "used" }
                 })
-                if (Exit.isFailure(persisted) || persisted.value !== "inserted" || !authorityAfterPersist) return false
+                if (
+                  Exit.isFailure(persisted) ||
+                  persisted.value !== "inserted" ||
+                  !authorityAfterPersist ||
+                  !finaliseAuthorityBindings()
+                )
+                  return false
                 return yield* new PermissionV1.PolicyCorrectionError({ feedback: correctionFeedback })
               }),
             )
