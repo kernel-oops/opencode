@@ -477,6 +477,17 @@ export function registeredReadonlyInvocation(action: PermissionReviewSnapshot["a
   return { identity: action.identity as "glob" | "grep" | "read", invocation }
 }
 
+// Reuse the registered descriptors, without weakening the existing scope-review contracts.
+export function registeredReadonlyPath(action: PermissionReviewSnapshot["action"], directory: string) {
+  const registered = registeredReadonlyInvocation(action)
+  if (registered)
+    return registered.identity === "read" ? registered.invocation.filePath : (registered.invocation.path ?? directory)
+  if (!record(action.arguments)) return
+  if (action.identity === "read" && projectTextFileArguments(action.arguments)) return action.arguments.filePath
+  if (action.identity === "grep" && projectLiteralGrepArguments(action.arguments))
+    return action.arguments.path ?? directory
+}
+
 function contains(root: string, target: string) {
   const relative = path.relative(root, target)
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))

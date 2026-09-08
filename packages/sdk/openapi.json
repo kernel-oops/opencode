@@ -21134,6 +21134,9 @@
             "type": "string",
             "enum": ["never", "policy-gated"]
           },
+          "temporary_read_allow": {
+            "type": "boolean"
+          },
           "automatic_rewrite": {
             "type": "string",
             "enum": ["never", "once-per-turn"]

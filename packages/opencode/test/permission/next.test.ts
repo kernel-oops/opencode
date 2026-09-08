@@ -1,9 +1,15 @@
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { LSP } from "../../src/lsp/lsp"
+import { Instruction } from "../../src/session/instruction"
+import { ReadTool } from "../../src/tool/read"
+import { GrepTool } from "../../src/tool/grep"
+import { GlobTool } from "../../src/tool/glob"
 import { ShellTool } from "../../src/tool/shell"
 import { WebFetchTool } from "../../src/tool/webfetch"
 import { WebSearchTool } from "../../src/tool/websearch"
 import type { Context as ToolContext } from "../../src/tool/tool"
+import planefolioTmpRules from "./fixtures/planefolio-tmp-rules.json"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
@@ -99,6 +105,8 @@ const env = AppNodeBuilder.build(
     Truncate.node,
     ToolRegistry.node,
     Ripgrep.node,
+    LSP.node,
+    Instruction.node,
     RuntimeFlags.node,
     SessionProjector.node,
     Database.node,
@@ -1171,6 +1179,7 @@ const withObviousReviewer = (
     policy?: "obvious-risk-only-v1" | "exceptional-risk-only-v1"
     automatic_allow?: "never" | "policy-gated"
     automatic_rewrite?: "never" | "once-per-turn"
+    temporary_read_allow?: boolean
     bashEvaluator?: "disabled"
     agents?: Record<string, { description: string; mode: "subagent" }>
   },
@@ -1197,6 +1206,7 @@ const withObviousReviewer = (
             policy: input.policy ?? "obvious-risk-only-v1",
             automatic_allow: input.automatic_allow ?? "never",
             automatic_rewrite: input.automatic_rewrite ?? "never",
+            temporary_read_allow: input.temporary_read_allow,
           },
           ...(input.bashEvaluator ? { bash_permission_evaluator: { mode: input.bashEvaluator } } : {}),
           ...(input.agents ? { agent: input.agents } : {}),
@@ -8353,3 +8363,160 @@ it.instance(
   }),
   30_000,
 )
+
+for (const identity of ["read", "grep", "glob"] as const) {
+  for (const scenario of [
+    "allow",
+    "directory-allow",
+    "directory-boundary-ask",
+    "descendant-deny",
+    "static-deny",
+    "plugin-deny",
+    "plugin-ask",
+    "escape",
+    "outside",
+    "credential-deny",
+    "spoof",
+    "mutation",
+  ] as const) {
+    it.instance(
+      `temporary read policy - actual ${identity} pipeline ${scenario}`,
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const sessions = yield* Session.Service
+          const permission = yield* Permission.Service
+          const sessionID = (yield* sessions.create({ title: "Temporary read pipeline" })).id
+          const turnID = yield* captureTrustedPersistedTurn({ sessionID, rootSessionID: sessionID })
+          const directory = yield* tmpdirScoped()
+          const filepath = path.join(directory, "focused-tests.log")
+          yield* Effect.promise(() => writeFile(filepath, "1) original\n5) ignored\n"))
+          const link = path.join(directory, "escape")
+          if (scenario === "escape") yield* Effect.promise(() => symlink("/etc", link))
+          const target =
+            scenario === "outside"
+              ? identity === "glob"
+                ? "/etc"
+                : "/etc/hosts"
+              : scenario === "escape"
+                ? identity === "glob"
+                  ? link
+                  : path.join(link, "hosts")
+                : identity === "glob" ||
+                    ["directory-allow", "directory-boundary-ask", "descendant-deny"].includes(scenario)
+                  ? directory
+                  : filepath
+          const args =
+            identity === "read"
+              ? { filePath: target }
+              : identity === "grep"
+                ? { pattern: "^[1-4]\\)", path: target }
+                : { pattern: "*.log", path: target }
+          reviewerLanguage = new MockLanguageModelV3({
+            doStream: async () => {
+              throw new Error("provider unavailable")
+            },
+          })
+          const stages: string[] = []
+          const ctx: ToolContext = {
+            sessionID,
+            messageID: turnID,
+            callID: "call_temporary_read",
+            agent: "build",
+            abort: new AbortController().signal,
+            messages: [],
+            metadata: () => Effect.void,
+            ask: (request) =>
+              Effect.gen(function* () {
+                stages.push(request.permission)
+                yield* permission.ask({
+                  ...request,
+                  sessionID,
+                  tool: { messageID: turnID, callID: "call_temporary_read" },
+                  ruleset: [
+                    ...(planefolioTmpRules as PermissionV1.Ruleset),
+                    ...(scenario === "static-deny"
+                      ? [{ permission: identity, pattern: "*", action: "deny" as const }]
+                      : scenario === "credential-deny"
+                        ? [{ permission: "read", pattern: target, action: "deny" as const }]
+                        : scenario === "descendant-deny"
+                          ? [{ permission: "read", pattern: `${target}/secret.env`, action: "deny" as const }]
+                          : scenario === "directory-boundary-ask"
+                            ? [{ permission: "external_directory", pattern: "/tmp/*", action: "ask" as const }]
+                            : []),
+                  ],
+                  review: {
+                    origin: "tool",
+                    action: resolveReviewAction({
+                      builtin: scenario !== "spoof",
+                      identity,
+                      permission: request.permission,
+                      permissionMetadata: request.metadata,
+                      arguments: args,
+                      requested: request.action,
+                      directory: test.directory,
+                    }),
+                  },
+                })
+                if (request.permission === identity) {
+                  yield* Effect.promise(async () => {
+                    // Real sibling churn during both Read and Grep's pinned-file lifecycle.
+                    await writeFile(path.join(directory, "sibling.txt"), "unrelated")
+                    await rm(path.join(directory, "sibling.txt"))
+                    if (scenario === "mutation") {
+                      if (identity === "glob") {
+                        await rename(directory, `${directory}-moved`)
+                        await mkdir(directory)
+                      } else await writeFile(filepath, "2) modified\n")
+                    }
+                  })
+                }
+              }).pipe(Effect.orDie),
+          }
+          const execution = Effect.gen(function* () {
+            if (identity === "read") return yield* (yield* (yield* ReadTool).init()).execute({ filePath: target }, ctx)
+            if (identity === "grep")
+              return yield* (yield* (yield* GrepTool).init()).execute({ pattern: "^[1-4]\\)", path: target }, ctx)
+            return yield* (yield* (yield* GlobTool).init()).execute({ pattern: "*.log", path: target }, ctx)
+          })
+          if (["escape", "outside", "spoof", "plugin-ask", "descendant-deny"].includes(scenario)) {
+            const pending = yield* execution.pipe(Effect.forkScoped)
+            expect(yield* waitForPending(1)).toHaveLength(1)
+            if (scenario === "plugin-ask") expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+            // Normal permissions may ask before invoking the provider (for example when
+            // reviewer input is unavailable). Pending + rejection is the safety invariant.
+            yield* rejectAll()
+            expect(Exit.isFailure(yield* Fiber.await(pending))).toBe(true)
+            expect(yield* list()).toHaveLength(0)
+            return
+          }
+          const result = yield* Effect.exit(execution).pipe(
+            Effect.ensuring(
+              scenario === "mutation" && identity === "glob"
+                ? Effect.promise(() => rm(`${directory}-moved`, { recursive: true, force: true }))
+                : Effect.void,
+            ),
+          )
+          if (scenario === "allow" || scenario === "directory-allow" || scenario === "directory-boundary-ask") {
+            expect(Exit.isSuccess(result)).toBe(true)
+            if (Exit.isSuccess(result))
+              expect(result.value.output).toContain(
+                identity === "glob" ||
+                  (identity === "read" && ["directory-allow", "directory-boundary-ask"].includes(scenario))
+                  ? "focused-tests.log"
+                  : "1) original",
+              )
+            expect(stages).toEqual(["external_directory", identity])
+          } else expect(Exit.isFailure(result)).toBe(true)
+          expect(reviewerLanguage.doStreamCalls).toHaveLength(0)
+          expect(yield* list()).toHaveLength(0)
+        }),
+      withObviousReviewer(
+        { mode: "enforce", temporary_read_allow: true },
+        ...(scenario === "plugin-deny" ? [permissionHook('    output.status = "deny"')] : []),
+        ...(scenario === "plugin-ask" ? [permissionHook('    output.status = "ask"')] : []),
+      ),
+      15_000,
+    )
+  }
+}

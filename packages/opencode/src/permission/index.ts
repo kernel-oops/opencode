@@ -31,6 +31,7 @@ import {
   type PermissionReviewInput,
   type PermissionReviewSnapshot,
 } from "@opencode-ai/plugin"
+import { temporaryReadAllows } from "./temporary-read"
 import { BashPermissionEvaluator } from "./bash-evaluator"
 import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
@@ -1654,6 +1655,20 @@ const layer = Layer.effect(
       const prepared = yield* plugin.preparePermissionAsk(hookInput)
       const permissionConfig = yield* config.get()
       const reviewerConfig = permissionConfig.permission_reviewer
+      const inspectTemporaryRead = () =>
+        Effect.promise(() =>
+          temporaryReadAllows({
+            enabled: reviewerConfig?.temporary_read_allow === true,
+            action: snapshot.action,
+            directory: permissionSession?.directory ?? instance.directory,
+            permission: info.permission,
+            ruleset,
+          }),
+        )
+      const temporaryReadDecision = yield* inspectTemporaryRead()
+      if (temporaryReadDecision === "deny") return yield* new PermissionV1.DeniedError({ ruleset })
+      const temporaryRead = temporaryReadDecision === "allow"
+
       const evaluatorConfig = permissionConfig.bash_permission_evaluator
       const started = yield* Clock.currentTimeMillis
       const deadline = started + 30_000
@@ -1851,6 +1866,7 @@ const layer = Layer.effect(
       const evaluatorDecision = evaluatorResult && "decision" in evaluatorResult ? evaluatorResult.decision : undefined
       const evaluatorPermitDecision = evaluator?.run?.isSettled() ? evaluatorDecision : undefined
       const needsReviewer =
+        !temporaryRead &&
         !readScopeGate &&
         (externalBashRequest ||
           (!evaluatorEnforcing && !evaluatorPermitOnly) ||
@@ -2047,6 +2063,7 @@ const layer = Layer.effect(
         if (!active.trustedComplete) return rejectAuthority("trusted_evidence_incomplete")
         return true
       }
+      const inspectedTemporaryRead = temporaryRead && (yield* inspectTemporaryRead()) === "allow"
       const finalAuthority = yield* inspectThenRevalidateAuthority(
         safelyRevalidateAuthority,
         () =>
@@ -2085,6 +2102,16 @@ const layer = Layer.effect(
       )
       // inspectThenRevalidateAuthority performs the persisted check and the final synchronous raw binding check as
       // its final operations. Do not add an await between this point and disposition or scope mutation.
+      const finalTemporaryRead =
+        inspectedTemporaryRead &&
+        exactActionBinding(source?.action) === sourceActionBinding &&
+        exactActionBinding({
+          permission: info.permission,
+          patterns: info.patterns,
+          metadata: info.metadata,
+          always: info.always,
+          tool: info.tool,
+        }) === rawRequestBinding
       const authorityStillCurrent = finalAuthority.authorityCurrent
       const inspectedExternalReadScopeRequest = finalAuthority.inspection?.externalReadScopeRequest
       const inspectedReadScopeGate = finalAuthority.inspection?.readScopeGate ?? false
@@ -2180,6 +2207,7 @@ const layer = Layer.effect(
         result = "deny"
       else if (pluginResult === "ask") result = "ask"
       else if (evaluatorEnforcing && !evaluatorPermits) result = "ask"
+      else if (finalTemporaryRead && otherSourcesPermit) result = "allow"
       else if (finalReadScopeGate && otherSourcesPermit) result = "allow"
       else if (builtinResult && "failure" in builtinResult) result = "ask"
       else if (riskPolicyAssessment) {
@@ -2280,6 +2308,16 @@ const layer = Layer.effect(
         })
       }
 
+      if (finalTemporaryRead) {
+        yield* Effect.logInfo("temporary read permission", {
+          permission: info.permission,
+          origin: review.origin,
+          auditCorrelationKey: correlation(info, review.origin),
+          rule: "registered-linux-tmp-read-v1",
+          effectsBound: false,
+          disposition: result,
+        })
+      }
       if (result === "allow") return
       if (result === "rewrite" && correctionFeedback) {
         const authorityUnchanged = yield* safelyRevalidateAuthority(true)

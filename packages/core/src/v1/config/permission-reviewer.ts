@@ -11,6 +11,10 @@ export const Info = Schema.Struct({
   automatic_allow: Schema.Literals(["never", "policy-gated"])
     .pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed("never" as const)))
     .annotate({ description: 'Local automatic-allow policy. Defaults to "never".' }),
+  temporary_read_allow: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Opt in to deterministic registered Read/Grep/Glob permission for canonical Linux /tmp targets. Static and plugin denies remain authoritative; no execution or edit permission is granted.",
+  }),
   automatic_rewrite: Schema.Literals(["never", "once-per-turn"])
     .pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed("never" as const)))
     .annotate({ description: 'Local automatic-rewrite policy. Defaults to "never".' }),
