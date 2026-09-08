@@ -63,11 +63,7 @@ export async function bindExternalTextFile(input: string): Promise<BoundExternal
     const mime = sniffAttachmentMime(sample, FSUtil.mimeType(target))
     if (isReadAttachmentMime(mime) || isBinaryFile(target, sample)) return undefined
     const contentDigest = await digestExactBytes(file, Number(fileGeneration.size))
-    if (
-      !sameGeneration(rootGeneration, await generation(root)) ||
-      !sameGeneration(fileGeneration, await generation(file))
-    )
-      return undefined
+    if (!sameGeneration(fileGeneration, await generation(file))) return undefined
     const result = {
       file,
       root,
@@ -78,6 +74,7 @@ export async function bindExternalTextFile(input: string): Promise<BoundExternal
       contentDigest,
       bindingId: opaqueBindingID(),
     }
+    if (!(await sameBoundPath(result))) return undefined
     transfer = true
     return result
   } catch {
@@ -87,16 +84,49 @@ export async function bindExternalTextFile(input: string): Promise<BoundExternal
   }
 }
 
+// Directory entry churn changes size/timestamps/link count, not directory identity. Verify the
+// live pathname and mounts instead; retain full generation and content checks for the file.
+async function sameBoundPath(input: BoundExternalTextFile) {
+  try {
+    if (
+      (await realpath(input.rootPath)) !== input.rootPath ||
+      (await realpath(input.path)) !== input.path ||
+      (await realpath(`/proc/self/fd/${input.root.fd}`)) !== input.rootPath
+    )
+      return false
+    const root = await open(input.rootPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    try {
+      const current = await generation(root)
+      if (
+        current.dev !== input.rootGeneration.dev ||
+        current.ino !== input.rootGeneration.ino ||
+        current.mountID !== input.rootGeneration.mountID
+      )
+        return false
+      const file = await open(
+        `/proc/self/fd/${root.fd}/${path.basename(input.path)}`,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      )
+      try {
+        return sameGeneration(input.fileGeneration, await generation(file))
+      } finally {
+        await file.close()
+      }
+    } finally {
+      await root.close()
+    }
+  } catch {
+    return false
+  }
+}
+
 export async function readBoundExternalTextFile(input: BoundExternalTextFile) {
-  if (
-    !sameGeneration(input.rootGeneration, await generation(input.root)) ||
-    !sameGeneration(input.fileGeneration, await generation(input.file))
-  )
+  if (!(await sameBoundPath(input)) || !sameGeneration(input.fileGeneration, await generation(input.file)))
     throw new Error("Pinned external text file changed")
   const result = await readExactBytes(input.file, Number(input.fileGeneration.size))
   if (
     result.digest !== input.contentDigest ||
-    !sameGeneration(input.rootGeneration, await generation(input.root)) ||
+    !(await sameBoundPath(input)) ||
     !sameGeneration(input.fileGeneration, await generation(input.file))
   )
     throw new Error("Pinned external text file changed")

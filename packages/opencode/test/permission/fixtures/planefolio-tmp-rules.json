@@ -1,0 +1,552 @@
+[
+  {
+    "permission": "*",
+    "pattern": "*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "*",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "*.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "*.env.*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "*.env.example",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/home/marc/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/home/marc/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/home/marc/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/*/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/home/marc/.cache/opencode/planefolio/implementation-queue-worktrees/*/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/*/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio-implementation-queue-worktrees/*/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio-implementation-queue-worktrees/*/deploy/private-alpha.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/*",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/**",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/*",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/**",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": "/tmp/planefolio-implementation-queue.log",
+    "action": "allow"
+  },
+  {
+    "permission": "read",
+    "pattern": ".env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "deploy/private-alpha.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/deploy/private-alpha.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/.env*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/env/cloudflare-audit.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/env/planefolio-cloudflare.env",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha/*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha/**",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha/*",
+    "action": "ask"
+  },
+  {
+    "permission": "read",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha/**",
+    "action": "ask"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/home/marc/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/home/marc/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/home/marc/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "*",
+    "action": "ask"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/docs/to-implement.md",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/docs/implementation-queue.json",
+    "action": "allow"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio",
+    "action": "deny"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio/*",
+    "action": "deny"
+  },
+  {
+    "permission": "edit",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio/**",
+    "action": "deny"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/",
+    "action": "deny"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc",
+    "action": "deny"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/mnt/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/mnt/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/mnt/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/Development/OpencodePersonal/private/xdg-data/opencode/tool-output/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/Development/OpencodePersonal",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/Development/OpencodePersonal/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/Development/OpencodePersonal/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/SyncFull",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/SyncFull/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/marc/SyncFull/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Marc/Notes",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Marc/Notes/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Marc/Notes/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Agent output",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Agent output/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/SyncFull/Agent output/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt",
+    "action": "deny"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/Development/planefolio/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/planefolio-automation/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio/implementation-queue-worktrees/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio-implementation-queue-worktrees",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio-implementation-queue-worktrees/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.cache/opencode/planefolio-implementation-queue-worktrees/**",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/tmp/planefolio-implementation-queue.log",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/tmp",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/tmp/*",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/env/cloudflare-audit.env",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/env/planefolio-cloudflare.env",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha/*",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/syncthing/Development/OpencodePersonal/private/planefolio/private-alpha/**",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha/*",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/mnt/crypt/home/opencode/.local/share/planefolio/private-alpha/**",
+    "action": "ask"
+  },
+  {
+    "permission": "*",
+    "pattern": "*",
+    "action": "ask"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/tmp",
+    "action": "allow"
+  },
+  {
+    "permission": "external_directory",
+    "pattern": "/tmp/*",
+    "action": "allow"
+  }
+]

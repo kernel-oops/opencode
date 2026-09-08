@@ -1889,6 +1889,7 @@ export type PermissionReviewerConfig = {
   model: string
   policy?: "conservative-v1" | "obvious-risk-only-v1" | "exceptional-risk-only-v1"
   automatic_allow?: "never" | "policy-gated"
+  temporary_read_allow?: boolean
   automatic_rewrite?: "never" | "once-per-turn"
 }
 

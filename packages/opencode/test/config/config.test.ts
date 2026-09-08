@@ -2463,3 +2463,18 @@ test("parseManagedPlist handles empty config", async () => {
   )
   expect(config.$schema).toBe("https://opencode.ai/config.json")
 })
+
+test("temporary read policy is an optional strict Boolean", () => {
+  const parse = (value: unknown) =>
+    ConfigParse.schema(
+      ConfigV1.Info,
+      {
+        permission_reviewer: { mode: "enforce", model: "test/unavailable", temporary_read_allow: value },
+      },
+      "test:temporary-read",
+    )
+  expect(parse(true).permission_reviewer?.temporary_read_allow).toBe(true)
+  expect(parse(false).permission_reviewer?.temporary_read_allow).toBe(false)
+  expect(() => parse("true")).toThrow()
+  expect(() => parse(["/tmp"])).toThrow()
+})
