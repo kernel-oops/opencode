@@ -1,4 +1,6 @@
 import { HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { ShellTool } from "../../src/tool/shell"
 import { WebFetchTool } from "../../src/tool/webfetch"
 import { WebSearchTool } from "../../src/tool/websearch"
 import type { Context as ToolContext } from "../../src/tool/tool"
@@ -83,6 +85,8 @@ const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap
 const env = AppNodeBuilder.build(
   LayerNode.group([
     Permission.node,
+    FSUtil.node,
+    Plugin.node,
     EventV2Bridge.node,
     CrossSpawnSpawner.node,
     InstanceStore.node,
@@ -231,7 +235,7 @@ const obviousReviewerOutput = (
   }),
 })
 
-function delayedObviousAllow() {
+function delayedObviousAllow(outcome: "allow" | "rewrite" = "allow") {
   let entered!: () => void
   let release!: () => void
   const started = new Promise<void>((resolve) => {
@@ -244,7 +248,9 @@ function delayedObviousAllow() {
     doStream: async () => {
       entered()
       await blocked
-      return obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+      return outcome === "allow"
+        ? obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+        : obviousReviewerOutput("rewrite", "credential_or_sensitive_data", "avoid_sensitive_data")
     },
   })
   return { started, release }
@@ -1004,32 +1010,35 @@ const createDelegationTable = Effect.fn("test.createDelegationTable")(function* 
 const seedDelegatedTurn = Effect.fn("test.seedDelegatedTurn")(function* (input: {
   directory: string
   rootSummary?: boolean
+  parent?: { root: { id: SessionID; directory: string }; rootTurnID: MessageID }
 }) {
   yield* createDelegationTable()
   const sessions = yield* Session.Service
   const permission = yield* Permission.Service
-  const root = yield* sessions.create({ title: "Delegated reviewer root" })
-  const rootTurnID = MessageID.ascending()
+  const root = input.parent?.root ?? (yield* sessions.create({ title: "Delegated reviewer root" }))
+  const rootTurnID = input.parent?.rootTurnID ?? MessageID.ascending()
   const admission = buildPermissionReviewAdmission([{ type: "text", text: "Inspect the flight log code read-only" }])
-  yield* sessions.updateMessage({
-    id: rootTurnID,
-    sessionID: root.id,
-    role: "user",
-    time: { created: Date.now() },
-    agent: "build",
-    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
-    permissionReview: { admission },
-    ...(input.rootSummary ? { summary: { diffs: [] } } : {}),
-  })
-  yield* permission.captureTurn({
-    sessionID: root.id,
-    rootSessionID: root.id,
-    turnID: rootTurnID,
-    trusted: [{ source: "human", text: admission.text[0]! }],
-    untrusted: [],
-    complete: true,
-    contextSafeForGate: true,
-  })
+  if (!input.parent) {
+    yield* sessions.updateMessage({
+      id: rootTurnID,
+      sessionID: root.id,
+      role: "user",
+      time: { created: Date.now() },
+      agent: "build",
+      model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+      permissionReview: { admission },
+      ...(input.rootSummary ? { summary: { diffs: [] } } : {}),
+    })
+    yield* permission.captureTurn({
+      sessionID: root.id,
+      rootSessionID: root.id,
+      turnID: rootTurnID,
+      trusted: [{ source: "human", text: admission.text[0]! }],
+      untrusted: [],
+      complete: true,
+      contextSafeForGate: true,
+    })
+  }
 
   const child = yield* sessions.create({ parentID: root.id, title: "Cat child", agent: "Cat" })
   const taskMessageID = MessageID.ascending()
@@ -4550,6 +4559,19 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
       })
+      expect(
+        yield* fail(
+          reviewerAsk(
+            genericExternalGrepRequest(
+              seeded.child.id,
+              seeded.childAssistantID,
+              seeded.child.directory,
+              childInput,
+              "file",
+            ),
+          ),
+        ),
+      ).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
       const rewrite = yield* reviewerAsk(
         genericExternalGrepRequest(
           seeded.child.id,
@@ -4850,6 +4872,11 @@ it.instance(
       reviewerLanguage = new MockLanguageModelV3({
         doStream: obviousReviewerOutput("rewrite", "scope_can_be_narrowed", "narrow_target"),
       })
+      expect(
+        yield* fail(
+          reviewerAsk(genericExternalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file")),
+        ),
+      ).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
       const rewrite = yield* reviewerAsk(
         genericExternalGrepRequest(child.id, childAssistantID, child.directory, childGrep, "file"),
       ).pipe(Effect.forkScoped)
@@ -7136,7 +7163,7 @@ it.instance(
 )
 
 it.instance(
-  "obvious-risk reviewer - child turn cannot rewrite",
+  "obvious-risk reviewer - unverified child turn cannot rewrite",
   () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
@@ -7750,13 +7777,16 @@ for (const outcome of ["allow", "rewrite", "human_review"] as const) {
               obviousReviewerOutput("human_review", "broad_unrecoverable_data_loss", "request_specific_authorisation"),
           })
         }
+        if (outcome === "rewrite") {
+          expect(yield* fail(reviewerAsk(primary))).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
+        }
         const pending = yield* reviewerAsk(primary).pipe(Effect.forkScoped)
         expect(yield* waitForPending(1)).toHaveLength(1)
         yield* rejectAll()
         expect(yield* fail(Fiber.join(pending))).toBeInstanceOf(PermissionV1.RejectedError)
         const logs = JSON.stringify(yield* TestConsole.logLines)
         expect(logs).not.toContain('"readScopeCode":"read_scope_minted"')
-        expect(logs).not.toContain('"dispositionAuthority":"automatic_rewrite"')
+        expect(logs.includes('"dispositionAuthority":"automatic_rewrite"')).toBe(outcome === "rewrite")
       }),
     withObviousReviewer({
       mode: "enforce",
@@ -7992,3 +8022,334 @@ for (const supplied of [false, true]) {
     15_000,
   )
 }
+
+for (const first of ["root", "child", "siblings"] as const) {
+  it.instance(
+    `delegated correction - ${first} claims one durable root budget including concurrent descendants`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const { db } = yield* Database.Service
+        const permission = yield* Permission.Service
+        const store = yield* InstanceStore.Service
+        const seeded = yield* seedDelegatedTurn({ directory: test.directory })
+        const sibling = yield* seedDelegatedTurn({ directory: test.directory, parent: seeded })
+        const requests = {
+          root: bashRequest(seeded.root.id, test.directory, true, seeded.taskMessageID),
+          child: bashRequest(seeded.child.id, test.directory, true, seeded.childAssistantID),
+          sibling: bashRequest(sibling.child.id, test.directory, true, sibling.childAssistantID),
+        }
+        let reviews = 0
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () => {
+            reviews++
+            return obviousReviewerOutput("rewrite", "credential_or_sensitive_data", "avoid_sensitive_data")
+          },
+        })
+        if (first === "siblings") {
+          const fibers = yield* Effect.all(
+            [requests.child, requests.sibling, requests.root].map((request) =>
+              reviewerAsk(request).pipe(Effect.forkScoped),
+            ),
+            { concurrency: "unbounded" },
+          )
+          expect(yield* waitForPending(2)).toHaveLength(2)
+          yield* rejectAll()
+          const exits = yield* Effect.all(fibers.map(Fiber.await))
+          const errors = exits.flatMap((exit) => (Exit.isFailure(exit) ? [Cause.squash(exit.cause)] : []))
+          expect(errors.filter((error) => error instanceof PermissionV1.PolicyCorrectionError)).toHaveLength(1)
+          expect(errors.filter((error) => error instanceof PermissionV1.RejectedError)).toHaveLength(2)
+        } else {
+          let executed = false
+          const error = yield* fail(
+            reviewerAsk(requests[first]).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  executed = true
+                }),
+              ),
+            ),
+          )
+          expect(executed).toBe(false)
+          expect(error).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
+          if (error instanceof PermissionV1.PolicyCorrectionError) {
+            expect(error.feedback === PermissionReviewer.obviousRiskRewriteFeedback("avoid_sensitive_data")).toBe(true)
+            expect(error.message).not.toContain("user rejected")
+          }
+          expect(yield* list()).toHaveLength(0)
+        }
+        const markers = yield* db
+          .select()
+          .from(PermissionReviewCorrectionTable)
+          .where(eq(PermissionReviewCorrectionTable.session_id, seeded.root.id))
+          .all()
+        expect(markers).toHaveLength(1)
+        expect(markers[0]?.turn_id).toBe(seeded.rootTurnID)
+        expect(
+          yield* db
+            .select()
+            .from(PermissionReviewCorrectionTable)
+            .where(eq(PermissionReviewCorrectionTable.session_id, seeded.child.id))
+            .all(),
+        ).toHaveLength(0)
+
+        // A replacement is independently assessed, not allowed by the correction or its spent budget.
+        const before = reviews
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () => {
+            reviews++
+            return obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+          },
+        })
+        yield* reviewerAsk(requests.child)
+        expect(reviews).toBe(before + 1)
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () =>
+            obviousReviewerOutput("rewrite", "credential_or_sensitive_data", "avoid_sensitive_data"),
+        })
+        yield* store.reload({ directory: test.directory })
+        yield* store.provide(
+          { directory: test.directory },
+          Effect.gen(function* () {
+            for (const item of [seeded, sibling]) {
+              yield* permission.captureTurn({
+                sessionID: item.child.id,
+                rootSessionID: item.root.id,
+                turnID: item.childTurnID,
+                trusted: [],
+                untrusted: [],
+                complete: true,
+                contextSafeForGate: true,
+              })
+            }
+            yield* recapturePersistedTurn({
+              sessionID: seeded.root.id,
+              rootSessionID: seeded.root.id,
+              turnID: seeded.rootTurnID,
+            })
+            const fibers = yield* Effect.all(
+              Object.values(requests).map((request) => reviewerAsk(request).pipe(Effect.forkScoped)),
+            )
+            expect(yield* waitForPending(3)).toHaveLength(3)
+            yield* rejectAll()
+            for (const fiber of fibers)
+              expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+          }),
+        )
+      }),
+    withObviousReviewer({ mode: "enforce", automatic_allow: "policy-gated", automatic_rewrite: "once-per-turn" }),
+    30_000,
+  )
+}
+
+for (const change of ["edge", "task_args", "root_admission", "child_turn", "action"] as const) {
+  it.instance(
+    `delegated correction - changed ${change} while review runs fails to human`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const sessions = yield* Session.Service
+        const permission = yield* Permission.Service
+        const { db } = yield* Database.Service
+        const seeded = yield* seedDelegatedTurn({ directory: test.directory })
+        const request = bashRequest(seeded.child.id, test.directory, true, seeded.childAssistantID)
+        const delayed = delayedObviousAllow("rewrite")
+        const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+        yield* Effect.promise(() => delayed.started)
+        if (change === "edge") {
+          yield* db
+            .delete(PermissionReviewDelegationTable)
+            .where(eq(PermissionReviewDelegationTable.child_turn_id, seeded.childTurnID))
+            .run()
+        }
+        if (change === "task_args") {
+          const part = yield* sessions.getPart({
+            sessionID: seeded.root.id,
+            messageID: seeded.taskMessageID,
+            partID: seeded.taskPartID,
+          })
+          if (!part || part.type !== "tool") throw new Error("expected Task part")
+          yield* sessions.updatePart({
+            ...part,
+            state: { ...part.state, input: { ...part.state.input, prompt: "Changed task" } },
+          })
+        }
+        if (change === "root_admission") {
+          yield* sessions.updateMessage({
+            id: seeded.rootTurnID,
+            sessionID: seeded.root.id,
+            role: "user",
+            time: { created: Date.now() },
+            agent: "build",
+            model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+            permissionReview: {
+              admission: buildPermissionReviewAdmission([{ type: "text", text: "Changed root request" }]),
+            },
+          })
+        }
+        if (change === "child_turn") {
+          yield* permission.captureTurn({
+            sessionID: seeded.child.id,
+            rootSessionID: seeded.root.id,
+            turnID: MessageID.ascending(),
+            trusted: [],
+            untrusted: [],
+            complete: true,
+            contextSafeForGate: true,
+          })
+        }
+        if (change === "action") request.patterns.push("changed command")
+        delayed.release()
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+        expect(
+          yield* db
+            .select()
+            .from(PermissionReviewCorrectionTable)
+            .where(eq(PermissionReviewCorrectionTable.session_id, seeded.root.id))
+            .all(),
+        ).toHaveLength(0)
+      }),
+    withObviousReviewer({ mode: "enforce", automatic_rewrite: "once-per-turn" }),
+    30_000,
+  )
+}
+
+for (const failure of ["persistence", "revocation_after_claim", "cancellation_before_claim"] as const) {
+  it.instance(
+    `delegated correction - ${failure} never executes or releases a durable claim`,
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const { db } = yield* Database.Service
+        const seeded = yield* seedDelegatedTurn({ directory: test.directory })
+        const request = bashRequest(seeded.child.id, test.directory, true, seeded.childAssistantID)
+        reviewerLanguage = new MockLanguageModelV3({
+          doStream: async () =>
+            obviousReviewerOutput("rewrite", "credential_or_sensitive_data", "avoid_sensitive_data"),
+        })
+        if (failure === "cancellation_before_claim") {
+          let interrupted = false
+          const logger = Logger.layer([
+            Logger.make((options) => {
+              if (
+                interrupted ||
+                !JSON.stringify(options.message).includes('"dispositionAuthority":"automatic_rewrite"')
+              )
+                return
+              interrupted = true
+              options.fiber.interruptUnsafe()
+            }),
+          ])
+          const fiber = yield* reviewerAsk(request).pipe(Effect.provide(logger), Effect.forkScoped)
+          const exit = yield* Fiber.await(fiber)
+          expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+          expect(interrupted).toBe(true)
+          expect(yield* fail(reviewerAsk(request))).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
+        } else {
+          const trigger = `correction_${seeded.root.id.replaceAll(/[^a-zA-Z0-9_]/g, "_")}`
+          const action =
+            failure === "persistence"
+              ? "SELECT RAISE(ABORT, 'test claim failure');"
+              : `DELETE FROM permission_review_delegation WHERE child_turn_id = '${seeded.childTurnID}';`
+          yield* db.run(
+            `CREATE TRIGGER ${trigger} ${failure === "persistence" ? "BEFORE" : "AFTER"} INSERT ON permission_review_correction WHEN NEW.session_id = '${seeded.root.id}' BEGIN ${action} END`,
+          )
+          yield* Effect.addFinalizer(() => db.run(`DROP TRIGGER IF EXISTS ${trigger}`).pipe(Effect.orDie))
+          const fiber = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+          expect(yield* waitForPending(1)).toHaveLength(1)
+          yield* rejectAll()
+          expect(yield* fail(Fiber.join(fiber))).toBeInstanceOf(PermissionV1.RejectedError)
+        }
+        const markers = yield* db
+          .select()
+          .from(PermissionReviewCorrectionTable)
+          .where(eq(PermissionReviewCorrectionTable.session_id, seeded.root.id))
+          .all()
+        expect(markers).toHaveLength(failure === "persistence" ? 0 : 1)
+        const retry = yield* reviewerAsk(request).pipe(Effect.forkScoped)
+        expect(yield* waitForPending(1)).toHaveLength(1)
+        yield* rejectAll()
+        expect(yield* fail(Fiber.join(retry))).toBeInstanceOf(PermissionV1.RejectedError)
+      }),
+    withObviousReviewer({ mode: "enforce", automatic_rewrite: "once-per-turn" }),
+    30_000,
+  )
+}
+
+it.instance(
+  "delegated correction - raw LOCK_DSN Bash is not executed and redacted replacement gets a fresh review",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const seeded = yield* seedDelegatedTurn({ directory: test.directory })
+      const permission = yield* Permission.Service
+      const info = yield* ShellTool
+      const bash = yield* info.init()
+      const original = path.join(test.directory, "original-executed")
+      const context: ToolContext = {
+        sessionID: seeded.child.id,
+        messageID: seeded.childAssistantID,
+        callID: "call_lock_dsn_diagnostics",
+        agent: "Cat",
+        abort: AbortSignal.any([]),
+        messages: [],
+        metadata: () => Effect.void,
+        ask: (input) =>
+          permission
+            .ask({
+              ...input,
+              sessionID: seeded.child.id,
+              tool: { messageID: seeded.childAssistantID, callID: "call_lock_dsn_diagnostics" },
+              ruleset: [],
+              review: { origin: "tool", action: input.action },
+            })
+            .pipe(Effect.orDie),
+      }
+      let reviews = 0
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          reviews++
+          return obviousReviewerOutput("rewrite", "credential_or_sensitive_data", "avoid_sensitive_data")
+        },
+      })
+      const error = yield* fail(
+        bash.execute(
+          {
+            command: `printf '%s\\n' "$LOCK_DSN"; touch '${original}'`,
+            workdir: test.directory,
+          },
+          context,
+        ),
+      )
+      expect(error).toBeInstanceOf(PermissionV1.PolicyCorrectionError)
+      expect(yield* Effect.promise(() => Bun.file(original).exists())).toBe(false)
+      expect(yield* list()).toHaveLength(0)
+      const before = reviews
+      reviewerLanguage = new MockLanguageModelV3({
+        doStream: async () => {
+          reviews++
+          return obviousReviewerOutput("allow", "routine_or_low_impact", "none")
+        },
+      })
+      const replacement = yield* bash.execute(
+        {
+          command: "printf 'LOCK_DSN=[redacted]\\n'",
+          workdir: test.directory,
+        },
+        context,
+      )
+      expect(replacement.output).toContain("LOCK_DSN=[redacted]")
+      expect(reviews).toBe(before + 1)
+      expect(yield* Effect.promise(() => Bun.file(original).exists())).toBe(false)
+    }),
+  withObviousReviewer({
+    mode: "enforce",
+    policy: "exceptional-risk-only-v1",
+    automatic_allow: "policy-gated",
+    automatic_rewrite: "once-per-turn",
+    bashEvaluator: "disabled",
+  }),
+  30_000,
+)

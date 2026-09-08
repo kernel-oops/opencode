@@ -1967,3 +1967,57 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
     { config: cfg },
   ),
 )
+
+it.live(
+  "session.processor delivers policy correction as a child tool error and continues without human impersonation",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const root = yield* session.create({})
+          const child = yield* session.create({ parentID: root.id })
+          const parent = yield* user(child.id, "Inspect diagnostics")
+          const msg = yield* assistant(child.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: child.id, model: mdl })
+          const correction = new PermissionV1.PolicyCorrectionError({
+            feedback: "Avoid exposing credentials or sensitive data.",
+          })
+          yield* llm.tool("diagnostics", {})
+          const input = {
+            user: parent,
+            sessionID: child.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user" as const, content: "Inspect diagnostics" }],
+            tools: {
+              diagnostics: tool({
+                inputSchema: z.object({}),
+                execute: async (): Promise<string> => {
+                  throw correction
+                },
+              }),
+            },
+          }
+          expect(yield* handle.process(input)).toBe("continue")
+          const parts = yield* MessageV2.parts(msg.id)
+          const failed = parts.find((part) => part.type === "tool")
+          expect(failed?.type === "tool" && failed.state.status === "error" && failed.state.error).toBe(
+            correction.message,
+          )
+          const messages = yield* MessageV2.toModelMessagesEffect([{ info: handle.message, parts }], mdl)
+          expect(JSON.stringify(messages)).toContain(correction.message)
+          expect(JSON.stringify(messages)).not.toContain("user rejected")
+          yield* llm.text("I will use redacted diagnostics instead.")
+          const next = yield* assistant(child.id, parent.id, path.resolve(dir))
+          const continuation = yield* processors.create({ assistantMessage: next, sessionID: child.id, model: mdl })
+          expect(yield* continuation.process({ ...input, messages: [...input.messages, ...messages] })).toBe("continue")
+          const calls = yield* llm.inputs
+          expect(calls).toHaveLength(2)
+          expect(JSON.stringify(calls[1])).toContain(correction.message)
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+)
