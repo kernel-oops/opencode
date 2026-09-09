@@ -6,7 +6,7 @@ import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { Cause, Clock, Deferred, Effect, Layer, Context, Exit, Option, Schema, Scope } from "effect"
 import { createHmac, randomBytes, randomUUID } from "crypto"
 import { realpath, stat } from "node:fs/promises"
-import { and, eq } from "drizzle-orm"
+import { and, eq, lt, or, desc, gte, sql } from "drizzle-orm"
 import os from "os"
 import path from "node:path"
 import { types } from "node:util"
@@ -36,7 +36,12 @@ import { BashPermissionEvaluator } from "./bash-evaluator"
 import { safeReviewValue } from "./review"
 import { PermissionReviewer } from "./reviewer"
 import { InstanceRef } from "@/effect/instance-ref"
-import { buildPermissionReviewSnapshot, validPermissionReviewAdmission, type EvidenceInput } from "./reviewer-input"
+import {
+  buildPermissionReviewSnapshot,
+  permissionReviewStringProjection,
+  validPermissionReviewAdmission,
+  type EvidenceInput,
+} from "./reviewer-input"
 import { auditCorrelationKey } from "./audit-correlation"
 import { exactSearchIncludeTarget } from "@/util/exact-search-include"
 import { trustedCanonicalAlias } from "@/util/trusted-path-alias"
@@ -187,6 +192,10 @@ interface State {
 const MAX_EVIDENCE_ITEMS = 64
 const MAX_EVIDENCE_BYTES = 8 * 1024
 const MAX_TRUSTED_EVIDENCE_BYTES = 40 * 1024
+// A suffix of whole admissions, not a search for old grants. Leave headroom for snapshot envelopes.
+const MAX_HUMAN_CONTEXT_MESSAGES = 64
+const MAX_HUMAN_CONTEXT_QUESTIONS = 64
+const MAX_HUMAN_CONTEXT_BYTES = 32 * 1024
 const MAX_EVIDENCE_SESSIONS = 64
 const MAX_READ_SCOPE_ROOTS = 8
 const MAX_BASH_SCOPE_ROOTS = 32
@@ -416,34 +425,178 @@ const layer = Layer.effect(
       }
     }
 
+    const questionAnswers = (messages: readonly SessionV1.WithParts[], turnID: MessageID) => {
+      const groups: { end: number; evidence: EvidenceInput[] }[] = []
+      let chronological = true
+      let complete = true
+      for (const message of messages) {
+        if (message.info.role !== "assistant" || message.info.parentID !== turnID) continue
+        for (const part of message.parts) {
+          if (part.type !== "tool" || part.tool !== "question") continue
+          // Historical context cannot jump over a question whose answer may contain a restriction.
+          if (
+            part.state.status !== "completed" ||
+            builtinToolProvenance(part) !== "question" ||
+            !verifyQuestionCompletion(part) ||
+            !plainRecord(part.state.input) ||
+            !plainRecord(part.state.metadata) ||
+            !Schema.is(QuestionParameters)(part.state.input)
+          ) {
+            complete = false
+            continue
+          }
+          const questions = part.state.input.questions
+          const answers = part.state.metadata.answers
+          if (!Array.isArray(answers) || questions.length !== answers.length || questions.length > 16) {
+            complete = false
+            continue
+          }
+          const evidence: EvidenceInput[] = []
+          for (const [index, question] of questions.entries()) {
+            const answer = answers[index]
+            if (!Schema.is(QuestionAnswer)(answer)) {
+              complete = false
+              continue
+            }
+            const text = `Question: ${question.question}\nUser answer: ${answer.length ? answer.join(", ") : "Unanswered"}`
+            if (Buffer.byteLength(text, "utf8") > MAX_EVIDENCE_BYTES) {
+              complete = false
+              continue
+            }
+            evidence.push({ source: "human", text, id: `${message.info.id}:${part.id}:${index}` })
+          }
+          if (!Number.isFinite(part.state.time.end)) chronological = false
+          groups.push({ end: part.state.time.end, evidence })
+        }
+      }
+      // Creation/part order is not answer order: concurrently opened questions can finish in reverse.
+      // Keep each questionnaire intact. Equal completion times do not establish which answer overrides.
+      groups.sort((left, right) => left.end - right.end)
+      if (groups.some((group, index) => index > 0 && group.end === groups[index - 1].end)) chronological = false
+      return { evidence: groups.flatMap((group) => group.evidence), complete, chronological }
+    }
+
     const questionAnswerEvidence = Effect.fn("Permission.questionAnswerEvidence")(function* (
       sessionID: SessionID,
       turnID: MessageID,
     ) {
-      const messages = yield* sessions.messages({ sessionID })
-      const evidence: EvidenceInput[] = []
-      for (const message of messages) {
-        if (message.info.role !== "assistant" || message.info.parentID !== turnID) continue
+      const answers = questionAnswers(yield* sessions.messages({ sessionID }), turnID)
+      if (!answers.chronological) return yield* Effect.fail(new Error("Current question completion order is ambiguous"))
+      return answers.evidence
+    })
+
+    const humanContext = Effect.fn("Permission.humanContext")(function* (
+      sessionID: SessionID,
+      turnID: MessageID,
+      current: EvidenceInput[],
+    ) {
+      const bound = yield* db
+        .select()
+        .from(MessageTable)
+        .where(and(eq(MessageTable.session_id, sessionID), eq(MessageTable.id, turnID)))
+        .get()
+      const boundData = bound?.data as SessionV1.Info | undefined
+      const boundAdmission = boundData?.role === "user" ? boundData.permissionReview?.admission : undefined
+      if (
+        !bound ||
+        !validPermissionReviewAdmission(boundAdmission) ||
+        !boundAdmission.complete ||
+        JSON.stringify(boundAdmission.text) !==
+          JSON.stringify(current.filter((item) => item.id === turnID).map((item) => item.text))
+      )
+        return yield* Effect.fail(new Error("Current human admission changed during context lookup"))
+      const earlier = or(
+        lt(MessageTable.time_created, bound.time_created),
+        and(eq(MessageTable.time_created, bound.time_created), lt(MessageTable.id, turnID)),
+      )
+      // Query human-role rows, not a transcript page: long assistant/tool stretches must not evict
+      // the original task. Missing/internal admissions remain in this window as conservative barriers.
+      const history = yield* db
+        .select()
+        .from(MessageTable)
+        .where(
+          and(
+            eq(MessageTable.session_id, sessionID),
+            earlier,
+            sql`json_extract(${MessageTable.data}, '$.role') = 'user'`,
+          ),
+        )
+        .orderBy(desc(MessageTable.time_created), desc(MessageTable.id))
+        .limit(MAX_HUMAN_CONTEXT_MESSAGES)
+        .all()
+      if (!history.length) return current
+      const questions = yield* db
+        .select({ message: MessageTable, part: PartTable })
+        .from(MessageTable)
+        .innerJoin(PartTable, and(eq(PartTable.message_id, MessageTable.id), eq(PartTable.session_id, sessionID)))
+        .where(
+          and(
+            eq(MessageTable.session_id, sessionID),
+            earlier,
+            sql`json_extract(${MessageTable.data}, '$.role') = 'assistant'`,
+            // A question opened before this window can complete inside it and revoke a newer grant.
+            // Do not filter by parentID: unknown/outside-window parents must fail conservatively too.
+            or(
+              gte(MessageTable.time_created, history.at(-1)!.time_created),
+              sql`json_extract(${PartTable.data}, '$.state.time.end') >= ${history.at(-1)!.time_created}`,
+              sql`json_extract(${PartTable.data}, '$.state.time.end') IS NULL`,
+            ),
+            sql`json_extract(${PartTable.data}, '$.type') = 'tool'`,
+            sql`json_extract(${PartTable.data}, '$.tool') = 'question'`,
+          ),
+        )
+        .orderBy(MessageTable.time_created, MessageTable.id, PartTable.id)
+        .limit(MAX_HUMAN_CONTEXT_QUESTIONS + 1)
+        .all()
+      // Do not retain an old grant if a bounded-out question might restrict it.
+      if (questions.length > MAX_HUMAN_CONTEXT_QUESTIONS) return current
+      const answered: SessionV1.WithParts[] = questions.map(({ message, part }) => ({
+        info: { ...message.data, id: message.id, sessionID } as SessionV1.Info,
+        parts: [{ ...part.data, id: part.id, messageID: message.id, sessionID } as SessionV1.Part],
+      }))
+      // Preflight the entire bounded question window BEFORE selecting a suffix. A late answer
+      // attached to an older turn can revoke a newer grant already collected by the reverse loop.
+      // Admission/size cutoffs cannot safely hide it, so any chronology gap discards ALL history.
+      for (const message of answered) {
+        if (message.info.role !== "assistant") return current
+        const parentID = message.info.parentID
+        const parent = history.findIndex((turn) => turn.id === parentID)
+        if (parent < 0) return current
+        const before = parent === 0 ? bound.time_created : history[parent - 1].time_created
         for (const part of message.parts) {
-          if (part.type !== "tool" || part.tool !== "question" || part.state.status !== "completed") continue
-          if (builtinToolProvenance(part) !== "question") continue
-          if (!verifyQuestionCompletion(part)) continue
-          if (!plainRecord(part.state.input) || !plainRecord(part.state.metadata)) continue
-          if (!Schema.is(QuestionParameters)(part.state.input)) continue
-          const questions = part.state.input.questions
-          const answers = part.state.metadata.answers
-          if (!Array.isArray(questions) || !Array.isArray(answers) || questions.length !== answers.length) continue
-          if (questions.length > 16) continue
-          for (const [index, question] of questions.entries()) {
-            const answer = answers[index]
-            if (!Schema.is(QuestionAnswer)(answer)) continue
-            const text = `Question: ${question.question}\nUser answer: ${answer.length ? answer.join(", ") : "Unanswered"}`
-            if (Buffer.byteLength(text, "utf8") > MAX_EVIDENCE_BYTES) continue
-            evidence.push({ source: "human", text })
-          }
+          if (part.type !== "tool" || part.state.status !== "completed") return current
+          if (!Number.isFinite(part.state.time.end) || part.state.time.end > before) return current
         }
       }
-      return evidence
+      let trusted = current
+      // A bounded chronological suffix with no holes: if any intervening admission/answer cannot
+      // be represented fully, discard it AND everything older. The current authority is unchanged.
+      // Copied fork history is intentionally eligible; never follow a source or sibling session.
+      for (const message of history) {
+        const data = message.data as SessionV1.Info
+        if (data.role !== "user") break
+        const admission = data.permissionReview?.admission
+        if (!validPermissionReviewAdmission(admission) || !admission.complete) break
+        const answers = questionAnswers(answered, message.id)
+        if (!answers.chronological) return current
+        if (!answers.complete) break
+        const candidate = [
+          ...admission.text.map((text) => ({ source: "human" as const, text, id: message.id })),
+          ...answers.evidence,
+          ...trusted,
+        ]
+        if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > MAX_HUMAN_CONTEXT_BYTES) break
+        // Redaction can expand short secrets. Bound the actual projection too, so the snapshot's
+        // own first/last fallback cannot remove an intervening restriction from retained history.
+        const projected = candidate.map((item) => ({
+          source: item.source,
+          trusted: true,
+          text: permissionReviewStringProjection(item.text).text,
+        }))
+        if (Buffer.byteLength(JSON.stringify(projected), "utf8") > MAX_HUMAN_CONTEXT_BYTES) break
+        trusted = candidate
+      }
+      return trusted
     })
 
     const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => {
@@ -1049,10 +1202,10 @@ const layer = Layer.effect(
             rootSessionID: edge.root_session_id,
             rootTurnID: edge.root_turn_id,
             binding: exactActionBinding(bindings),
-            trusted: [
+            trusted: yield* humanContext(SessionID.make(edge.root_session_id), MessageID.make(edge.root_turn_id), [
               ...admission.text.map((text) => ({ source: "human" as const, text, id: edge.root_turn_id })),
               ...answers,
-            ],
+            ]),
           }
         }
         sessionID = parent.id
@@ -1074,13 +1227,19 @@ const layer = Layer.effect(
       return {
         rootSessionID: sessionID,
         rootTurnID: turnID,
-        trusted: [...admission.text.map((text) => ({ source: "human" as const, text, id: turnID })), ...answers],
+        trusted: yield* humanContext(sessionID, turnID, [
+          ...admission.text.map((text) => ({ source: "human" as const, text, id: turnID })),
+          ...answers,
+        ]),
       }
     })
 
     const sameEvidence = (left: readonly EvidenceInput[], right: readonly EvidenceInput[]) =>
       left.length === right.length &&
-      left.every((item, index) => item.source === right[index]?.source && item.text === right[index]?.text)
+      left.every(
+        (item, index) =>
+          item.source === right[index]?.source && item.text === right[index]?.text && item.id === right[index]?.id,
+      )
 
     const sameReviewTurn = (left: TurnState, right: TurnState) =>
       left.rootSessionID === right.rootSessionID &&
