@@ -22,6 +22,8 @@ type Failure = "input" | "lossy" | "serialization" | "size"
 type Serialised = { data: string } | { failure: Failure }
 
 export type EvidenceInput = {
+  // Internal identity for exact revalidation; never sent to the reviewer as human text.
+  id?: string
   source: PermissionReviewEvidenceSource
   text: string
 }
