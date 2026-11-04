@@ -15,7 +15,6 @@ import { Locale } from "../../util/locale"
 import { use } from "./render-context"
 import { generateThinkingSyntax } from "./thinking-syntax"
 import { canonicalToolName } from "../../util/tool-display"
-import { hideKcpContext } from "./kcp-display"
 
 export const INLINE_TOOL_ICON_WIDTH = 2
 
@@ -57,7 +56,7 @@ export function ReasoningPart(props: {
   // layout never shifts. Click to open the full markdown block, click to close.
   const [expanded, setExpanded] = createSignal(false)
 
-  const content = createMemo(() => hideKcpContext(reasoningContent(props.part), props.message.time.completed === undefined))
+  const content = createMemo(() => reasoningContent(props.part))
   const isDone = createMemo(
     () => props.part.time?.completed !== undefined || props.message.time.completed !== undefined,
   )
@@ -181,13 +180,13 @@ export function TextPart(props: {
   const { currentSyntax: syntax } = useThemes()
   const plugins = usePlugin()
   return (
-    <Show when={hideKcpContext(props.part.text, props.message.time.completed === undefined).trim()}>
+    <Show when={props.part.text.trim()}>
       <box paddingLeft={3} flexShrink={0}>
         {/* Configure custom nodes before parsing; apply content before streaming so completion keeps the final tokens. */}
         <markdown
           syntaxStyle={syntax()}
           renderNode={plugins.markdown()}
-          content={hideKcpContext(props.part.text, props.message.time.completed === undefined).trim()}
+          content={props.part.text.trim()}
           streaming={props.message.time.completed === undefined}
           internalBlockMode="top-level"
           tableOptions={{ style: "grid", cellPaddingX: 1 }}
