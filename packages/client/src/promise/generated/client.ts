@@ -2167,7 +2167,7 @@ export function make(options: ClientOptions) {
           {
             method: "POST",
             path: `/api/session/${encodeURIComponent(input.sessionID)}/permission/${encodeURIComponent(input.requestID)}/reply`,
-            body: { decision: input["decision"], message: input["message"] },
+            body: { decision: input["decision"], message: input["message"], experimental: input["experimental"] },
             successStatus: 204,
             declaredStatuses: [400, 401, 404],
             empty: true,

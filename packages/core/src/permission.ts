@@ -39,6 +39,8 @@ export interface ReplyInput {
   readonly requestID: ID
   readonly reply: Reply
   readonly message?: string
+  /** Limit a rejection to this request; omitted preserves session-wide batch rejection. */
+  readonly experimental?: { readonly scope?: "request" }
 }
 
 export interface AskResult {
@@ -312,6 +314,7 @@ const layer = Layer.effect(
               input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
             )
             pending.delete(input.requestID)
+            if (input.experimental?.scope === "request") return
             for (const [id, item] of pending) {
               if (item.request.sessionID !== existing.request.sessionID) continue
               yield* bus.publish(Permission.Event.Replied, {

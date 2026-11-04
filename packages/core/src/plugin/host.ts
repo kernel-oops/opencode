@@ -492,7 +492,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
           .pipe(
             Effect.flatMap((request) =>
               request?.sessionID === input.sessionID
-                ? permission.reply({ requestID: input.requestID, reply: input.decision, message: input.message })
+                ? permission.reply({ requestID: input.requestID, reply: input.decision, message: input.message, experimental: input.experimental })
                 : Effect.fail(new Error(`Permission request not found: ${input.requestID}`)),
             ),
           ),

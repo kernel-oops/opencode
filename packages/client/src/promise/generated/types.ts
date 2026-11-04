@@ -2491,6 +2491,7 @@ export type ConfigEntry =
                       output: MoneyUSDPerMillionTokens
                       cache?: { read?: MoneyUSDPerMillionTokens; write?: MoneyUSDPerMillionTokens }
                     }>
+                status?: "deprecated"
                 disabled?: boolean
                 limit?: { context?: number; input?: number; output?: number }
               }
@@ -4214,6 +4215,7 @@ export type PermissionReplyInput = {
   readonly requestID: string
   readonly decision: "once" | "always" | "reject"
   readonly message?: string | undefined
+  readonly experimental?: { readonly scope?: "request" | undefined } | undefined
 }
 
 export type PermissionReplyOutput = void

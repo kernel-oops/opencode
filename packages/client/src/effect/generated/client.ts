@@ -1336,7 +1336,7 @@ const EndpointPermissionReply = (raw: RawClient["server.permission"]) => (input:
   preserveEffect<PermissionReplyOutput>()(
     raw["session.permission.reply"]({
       params: { sessionID: input["sessionID"], requestID: input["requestID"] },
-      payload: { decision: input["decision"], message: input["message"] },
+      payload: { decision: input["decision"], message: input["message"], experimental: input["experimental"] },
     }).pipe(Effect.mapError(mapClientError)),
   )
 

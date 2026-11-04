@@ -144,6 +144,11 @@ export const makePermissionGroup = <
         payload: Schema.Struct({
           decision: Permission.Reply,
           message: Schema.String.pipe(Schema.optional),
+          experimental: Schema.Struct({
+            scope: Schema.Literal("request").pipe(Schema.optional).annotate({
+              description: "Limit a rejection to this request. Omitted rejects the session's pending batch.",
+            }),
+          }).pipe(Schema.optional),
         }),
         success: HttpApiSchema.NoContent,
         error: [SessionNotFoundError, PermissionNotFoundError],
