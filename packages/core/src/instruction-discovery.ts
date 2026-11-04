@@ -40,7 +40,6 @@ export interface Interface extends State.Transformable<Editor> {
   // Move it into plugin config once plugins can consume their own options.
   readonly project: boolean
   readonly global: boolean
-  readonly globalAlias?: string
   readonly list: () => Effect.Effect<File[] | Instructions.Unavailable>
   readonly load: () => Effect.Effect<Instructions.List>
 }
@@ -48,7 +47,6 @@ export interface Interface extends State.Transformable<Editor> {
 export const Options = Schema.Struct({
   project: Schema.optional(Schema.Boolean),
   global: Schema.optional(Schema.Boolean),
-  globalAlias: Schema.optional(Schema.String),
 })
 export type Options = typeof Options.Type
 
@@ -100,7 +98,6 @@ export const layer = (options?: Options) =>
       return Service.of({
         project: options?.project !== false,
         global: options?.global !== false,
-        globalAlias: options?.globalAlias,
         transform: state.transform,
         reload: state.reload,
         list,

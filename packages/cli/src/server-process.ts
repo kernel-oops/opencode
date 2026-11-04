@@ -134,7 +134,6 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
             ),
             file: process.env.OPENCODE_CONFIG,
             content: process.env.OPENCODE_CONFIG_CONTENT,
-            globalAlias: process.env.OPENCODE_CONFIG_GLOBAL_ALIAS,
           },
           windows: {
             gitbash: process.env.OPENCODE_GIT_BASH_PATH,

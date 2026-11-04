@@ -39,9 +39,6 @@ export const Plugin = define({
       const project = discovery.project && FSUtil.contains(root, start)
       const stop = FSUtil.contains(home, start) ? home : root
       const globalFile = yield* fs.resolve(join(global.config, "AGENTS.md"))
-      const aliasFile = discovery.globalAlias === undefined
-        ? undefined
-        : yield* fs.resolve(join(discovery.globalAlias, "AGENTS.md"))
       const loaded: { current: Loaded } = { current: { type: "available", files: [] } }
       const configured: { sources: string[]; remote: Map<string, InstructionDiscovery.File> } = {
         sources: [],
@@ -56,7 +53,7 @@ export const Plugin = define({
         ...(project
           ? ancestorDirectories(start, stop)
               .map((directory) => join(directory, "AGENTS.md"))
-              .filter((file) => (discovery.global || file !== globalFile) && file !== aliasFile)
+              .filter((file) => discovery.global || file !== globalFile)
           : []),
       ]
       for (const file of new Set(candidates)) {
@@ -90,7 +87,7 @@ export const Plugin = define({
           yield* fs.up({ targets: ["AGENTS.md"], start, stop, type: "file" }),
           fs.resolve,
         )
-        const discovered = new Set(walked.filter((file) => (discovery.global || file !== globalFile) && file !== aliasFile))
+        const discovered = new Set(walked.filter((file) => discovery.global || file !== globalFile))
         const files = yield* Effect.forEach(discovered, read, { concurrency: "unbounded" })
         if (files.some((file) => file === undefined)) return Instructions.unavailable
         return files.filter((file) => file instanceof InstructionDiscovery.File)

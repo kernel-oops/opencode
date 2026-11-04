@@ -73,11 +73,6 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
     [...configDirectories, globalClaudeDirectory, globalAgentsDirectory],
     (item) => fs.resolve(item),
   )
-  const alias = options?.globalAlias
-  if (alias !== undefined && (!path.isAbsolute(alias) || path.basename(alias) !== "opencode" || !(yield* fs.isDir(alias))))
-    return yield* Effect.die(new Error("globalAlias must be an existing absolute opencode configuration directory"))
-  const aliasRoot = alias === undefined ? undefined : yield* fs.resolve(alias)
-  const excludedRoots = aliasRoot === undefined ? globalRoots : [...globalRoots, aliasRoot]
   const current = yield* fs.resolve(location.directory)
   const directories =
     globalRoots.slice(0, configDirectories.length).includes(current) || options?.project === false
@@ -100,18 +95,15 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
 
   const globalEnabled = options?.global !== false
   const globalFiles = yield* Effect.forEach(
-    [...configDirectories, ...(aliasRoot === undefined ? [] : [aliasRoot])].flatMap((root) =>
-      names.map((name) => path.join(root, name)),
-    ),
+    configDirectories.flatMap((root) => names.map((name) => path.join(root, name))),
     (file) => fs.resolve(file),
   )
   // Global sources must not re-enter through the project walk.
   const visible = discovered
     .filter(({ resolved }) =>
       globalEnabled
-        ? !excludedRoots.includes(resolved) && !globalFiles.includes(resolved)
-        : !globalRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep)) &&
-          resolved !== aliasRoot && !globalFiles.includes(resolved),
+        ? !globalRoots.includes(resolved) && !globalFiles.includes(resolved)
+        : !globalRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep)),
     )
     .map(({ item }) => item)
 

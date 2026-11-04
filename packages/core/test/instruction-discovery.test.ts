@@ -33,7 +33,6 @@ const instructionLayer = (input: {
   instructions?: string[]
   http?: HttpClient.HttpClient
   project?: boolean
-  globalAlias?: string
 }) => {
   const watcher = Watcher.testLayer
   const config = Config.testLayer(input.instructions ? [configured(input.instructions)] : [])
@@ -50,7 +49,7 @@ const instructionLayer = (input: {
       ]),
       [
         Config.node.replace(config),
-        InstructionDiscovery.node.replace(InstructionDiscovery.configured({ project: input.project, globalAlias: input.globalAlias })),
+        InstructionDiscovery.node.replace(InstructionDiscovery.configured({ project: input.project })),
         Global.node.replace(
           input.config || input.home
             ? Global.layerWith({
@@ -116,36 +115,6 @@ function triggerAndWait<E, R>(trigger: Effect.Effect<void, E, R>) {
 }
 
 describe("InstructionDiscovery", () => {
-  it.live("frozen global alias excludes original global guidance without hiding project instructions", () =>
-    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
-      Effect.flatMap((tmp) => {
-        const canonical = path.join(tmp.path, "canonical", "opencode")
-        const snapshot = path.join(tmp.path, "release", "opencode")
-        const project = path.join(canonical, "project")
-        return Effect.promise(async () => {
-          await fs.mkdir(project, { recursive: true })
-          await fs.mkdir(snapshot, { recursive: true })
-          await fs.writeFile(path.join(canonical, "AGENTS.md"), "old-global")
-          await fs.writeFile(path.join(snapshot, "AGENTS.md"), "frozen-global")
-          await fs.writeFile(path.join(project, "AGENTS.md"), "project-guidance")
-        }).pipe(
-          Effect.andThen(Effect.gen(function* () {
-            const discovery = yield* start()
-            const files = yield* discovery.list()
-            expect(Array.isArray(files)).toBe(true)
-            if (!Array.isArray(files)) return
-            expect(files.map((item) => item.content)).toEqual(["frozen-global", "project-guidance"])
-          }).pipe(Effect.provide(instructionLayer({
-            config: snapshot,
-            home: tmp.path,
-            globalAlias: canonical,
-            locationServiceLayer: Layer.succeed(Location.Service, location({ directory: AbsolutePath.make(project) }, { projectDirectory: AbsolutePath.make(canonical) })),
-          })))),
-        )
-      }),
-    ),
-  )
-
   it.effect("stores ordered values with last-write-wins precedence", () =>
     Effect.gen(function* () {
       const discovery = yield* InstructionDiscovery.Service

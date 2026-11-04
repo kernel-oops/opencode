@@ -673,8 +673,6 @@ export const make = Effect.fn("PluginHost.make")(function* (
           yield* sessions.setMetadata({ sessionID: input.sessionID, metadata: input.metadata })
         if (input.permissions !== undefined)
           yield* sessions.setPermissions({ sessionID: input.sessionID, permissions: input.permissions })
-        if (input.contextBudget !== undefined)
-          yield* sessions.setContextBudget({ sessionID: input.sessionID, contextBudget: input.contextBudget })
       }),
       move: sessions.move,
       synthetic: ((input: Parameters<typeof sessions.synthetic>[0] | (Parameters<typeof sessions.assistantSynthetic>[0] & { role: "assistant" })) =>

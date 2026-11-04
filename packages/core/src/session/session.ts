@@ -456,15 +456,12 @@ export const make = Effect.fn("Session.make")(function* () {
     const existing = found?.type === "assistant" ? found : undefined
     const assistantMessageID = existing?.id ?? continuationID ?? SessionMessage.ID.create()
     if (!existing) {
-      // A child session created for delegated work has no agent/model of its own until it runs,
-      // so inherit the parent's rather than refusing to record output that already exists.
-      const parent = session.parentID ? yield* get(session.parentID) : undefined
-      const agent = input.agent ?? session.agent ?? parent?.agent
-      const model = input.model ?? session.model ?? parent?.model
+      const agent = input.agent ?? session.agent
+      const model = input.model ?? session.model
       if (!agent || !model)
         return yield* Effect.die(
           new Error(
-            `Session.append requires agent/model: session ${sessionID} has none selected and no parent to inherit from; pass agent and model explicitly`,
+            `Session.append requires agent/model: session ${sessionID} has none selected; pass agent and model explicitly`,
           ),
         )
       yield* bus.publish(

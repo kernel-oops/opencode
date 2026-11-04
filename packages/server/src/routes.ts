@@ -141,12 +141,10 @@ function makeRoutes<AuthError, AuthServices>(
         claude: options.config?.claude,
         file: options.config?.file,
         content: options.config?.content,
-        globalAlias: options.config?.globalAlias,
       }),
     ),
     InstructionDiscovery.node.replace(InstructionDiscovery.configured({
       project: options.config?.project,
-      globalAlias: options.config?.globalAlias,
     })),
     ShellSelect.node.replace(ShellSelect.configured({ gitbash: options.windows?.gitbash })),
     Mcp.node.replace(

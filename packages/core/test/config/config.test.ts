@@ -94,56 +94,6 @@ const provider = {
 }
 
 describe("Config", () => {
-  it.live("frozen global alias excludes only original global sources, including symlinked ancestors", () =>
-    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
-      Effect.flatMap((tmp) => {
-        const canonical = path.join(tmp.path, "canonical", "config", "opencode")
-        const snapshot = path.join(tmp.path, "release", "config", "opencode")
-        const link = path.join(tmp.path, "alias")
-        const override = path.join(canonical, ".opencode")
-        return Effect.promise(async () => {
-          await fs.mkdir(canonical, { recursive: true })
-          await fs.mkdir(snapshot, { recursive: true })
-          await fs.mkdir(override)
-          await fs.mkdir(path.join(canonical, "plugins"))
-          await fs.writeFile(path.join(canonical, "opencode.json"), JSON.stringify({ shell: "old-global" }))
-          await fs.writeFile(path.join(snapshot, "opencode.json"), JSON.stringify({ shell: "new-global" }))
-          await fs.writeFile(path.join(override, "opencode.json"), JSON.stringify({ mcp: { servers: { sentry: { enabled: false } } } }))
-          await fs.symlink(canonical, link)
-        }).pipe(
-          Effect.andThen(
-            Effect.forEach([canonical, link, path.join(canonical, "plugins")], (directory) =>
-              Effect.gen(function* () {
-                const config = yield* Config.Service
-                const entries = yield* config.entries()
-                expect(Config.latest(entries, "shell")).toBe("new-global")
-                expect(entries.filter((entry) => entry.type === "document" && entry.path === path.join(canonical, "opencode.json"))).toHaveLength(0)
-                expect(entries.some((entry) => entry.type === "directory" && entry.path?.endsWith(".opencode"))).toBe(true)
-              }).pipe(Effect.provide(testLayer(directory, snapshot, directory, undefined, undefined, undefined, undefined, { globalAlias: canonical }))),
-            ),
-          ),
-        )
-      }),
-    ),
-  )
-
-  it.live("rejects relative or unrelated blanket global aliases", () =>
-    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
-      Effect.flatMap((tmp) =>
-        Effect.forEach(["relative/opencode", path.parse(tmp.path).root, path.join(tmp.path, "missing", "opencode")], (globalAlias) =>
-          Effect.gen(function* () {
-            const config = yield* Config.Service
-            yield* config.entries()
-          }).pipe(
-            Effect.provide(testLayer(tmp.path, path.join(tmp.path, "global"), tmp.path, undefined, undefined, undefined, undefined, { globalAlias })),
-            Effect.exit,
-            Effect.map((exit) => expect(exit._tag).toBe("Failure")),
-          ),
-        ),
-      ),
-    ),
-  )
-
   it.live("excludes home-level claude and agents directories when global is disabled", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
       Effect.flatMap((tmp) => {
