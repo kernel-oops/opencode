@@ -9596,6 +9596,31 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "experimental": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "scope": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "enum": ["request"]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "description": "Limit a rejection to this request. Omitted rejects the session's pending batch."
+                          }
+                        },
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   }
                 },
                 "required": ["decision"],
@@ -17701,6 +17726,10 @@
                 }
               }
             ]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["deprecated"]
           },
           "disabled": {
             "type": "boolean"

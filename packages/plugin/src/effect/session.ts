@@ -8,7 +8,7 @@ import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { SessionError } from "@opencode/schema/session-error"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { TokenUsage } from "@opencode/schema/token-usage"
-import type { JsonSchema, Types } from "effect"
+import type { Effect, JsonSchema, Types } from "effect"
 import type { ModelHooks } from "./registration.js"
 
 export interface SessionPrompt {
@@ -210,12 +210,20 @@ export type SessionDomain = Pick<
   | "generate"
   | "command"
   | "compact"
-  | "synthetic"
   | "interrupt"
   | "update"
   | "move"
   | "context"
 > &
   Pick<ExperimentalSessionApi<unknown>, "wait" | "instructions"> & {
+    /** Assistant notes inherit session agent/model and never start a turn. Add only at an idle boundary, not during model output. Core control metadata is stripped. */
+    readonly synthetic: SessionApi<unknown>["synthetic"] & ((input: {
+      sessionID: Session.ID
+      role: "assistant"
+      text: string
+      /** Defaults to true; false is rejected because notes cannot be continued. */
+      final?: boolean
+      metadata?: Record<string, unknown>
+    }) => Effect.Effect<{ id: SessionMessage.ID }, Effect.Error<ReturnType<SessionApi<unknown>["synthetic"]>>>)
     readonly hook: ModelHooks<SessionHooks>
   }

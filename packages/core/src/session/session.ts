@@ -3,6 +3,7 @@ export * as Session from "./session.js"
 import { DateTime, Effect, Fiber, Scope } from "effect"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
+import { Money } from "@opencode/schema/money"
 import type { Permission } from "@opencode/schema/permission"
 import { Event } from "@opencode/schema/event"
 import { FSUtil } from "@opencode/util/fs-util"
@@ -325,6 +326,32 @@ export const make = Effect.fn("Session.make")(function* () {
         }),
       ),
   )
+  // Assistant notes are projected history, never inbox work or a model execution.
+  const assistantSynthetic = Effect.fn("Session.assistantSynthetic")(function* (
+    sessionID: SessionSchema.ID,
+    input: { text: string; final?: boolean; metadata?: Record<string, unknown> },
+  ) {
+    if (input.final === false)
+      return yield* Effect.die(new Error("Assistant synthetic notes must be final"))
+    const session = yield* get(sessionID)
+    if (!session.agent || !session.model)
+      return yield* Effect.die(new Error("Assistant synthetic requires the session's selected agent and model"))
+    const assistantMessageID = SessionMessage.ID.create()
+    // Plugins may annotate notes, but cannot forge core replay or checkpoint controls.
+    const metadata = input.metadata && Object.fromEntries(Object.entries(input.metadata).filter(([key]) =>
+      !["experimental", "opencode", "instructions", "instruction", "keepID", "recent", "native", "checkpoint", "compaction", "stateCheckpoint", "contextBudget"].includes(key),
+    ))
+    yield* bus.publish(SessionEvent.Step.Started, {
+      sessionID, assistantMessageID, agent: session.agent, model: session.model, started: Date.now(),
+    }, { metadata })
+    yield* bus.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID, ordinal: 0 })
+    yield* bus.publish(SessionEvent.Text.Ended, { sessionID, assistantMessageID, ordinal: 0, text: input.text })
+    yield* bus.publish(SessionEvent.Step.Ended, {
+      sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0),
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    })
+    return { id: assistantMessageID }
+  }, Effect.uninterruptible)
   const interrupt = Effect.fn("Session.interrupt")(
     (sessionID: SessionSchema.ID, options?: { readonly resume?: boolean }) =>
       Effect.uninterruptible(execution.interrupt(sessionID, options)),
@@ -370,6 +397,7 @@ export const make = Effect.fn("Session.make")(function* () {
     inbox,
     prompt,
     synthetic,
+    assistantSynthetic,
     shell,
     skill,
     compact,
@@ -396,6 +424,7 @@ export const make = Effect.fn("Session.make")(function* () {
     const inbox = operations.inbox.bind(undefined, sessionID)
     const prompt = operations.prompt.bind(undefined, sessionID)
     const synthetic = operations.synthetic.bind(undefined, sessionID)
+    const assistantSynthetic = operations.assistantSynthetic.bind(undefined, sessionID)
     const shell = operations.shell.bind(undefined, sessionID)
     const skill = operations.skill.bind(undefined, sessionID)
     const compact = operations.compact.bind(undefined, sessionID)
@@ -425,6 +454,7 @@ export const make = Effect.fn("Session.make")(function* () {
       inbox,
       prompt,
       synthetic,
+      assistantSynthetic,
       shell,
       skill,
       compact,

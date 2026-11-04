@@ -642,7 +642,8 @@ export const make = Effect.fn("PluginHost.make")(function* (
           yield* sessions.setPermissions({ sessionID: input.sessionID, permissions: input.permissions })
       }),
       move: sessions.move,
-      synthetic: sessions.synthetic,
+      synthetic: ((input: Parameters<typeof sessions.synthetic>[0] | (Parameters<typeof sessions.assistantSynthetic>[0] & { role: "assistant" })) =>
+        "role" in input && input.role === "assistant" ? sessions.assistantSynthetic(input) : sessions.synthetic(input)) as Plugin.Context["session"]["synthetic"],
       interrupt: (input) =>
         sessions
           .interrupt(input.sessionID, { resume: input.resume })

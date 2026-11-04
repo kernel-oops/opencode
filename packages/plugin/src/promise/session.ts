@@ -210,12 +210,20 @@ export type SessionDomain = Pick<
   | "generate"
   | "command"
   | "compact"
-  | "synthetic"
   | "interrupt"
   | "update"
   | "move"
   | "context"
 > &
   Pick<ExperimentalSessionApi, "wait" | "instructions"> & {
+    /** Assistant notes inherit session agent/model and never start a turn. Add only at an idle boundary, not during model output. Core control metadata is stripped. */
+    readonly synthetic: SessionApi["synthetic"] & ((input: {
+      sessionID: Session.ID
+      role: "assistant"
+      text: string
+      /** Defaults to true; false is rejected because notes cannot be continued. */
+      final?: boolean
+      metadata?: Record<string, unknown>
+    }) => Promise<{ id: SessionMessage.ID }>)
     readonly hook: ModelHooks<SessionHooks>
   }

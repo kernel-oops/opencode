@@ -1,4 +1,5 @@
 import { Tool } from "@opencode/schema/tool"
+import { Session } from "@opencode/schema/session"
 import type { Rpc } from "@opencode/schema/rpc"
 import type { OpenCodeEvent } from "@opencode/client"
 import type { RpcCallOptions, RpcEventPayload, SelectedEvent, SubscribeOptions } from "@opencode/client/promise/api"
@@ -29,6 +30,13 @@ interface CompiledEndpoint {
 
 const compiledEndpoints = new WeakMap<object, CompiledEndpoint>()
 const JsonInput = Schema.fromJsonString(Schema.Unknown)
+const AssistantSynthetic = Schema.Struct({
+  sessionID: Session.ID,
+  role: Schema.Literal("assistant"),
+  text: Schema.String,
+  final: Schema.Boolean.pipe(Schema.optional),
+  metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(Schema.optional),
+})
 
 interface HostRpcCallContext {
   readonly error: (type: string, message: string, data?: unknown) => unknown
@@ -634,7 +642,14 @@ export function fromPromise(plugin: Plugin) {
             generate: adaptApiMethod(SessionEndpoints["session.generate"], host.session.generate),
             command: adaptApiMethod(SessionEndpoints["session.command"], host.session.command),
             compact: adaptApiMethod(SessionEndpoints["session.compact"], host.session.compact),
-            synthetic: adaptApiMethod(SessionEndpoints["session.synthetic"], host.session.synthetic),
+            synthetic: ((input: Parameters<PromiseContext["session"]["synthetic"]>[0] | Parameters<typeof host.session.synthetic>[0]) =>
+              "role" in input && input.role === "assistant"
+                ? run(Schema.encodeUnknownEffect(JsonInput)(input).pipe(
+                    Effect.flatMap(Schema.decodeUnknownEffect(JsonInput)),
+                    Effect.flatMap(Schema.decodeUnknownEffect(AssistantSynthetic)),
+                    Effect.flatMap((note) => host.session.synthetic(note)),
+                  ))
+                : adaptApiMethod<(input: unknown) => Promise<unknown>>(SessionEndpoints["session.synthetic"], host.session.synthetic)(input)) as PromiseContext["session"]["synthetic"],
             interrupt: adaptApiMethod(SessionEndpoints["session.interrupt"], host.session.interrupt),
             update: adaptApiMethod(SessionEndpoints["session.update"], host.session.update),
             move: adaptApiMethod(SessionEndpoints["session.move"], host.session.move),
