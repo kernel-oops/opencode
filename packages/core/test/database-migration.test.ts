@@ -65,6 +65,31 @@ const parkedClient = (arrived: Deferred.Deferred<void>, gate: Deferred.Deferred<
   ).pipe(Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Layer.provide(Reactivity.layer))
 
 describe("DatabaseMigration", () => {
+  test("preserves unknown applied IDs and applies each registered migration only once", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
+        yield* db.run(sql`INSERT INTO migration VALUES ('retired_plugin_migration', 123)`)
+        const migration: DatabaseMigration.Migration = {
+          id: "registered_migration",
+          up: (tx) => tx.run(sql`CREATE TABLE migration_probe (value TEXT)`).pipe(Effect.asVoid),
+        }
+        yield* DatabaseMigration.applyOnly(db, [migration])
+        yield* DatabaseMigration.applyOnly(db, [migration])
+        expect(yield* db.all(sql`SELECT id FROM migration ORDER BY id`)).toEqual([
+          { id: "registered_migration" },
+          { id: "retired_plugin_migration" },
+        ])
+        expect(yield* db.get(sql`SELECT time_completed FROM migration WHERE id = 'retired_plugin_migration'`)).toEqual({
+          time_completed: 123,
+        })
+        yield* DatabaseMigration.applyOnly(db, [])
+        expect(yield* db.all(sql`SELECT id FROM migration ORDER BY id`)).toHaveLength(2)
+      }),
+    )
+  })
+
   test("defaults missing workspace names while preserving legacy workspace data", async () => {
     await run(
       Effect.gen(function* () {
