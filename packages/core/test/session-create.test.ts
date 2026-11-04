@@ -183,7 +183,7 @@ describe("native immutable delegation projection and transitions", () => {
         permissions: [{ action: "*", resource: "*", effect: "allow" }],
       })
       expect((yield* SessionDelegation.get(db, child.id))?.origin_id).toBe(owner.id)
-      yield* sessions.append({ sessionID: owner.id, text: "Fixture evidence only", final: true })
+      yield* sessions.assistantSynthetic({ sessionID: owner.id, text: "Fixture evidence only", final: true })
       const fork = yield* sessions.fork({ sessionID: owner.id })
       expect(fork.parentID).toBeUndefined()
       expect((yield* SessionDelegation.get(db, fork.id))?.origin_id).toBe(owner.id)

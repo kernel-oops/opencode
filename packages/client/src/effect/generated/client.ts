@@ -49,8 +49,6 @@ import type {
   SessionCommandOutput,
   SessionSyntheticInput,
   SessionSyntheticOutput,
-  SessionAppendInput,
-  SessionAppendOutput,
   SessionShellInput,
   SessionShellOutput,
   SessionCompactInput,
@@ -593,24 +591,6 @@ const EndpointSessionSynthetic = (raw: RawClient["server.session"]) => (input: S
     ),
   )
 
-const EndpointSessionAppend = (raw: RawClient["server.session"]) => (input: SessionAppendInput) =>
-  preserveEffect<SessionAppendOutput>()(
-    raw["session.append"]({
-      params: { sessionID: input["sessionID"] },
-      payload: {
-        id: input["id"],
-        text: input["text"],
-        final: input["final"],
-        agent: input["agent"],
-        model: input["model"],
-        metadata: input["metadata"],
-      },
-    }).pipe(
-      Effect.mapError(mapClientError),
-      Effect.map((value) => value.data),
-    ),
-  )
-
 const EndpointSessionShell = (raw: RawClient["server.session"]) => (input: SessionShellInput) =>
   preserveEffect<SessionShellOutput>()(
     raw["session.shell"]({
@@ -815,7 +795,6 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   prompt: EndpointSessionPrompt(raw),
   command: EndpointSessionCommand(raw),
   synthetic: EndpointSessionSynthetic(raw),
-  append: EndpointSessionAppend(raw),
   shell: EndpointSessionShell(raw),
   compact: EndpointSessionCompact(raw),
   revert: {

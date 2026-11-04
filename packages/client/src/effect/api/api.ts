@@ -248,18 +248,6 @@ export type SessionSyntheticOperation<E = never> = (
   input: SessionSyntheticInput,
 ) => Effect.Effect<SessionSyntheticOutput, E>
 
-export type SessionAppendInput = {
-  readonly sessionID: Session.ID
-  readonly id?: SessionMessage.ID | undefined
-  readonly text: string
-  readonly final?: boolean | undefined
-  readonly agent?: Agent.ID | undefined
-  readonly model?: Model.Ref | undefined
-  readonly metadata?: { readonly [x: string]: unknown } | undefined
-}
-export type SessionAppendOutput = { readonly id: SessionMessage.ID }
-export type SessionAppendOperation<E = never> = (input: SessionAppendInput) => Effect.Effect<SessionAppendOutput, E>
-
 export type SessionShellInput = {
   readonly sessionID: Session.ID
   readonly id?: SessionMessage.ID | undefined
@@ -459,7 +447,6 @@ export interface SessionApi<E = never> {
   readonly prompt: SessionPromptOperation<E>
   readonly command: SessionCommandOperation<E>
   readonly synthetic: SessionSyntheticOperation<E>
-  readonly append: SessionAppendOperation<E>
   readonly shell: SessionShellOperation<E>
   readonly compact: SessionCompactOperation<E>
   readonly revert: {

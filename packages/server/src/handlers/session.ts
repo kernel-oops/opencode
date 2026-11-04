@@ -432,26 +432,6 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
-        "session.append",
-        Effect.fn(function* (ctx) {
-          const data = yield* session
-            .append({
-              sessionID: ctx.params.sessionID,
-              id: ctx.payload.id,
-              text: ctx.payload.text,
-              final: ctx.payload.final,
-              agent: ctx.payload.agent,
-              model: ctx.payload.model,
-              metadata: ctx.payload.metadata,
-            })
-            .pipe(
-              Effect.catchTag("Session.NotFoundError", missingSession),
-              Effect.catchTag("Session.MessageNotFoundError", missingMessage),
-            )
-          return { data }
-        }),
-      )
-      .handle(
         "session.shell",
         Effect.fn(function* (ctx) {
           yield* session

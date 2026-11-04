@@ -686,7 +686,6 @@ export function fromPromise(plugin: Plugin) {
                     Effect.flatMap((note) => host.session.synthetic(note)),
                   ))
                 : adaptApiMethod<(input: unknown) => Promise<unknown>>(SessionEndpoints["session.synthetic"], host.session.synthetic)(input)) as PromiseContext["session"]["synthetic"],
-            append: adaptApiMethod(SessionEndpoints["session.append"], host.session.append),
             interrupt: adaptApiMethod(SessionEndpoints["session.interrupt"], host.session.interrupt),
             update: adaptApiMethod(SessionEndpoints["session.update"], host.session.update),
             move: adaptApiMethod(SessionEndpoints["session.move"], host.session.move),

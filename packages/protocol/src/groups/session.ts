@@ -430,30 +430,6 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         ),
     )
     .add(
-      HttpApiEndpoint.post("session.append", "/api/session/:sessionID/append", {
-        params: { sessionID: Session.ID },
-        payload: Schema.Struct({
-          id: SessionMessage.ID.pipe(Schema.optional),
-          text: Schema.String,
-          final: Schema.Boolean.pipe(Schema.optional),
-          agent: Agent.ID.pipe(Schema.optional),
-          model: Model.Ref.pipe(Schema.optional),
-          metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(Schema.optional),
-        }),
-        success: Schema.Struct({ data: Schema.Struct({ id: SessionMessage.ID }) }),
-        error: [MessageNotFoundError, SessionNotFoundError],
-      })
-        .middleware(sessionLocationMiddleware)
-        .annotateMerge(
-          OpenApi.annotations({
-            identifier: "session.append",
-            summary: "Append visible assistant text",
-            description:
-              "Durably append a chunk of assistant-authored text to a session, without scheduling a model turn. Pass the returned id back in to extend the same message; set final to close it out.",
-          }),
-        ),
-    )
-    .add(
       HttpApiEndpoint.post("session.shell", "/api/session/:sessionID/shell", {
         params: { sessionID: Session.ID },
         payload: Schema.Struct({

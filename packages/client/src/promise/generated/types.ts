@@ -3812,18 +3812,6 @@ export type SessionSyntheticInput = {
 
 export type SessionSyntheticOutput = { data: SessionInboxSynthetic }["data"]
 
-export type SessionAppendInput = {
-  readonly sessionID: string
-  readonly id?: string | null | undefined
-  readonly text: string
-  readonly final?: boolean | null | undefined
-  readonly agent?: string | null | undefined
-  readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null | undefined
-  readonly metadata?: { readonly [x: string]: JsonValue } | null | undefined
-}
-
-export type SessionAppendOutput = { data: { id: SessionMessageID } }["data"]
-
 export type SessionShellInput = {
   readonly sessionID: string
   readonly id?: string | undefined

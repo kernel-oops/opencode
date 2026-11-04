@@ -8658,7 +8658,7 @@ const blockWithArrivals = Effect.fnUntraced(function* (s: Scenario) {
 
 /**
  * The plugin's half through the host seam (`maintainFor` is the host's `stateCheckpoint.maintain`), each operation
- * after its own exact native shell intent, then a derived note via the existing append, as the command does. The
+ * after its own exact native shell intent, then a derived assistant synthetic note, as the command does. The
  * command registry itself is not part of this harness. No operation may reach the model.
  */
 const maintainAll = Effect.fnUntraced(function* (
@@ -8673,7 +8673,7 @@ const maintainAll = Effect.fnUntraced(function* (
         { get: s.session.get, compact: (request) => s.session.compact(request) },
         { ...input, sessionID } as never,
       )
-      yield* s.session.append({
+      yield* s.session.assistantSynthetic({
         sessionID,
         text: `controller-state maintenance (derived record, not approval):\n${JSON.stringify(result)}`,
         final: true,

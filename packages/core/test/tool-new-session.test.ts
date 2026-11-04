@@ -1418,7 +1418,7 @@ test("native execution coordinator delivers the initial prompt through a fake ru
         ).toBe("Failure")
         expect(
           (yield* sessions
-            .append({ sessionID: result.output.sessionID, text: "Late development", final: true })
+            .assistantSynthetic({ sessionID: result.output.sessionID, text: "Late development", final: true })
             .pipe(Effect.exit))._tag,
         ).toBe("Failure")
       }).pipe(Effect.provide(nativeLayer(`${location.directory}/native-run.db`, location, true)), Effect.scoped)

@@ -231,7 +231,6 @@ export type SessionDomain = Pick<
   | "generate"
   | "command"
   | "compact"
-  | "append"
   | "interrupt"
   | "update"
   | "move"

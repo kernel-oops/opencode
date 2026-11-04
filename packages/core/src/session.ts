@@ -264,9 +264,6 @@ export interface Interface {
   readonly assistantSynthetic: (
     input: Parameters<Session.Handle["assistantSynthetic"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["assistantSynthetic"]>
-  readonly append: (
-    input: Parameters<Session.Handle["append"]>[0] & { sessionID: SessionSchema.ID },
-  ) => ReturnType<Session.Handle["append"]>
   readonly revert: {
     readonly stage: (input: {
       sessionID: SessionSchema.ID
@@ -552,7 +549,6 @@ const layer = Layer.effect(
       resume: (sessionID) => sessions.forSession(sessionID).resume(),
       synthetic: (input) => sessions.forSession(input.sessionID).synthetic(input),
       assistantSynthetic: (input) => sessions.forSession(input.sessionID).assistantSynthetic(input),
-      append: (input) => sessions.forSession(input.sessionID).append(input),
       interrupt: (sessionID, options) => sessions.forSession(sessionID).interrupt(options),
       revert: {
         stage: (input) => sessions.forSession(input.sessionID).revert.stage(input),

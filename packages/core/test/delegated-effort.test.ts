@@ -106,7 +106,7 @@ describe("delegated reasoning effort", () => {
       expect((yield* sessions.switchModel({ sessionID: child.id, model: selected }).pipe(Effect.exit))._tag).toBe(
         "Failure",
       )
-      yield* sessions.append({ sessionID: owner.id, text: "Fork evidence", final: true })
+      yield* sessions.assistantSynthetic({ sessionID: owner.id, text: "Fork evidence", final: true })
       const fork = yield* sessions.fork({ sessionID: owner.id })
       expect((yield* SessionDelegation.get(db, fork.id))?.client_model).toBeNull()
       expect((yield* sessions.switchModel({ sessionID: fork.id, model: effortRef() }).pipe(Effect.exit))._tag).toBe(
@@ -269,7 +269,7 @@ describe("delegated reasoning effort", () => {
         model: effortRef("high", "specialist"),
       })
       yield* sessions.switchModel({ sessionID: child.id, model: effortRef("medium", "specialist") })
-      yield* sessions.append({ sessionID: child.id, text: "Evidence", final: true })
+      yield* sessions.assistantSynthetic({ sessionID: child.id, text: "Evidence", final: true })
       const fork = yield* sessions.fork({ sessionID: child.id })
       yield* sessions.switchModel({ sessionID: fork.id, model: effortRef("high", "specialist") })
       expect((yield* sessions.get(fork.id)).model?.id).toBe(Model.ID.make("specialist"))
