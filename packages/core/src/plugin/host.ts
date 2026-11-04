@@ -49,8 +49,14 @@ const isRpcType = (type: string): type is RpcEvent["type"] => type.startsWith("r
 const isRpcEvent = (event: Event.Payload): event is RpcEvent => isRpcType(event.type)
 const isPublicEvent = (event: Event.Payload): event is EventManifest.ServerEvent | RpcEvent =>
   EventManifest.isServer(event) || isRpcEvent(event)
+/** A lookup during activation waits at most this long, so a plugin cannot wait indefinitely for its own load. */
+const ACTIVATION_WAIT = "15 seconds"
+
 export const make = Effect.fn("PluginHost.make")(function* (
-  plugin: Pick<Interface, "list">,
+  plugin: Pick<Interface, "list"> &
+    Partial<Pick<Interface, "awaitActivation">> & {
+      readonly activating?: () => boolean
+    },
   pluginID: string = "test",
 ) {
   const app = yield* App.Metadata
@@ -128,15 +134,26 @@ export const make = Effect.fn("PluginHost.make")(function* (
     agent: {
       get: (input) => {
         const ref = locationRef(input)
+        const remote = ref !== undefined && !isCurrentLocation(ref)
+        const lookup = remote
+          ? listAgents(ref).pipe(
+              Effect.map((result) => ({
+                ...result,
+                data: result.data.find((agent) => agent.id === input.agentID),
+              })),
+            )
+          : response(agents.get(input.agentID))
+        const settled = plugin.awaitActivation
         const output =
-          ref && !isCurrentLocation(ref)
-            ? listAgents(ref).pipe(
-                Effect.map((result) => ({
-                  ...result,
-                  data: result.data.find((agent) => agent.id === input.agentID),
-                })),
+          remote || settled === undefined
+            ? lookup
+            : lookup.pipe(
+                Effect.flatMap((result) =>
+                  result.data !== undefined || !plugin.activating?.()
+                    ? Effect.succeed(result)
+                    : settled.pipe(Effect.timeoutOption(ACTIVATION_WAIT), Effect.andThen(lookup)),
+                ),
               )
-            : response(agents.get(input.agentID))
         return output.pipe(
           Effect.flatMap((result) =>
             result.data

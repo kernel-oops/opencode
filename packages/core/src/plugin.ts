@@ -7,7 +7,7 @@ import { Plugin } from "@opencode/schema/plugin"
 import { Node } from "@opencode/util/effect/app-node"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import type { PersistentPty } from "./persistent-pty.js"
-import { Cause, Context, Effect, Exit, Latch, Layer, Logger, Queue, References, Scope, Semaphore } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Latch, Layer, Logger, Queue, References, Scope, Semaphore } from "effect"
 import { Bus } from "./bus.js"
 import { KV } from "./kv.js"
 import { PluginHost } from "./plugin/host.js"
@@ -59,7 +59,11 @@ const layer = Layer.effect(
       const code = yield* Effect.promise(() => readFile(fileURLToPath(gui.file), "utf8"))
       return { code, revision: gui.revision, options: gui.options } satisfies Plugin.GuiBundle
     })
-    const host = yield* PluginHost.make({ list })
+    const host = yield* PluginHost.make({
+      list,
+      awaitActivation: ready.await,
+      activating: () => !closed && pending.size > 0,
+    })
     const load = Effect.fnUntraced(function* (plugin: Generation) {
       const activation: Activation = { plugin, scope: yield* Scope.fork(scope) }
       const inherit = yield* State.inherit()
@@ -146,7 +150,7 @@ const layer = Layer.effect(
                       Effect.gen(function* () {
                         active.delete(id)
                         if (slot.activation && !slot.activation.failure)
-                          yield* Scope.close(slot.activation.scope, Exit.void)
+                          yield* reportSlow("unloading", id, Scope.close(slot.activation.scope, Exit.void))
                       }),
                     { discard: true },
                   )
@@ -157,7 +161,7 @@ const layer = Layer.effect(
                       active.set(definition.id, { ...slot, plugin: definition })
                       continue
                     }
-                    const result = yield* load(definition)
+                    const result = yield* reportSlow("loading", definition.id, load(definition))
                     if (result.activation !== undefined) {
                       active.set(definition.id, {
                         plugin: definition,
@@ -271,6 +275,36 @@ const layer = Layer.effect(
     })
   }),
 )
+
+// While plugins are loaded or unloaded the location is not ready: prompts and new steps wait. Name the plugin that
+// holds that up, so a load or cleanup that never finishes shows in the log instead of as sessions that silently hang.
+const SLOW_PLUGIN = "10 seconds"
+const reportSlow = <A, E, R>(phase: "loading" | "unloading", id: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const started = Date.now()
+    const warning = yield* Effect.sleep(SLOW_PLUGIN).pipe(
+      Effect.andThen(
+        Effect.logWarning("plugin is holding up a plugin reload; sessions in this location wait for it", {
+          "plugin.id": id,
+          phase,
+        }),
+      ),
+      Effect.forkDetach,
+    )
+    return yield* effect.pipe(
+      Effect.ensuring(
+        Fiber.interrupt(warning).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              Date.now() - started >= 10_000
+                ? Effect.logWarning("slow plugin finished", { "plugin.id": id, phase, ms: Date.now() - started })
+                : Effect.void,
+            ),
+          ),
+        ),
+      ),
+    )
+  })
 
 // `plugin` is the requested definition; `activation` is its last activation, which may have
 // failed or be an older fallback while the requested revision keeps failing setup.

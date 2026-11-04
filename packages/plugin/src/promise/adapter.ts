@@ -2,7 +2,7 @@ import { Tool } from "@opencode/schema/tool"
 import type { Rpc } from "@opencode/schema/rpc"
 import type { OpenCodeEvent } from "@opencode/client"
 import type { RpcCallOptions, RpcEventPayload, SelectedEvent, SubscribeOptions } from "@opencode/client/promise/api"
-import { Effect, Schema, SchemaAST, Stream } from "effect"
+import { Effect, Exit, Fiber, Option, Schema, SchemaAST, Stream } from "effect"
 import type { Scope } from "effect"
 import { HttpApiEndpoint, HttpApiSchema } from "effect/http-api"
 import { define } from "../effect/plugin.js"
@@ -665,11 +665,37 @@ export function fromPromise(plugin: Plugin) {
 
         yield* Effect.acquireRelease(
           Effect.promise(() => Promise.resolve(plugin.setup(context2))),
-          (cleanup) => (cleanup ? Effect.promise(() => Promise.resolve(cleanup())) : Effect.void),
+          (cleanup) => (cleanup ? releaseCleanup(plugin.id, cleanup) : Effect.void),
         )
       }),
   })
 }
+
+// Registrations are disposed with the plugin scope; the cleanup only releases the plugin's own resources.
+const CLEANUP_GRACE = "5 seconds"
+
+/**
+ * Unloading runs while the location's plugins are not ready, and API calls such as session.prompt wait for
+ * readiness. A cleanup that awaits one (delivering held messages, say) would wait for its own unload and wedge
+ * the location, so give it a bounded head start and let the rest finish once the replacement is active.
+ */
+const releaseCleanup = (id: string, cleanup: () => unknown) =>
+  Effect.gen(function* () {
+    const fiber = yield* Effect.promise(() => Promise.resolve().then(cleanup)).pipe(Effect.forkDetach)
+    const exit = yield* Fiber.await(fiber).pipe(Effect.timeoutOption(CLEANUP_GRACE))
+    if (Option.isSome(exit)) return yield* exit.value
+    yield* Effect.logWarning("plugin cleanup still running; continuing reload without waiting for it", {
+      "plugin.id": id,
+    })
+    yield* Fiber.await(fiber).pipe(
+      Effect.flatMap((exit) =>
+        Exit.isFailure(exit)
+          ? Effect.logWarning("plugin cleanup failed", { "plugin.id": id, cause: exit.cause })
+          : Effect.void,
+      ),
+      Effect.forkDetach,
+    )
+  })
 
 function attempt<A>(evaluate: (signal: AbortSignal) => PromiseLike<A>) {
   return Effect.tryPromise({ try: evaluate, catch: (cause) => cause })
