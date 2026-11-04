@@ -791,7 +791,7 @@ describe("ChatGPTPlugin", () => {
       })
       const grandchild = yield* sessions.create({ parentID: child.id })
       expect((yield* request(Provider.ID.openai, "https://api.openai.com/v1", grandchild.id)).headers).toEqual({
-        "session-id": parent.id,
+        "session-id": child.id,
         "thread-id": grandchild.id,
         "x-client-request-id": grandchild.id,
       })

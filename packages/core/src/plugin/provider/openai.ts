@@ -310,11 +310,12 @@ export const OpenAIPlugin = define({
           if (!chatgpt) return
           if (evt.baseURL && URL.canParse(evt.baseURL) && new URL(evt.baseURL).origin === "https://api.openai.com")
             evt.baseURL = codexBaseURL
+          const session = yield* ctx.session
+            .get({ sessionID: evt.sessionID })
+            .pipe(Effect.orElseSucceed(() => undefined))
           evt.headers.originator = "opencode"
-          // ChatGPT routes its prompt cache on this header, so children and forks share their root's.
-          evt.headers["session-id"] = yield* SessionAffinity.get(evt.sessionID, (sessionID) =>
-            ctx.session.get({ sessionID }).pipe(Effect.orElseSucceed(() => undefined)),
-          )
+          // ChatGPT routes its prompt cache on this header, so children share the parent's.
+          evt.headers["session-id"] = session ? SessionAffinity.get(session) : evt.sessionID
         }),
       { providerID: Provider.ID.openai },
     )

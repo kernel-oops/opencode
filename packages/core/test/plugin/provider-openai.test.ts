@@ -181,7 +181,7 @@ describe("OpenAIPlugin", () => {
       expect(childRequest.headers).toMatchObject({ "session-id": parent.id })
       const grandchild = yield* sessions.create({ parentID: child.id })
       expect((yield* request(Provider.ID.openai, "https://api.openai.com/v1", grandchild.id)).headers).toMatchObject({
-        "session-id": parent.id,
+        "session-id": child.id,
         originator: "opencode",
       })
       const eligible = required(yield* models.get(Provider.ID.openai, Model.ID.make("gpt-5.6-sol")))

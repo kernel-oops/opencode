@@ -6071,7 +6071,7 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0]?.promptCacheKey).toBe(parentID)
   })
 
-  scenario("uses root cache affinity for nested child model requests", function* (s) {
+  scenario("without a plugin retains upstream immediate-parent affinity for nested children", function* (s) {
     const rootID = Session.ID.make(`ses_${"a".repeat(64)}`)
     const parentID = Session.ID.make("ses_runner_nested_parent")
     const adopt = (id: Session.ID, parent: Session.ID) =>
@@ -6086,15 +6086,15 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests[0]?.http?.headers).toMatchObject({
       "x-opencode-session-id": sessionID,
       "x-opencode-parent-session-id": parentID,
-      "x-session-affinity": rootID,
-      "X-Session-Id": rootID,
+      "x-session-affinity": parentID,
+      "X-Session-Id": parentID,
       "x-parent-session-id": parentID,
-      "x-opencode-session": rootID,
+      "x-opencode-session": parentID,
     })
-    expect(s.requests[0]?.promptCacheKey).toBe("a".repeat(64))
+    expect(s.requests[0]?.promptCacheKey).toBe(parentID)
   })
 
-  scenario("uses root cache affinity for every fork in a fork chain", function* (s) {
+  scenario("without a plugin retains upstream immediate-source affinity for forks", function* (s) {
     const rootID = Session.ID.make("ses_runner_fork_root")
     const middleID = Session.ID.make("ses_runner_fork_middle")
     const fork = (id: Session.ID, source: Session.ID) =>
@@ -6115,14 +6115,14 @@ describe("SessionRunnerLLM", () => {
         .pipe(Effect.andThen(s.session.resume(id))),
     )
 
-    expect(s.requests.map((request) => request.promptCacheKey)).toEqual([rootID, rootID, rootID])
+    expect(s.requests.map((request) => request.promptCacheKey)).toEqual([rootID, rootID, middleID])
     expect(s.requests.map((request) => request.http?.headers)).toEqual(
-      [rootID, middleID, sessionID].map((id) =>
+      [rootID, middleID, sessionID].map((id, index) =>
         expect.objectContaining({
           "x-opencode-session-id": id,
-          "x-session-affinity": rootID,
-          "X-Session-Id": rootID,
-          "x-opencode-session": rootID,
+          "x-session-affinity": index === 2 ? middleID : rootID,
+          "X-Session-Id": index === 2 ? middleID : rootID,
+          "x-opencode-session": index === 2 ? middleID : rootID,
         }),
       ),
     )

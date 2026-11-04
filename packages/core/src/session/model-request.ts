@@ -375,7 +375,7 @@ export const layer = Layer.effect(
       const entries = Object.entries(shaped.options)
       const generation = Object.fromEntries(entries.filter(([k]) => GENERATION_KEYS.has(k))) as GenerationOptionsFields
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
-      const affinity = yield* SessionAffinity.get(session.id, store.get)
+      const affinity = SessionAffinity.get(session)
       const base = ai.request({
         model: model.model,
         http: {
