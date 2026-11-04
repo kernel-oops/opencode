@@ -127,10 +127,14 @@ export const Outcome = Schema.Literals([
 })
 export type Outcome = typeof Outcome.Type
 
+export const Delivery = Schema.Literals(["steer", "queue"]).annotate({ identifier: "Schedule.Delivery" })
+export type Delivery = typeof Delivery.Type
+
 export const Info = Schema.Struct({
   id: ID,
   sessionID: SessionID.pipe(optional),
   name: Schema.String.pipe(optional),
+  delivery: Delivery,
   when: When,
   tz: Schema.String,
   if: Condition.pipe(optional),
@@ -151,6 +155,7 @@ export type Info = typeof Info.Type
 export const CreateInput = Schema.Struct({
   sessionID: SessionID,
   name: Schema.String.pipe(optional),
+  delivery: Delivery.pipe(optional),
   when: When.pipe(optional),
   if: Condition.pipe(optional),
   until: Condition.pipe(optional),
@@ -213,6 +218,7 @@ export type ConditionInput = typeof ConditionInput.Type
 /** A schedule as callers describe it: when it fires, optional condition, when it stops, and the prompt it sends. */
 export const Request = Schema.Struct({
   name: Schema.String.pipe(optional).annotate({ description: "A short label for the schedule." }),
+  delivery: Delivery.pipe(optional).annotate({ description: '"steer" (default) interrupts at the next step boundary; "queue" waits until the current turn ends.' }),
   when: WhenInput.pipe(optional).annotate({
     description:
       'When it fires: { in: "20 minutes" }, { at: "2026-10-27T09:00" }, { every: "1 hour" } or { cron: "0 9 * * 1-5" }. Optional with `until` (defaults to { every: "30 seconds" }).',
@@ -237,6 +243,7 @@ export type Request = typeof Request.Type
 export const toCreateInput = (sessionID: SessionID, request: Request): CreateInput => ({
   sessionID,
   name: request.name,
+  delivery: request.delivery,
   when: request.when === undefined ? undefined : toWhen(request.when),
   if: request.if === undefined ? undefined : toCondition(request.if),
   until: request.until === undefined ? undefined : toCondition(request.until),

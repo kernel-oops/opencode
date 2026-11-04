@@ -14,6 +14,7 @@ import { Schedule } from "../../schedule.js"
 export const View = Schema.Struct({
   id: Schedule.ID,
   name: Schema.String.pipe(optional),
+  delivery: Schedule.Delivery,
   when: Schedule.When,
   tz: Schema.String,
   if: Schedule.Condition.pipe(optional),
@@ -205,6 +206,7 @@ function summary(view: View) {
   return [
     `${view.id}${view.name ? ` "${view.name}"` : ""}: ${trigger} (${view.tz})`,
     gate,
+    `delivery ${view.delivery}`,
     view.status,
     view.nextDueAt && `next ${view.nextDueAt}`,
     `prompt: ${JSON.stringify(prompt)}`,
@@ -225,6 +227,7 @@ function toView(info: Schedule.Info): View {
   return {
     id: info.id,
     name: info.name,
+    delivery: info.delivery,
     when: info.when,
     tz: info.tz,
     if: info.if,

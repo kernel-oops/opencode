@@ -16,6 +16,7 @@ export const ScheduleTable = sqliteTable(
       .$type<SessionSchema.ID>()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     name: text(),
+    delivery: text().$type<Schedule.Delivery>(),
     action: text({ mode: "json" }).$type<Schedule.Action>().notNull(),
     check: text({ mode: "json" }).$type<Schedule.StoredCheck>(),
     when: text({ mode: "json" }).$type<Schedule.When>().notNull(),

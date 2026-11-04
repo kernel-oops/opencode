@@ -23278,6 +23278,9 @@
           "name": {
             "type": "string"
           },
+          "delivery": {
+            "$ref": "#/components/schemas/Schedule.Delivery"
+          },
           "when": {
             "$ref": "#/components/schemas/Schedule.WhenInput"
           },
@@ -23298,6 +23301,10 @@
         },
         "required": ["sessionID", "prompt"],
         "additionalProperties": false
+      },
+      "Schedule.Delivery": {
+        "type": "string",
+        "enum": ["steer", "queue"]
       },
       "Schedule.Duration": {
         "type": "string",
@@ -23335,6 +23342,9 @@
           },
           "name": {
             "type": "string"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/Schedule.Delivery"
           },
           "when": {
             "$ref": "#/components/schemas/Schedule.When"
@@ -23393,7 +23403,7 @@
             "additionalProperties": false
           }
         },
-        "required": ["id", "when", "tz", "action", "status", "runCount", "time"],
+        "required": ["id", "delivery", "when", "tz", "action", "status", "runCount", "time"],
         "additionalProperties": false
       },
       "Schedule.Outcome": {

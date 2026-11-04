@@ -25,7 +25,7 @@ import { RequestExecutor, type WebSocketConnector } from "@opencode/ai/route"
 import { TestLLM } from "@opencode/ai/testing"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Database } from "@opencode/core/database/database"
-import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { makeGlobalNode, makeLocationNode } from "@opencode/util/effect/app-node"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode/core/effect/app-node-platform"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -35,6 +35,12 @@ import { App } from "@opencode/core/app"
 import { Permission } from "@opencode/core/permission"
 import { EventSequenceTable, EventTable } from "@opencode/core/event/sql"
 import { Project } from "@opencode/core/project"
+import { Schedule } from "@opencode/core/schedule"
+import { Image } from "@opencode/core/image"
+import { Skill } from "@opencode/core/skill"
+import type { FileSystem } from "@opencode/core/filesystem"
+import type { LocationServices } from "@opencode/core/location-services"
+import { ConfigExperimental } from "@opencode/schema/config/experimental"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { Form } from "@opencode/core/form"
 import { Job } from "@opencode/core/job"
@@ -87,11 +93,10 @@ import { SessionSystemPrompt } from "@opencode/core/session/system-prompt"
 import { ID, Model } from "@opencode/core/model"
 import { Location } from "@opencode/core/location"
 import { Provider } from "@opencode/core/provider"
-import { Cause, Context, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Scope, Stream } from "effect"
+import { Cause, Context, DateTime, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Queue, Schema, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { asc, desc, eq, sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
-import { promptLocationNode } from "./fixture/prompt-location"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { Expected } from "./lib/session-message"
 import { permissionLayer } from "./lib/permission"
@@ -435,6 +440,7 @@ const makeLayer = (actualPermissions = false) =>
         new Document({
           type: "document",
           info: new Info({
+            experimental: new ConfigExperimental.Info({ schedules: true }),
             compaction: new ConfigCompaction.Info({
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
@@ -442,6 +448,21 @@ const makeLayer = (actualPermissions = false) =>
           }),
         }),
       ])
+      const scheduleLocations = makeGlobalNode({
+        service: LocationServiceMap.Service,
+        layer: Layer.effect(LocationServiceMap.Service, Effect.gen(function* () {
+          const bus = yield* Bus.Service
+          return yield* LayerMap.make((_ref: Location.Ref) =>
+            Layer.merge(config, LayerNode.compile(LayerNode.group([PluginHooks.node, Image.node, Skill.node, Plugin.node]), {
+              replacements: [
+                Bus.node.replace(Layer.succeed(Bus.Service, bus)),
+                Plugin.node.replace(Layer.mock(Plugin.Service, { awaitActivation: Effect.void })),
+              ],
+            })) as unknown as Layer.Layer<LocationServices, FileSystem.DirectoryNotFoundError>,
+          )
+        })),
+        deps: [Bus.node],
+      })
       const promptModels = Layer.mock(Model.Service, {
         get: () => Effect.undefined,
         all: () => Effect.succeed([]),
@@ -550,11 +571,12 @@ const makeLayer = (actualPermissions = false) =>
           SessionRunnerLLM.node,
           SessionExecution.node,
           Session.node,
+          Schedule.node,
         ]),
         [
           ...replacements,
           Bus.node.replace(Bus.configured({ persist: true })),
-          LocationServiceMap.node.replace(promptLocationNode),
+          LocationServiceMap.node.replace(scheduleLocations),
           Model.node.replace(promptModels),
           SessionExecution.node.replace(execution),
         ],
@@ -1217,6 +1239,50 @@ for (const late of [false, true])
 
 // Nominal retry gaps: exponential from 2s capped at 10s, for 10 retries.
 // Nominal retry gaps: exponential from 2s capped at 10s, for 10 retries.
+for (const delivery of ["steer", "queue"] as const) {
+  scenario(`scheduled ${delivery} respects the active turn boundary`, function* (s) {
+    const schedules = yield* Schedule.Service
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const tools = yield* Tool.Service
+    yield* transformTools(tools, {
+      blocked: {
+        name: "blocked",
+        description: "Hold the first step",
+        input: Schema.Struct({}),
+        execute: () => Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+          return { content: "done" }
+        }),
+      },
+    }, { codemode: false })
+    yield* s.admit("Start")
+    yield* s.llm.push(
+      TestLLM.toolCalls(LLMEvent.toolCall({ id: "scheduled-block", name: "blocked", input: {} })),
+      TestLLM.stop(),
+      TestLLM.stop(),
+    )
+    const schedule = yield* schedules.create({
+      sessionID,
+      delivery,
+      when: { type: "in", in: "1 minute" },
+      action: { type: "prompt", prompt: "Scheduled input" },
+    })
+    const run = yield* s.resume.pipe(Effect.forkScoped)
+    yield* Deferred.await(entered)
+    yield* TestClock.adjust("1 minute")
+    yield* schedules.tick
+    expect((yield* s.inbox).some((item) => item.id === `msg_${schedule.id}_1`)).toBe(true)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(run)
+    const next = delivery === "steer" ? 1 : 2
+    expect(userTexts(s.requests[next])).toContain("Scheduled input")
+    if (delivery === "queue") expect(userTexts(s.requests[1])).not.toContain("Scheduled input")
+    expect(yield* s.inbox).toEqual([])
+  })
+}
+
 const RETRY_GAPS = [2_000, 4_000, 8_000, ...Array<number>(7).fill(10_000)]
 
 for (const delivery of ["steer", "queue"] as const) {

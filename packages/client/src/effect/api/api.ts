@@ -2925,6 +2925,7 @@ export type ExperimentalPersistentPtyConnectTokenOperation<E = never> = (
 export type ExperimentalScheduleCreateInput = {
   readonly sessionID: Session.ID
   readonly name?: string | undefined
+  readonly delivery?: Schedule.Delivery | undefined
   readonly when?: Schedule.WhenInput | undefined
   readonly if?: Schedule.ConditionInput | undefined
   readonly until?: Schedule.ConditionInput | undefined

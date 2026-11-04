@@ -418,6 +418,8 @@ export type PersistentPtyHandoff = { directory: string; instanceID: string; tick
 
 export type ScheduleID = string
 
+export type ScheduleDelivery = "steer" | "queue"
+
 export type ScheduleDuration = string
 
 export type ScheduleWhenAt = { type: "at"; at: string; tz?: string }
@@ -2913,6 +2915,7 @@ export type ScheduleInfo = {
   id: ScheduleID
   sessionID?: SessionID
   name?: string
+  delivery: ScheduleDelivery
   when: ScheduleWhen
   tz: string
   if?: ScheduleCondition
@@ -4966,6 +4969,7 @@ export type ExperimentalMediaGetOutput = globalThis.Uint8Array
 export type ExperimentalScheduleCreateInput = {
   readonly sessionID: string
   readonly name?: string | undefined
+  readonly delivery?: ("steer" | "queue") | undefined
   readonly when?:
     | (
         | {

@@ -50,6 +50,7 @@ const memory = () => {
           id: Schedule.ID.make(`sch_${rows.size + 1}`),
           sessionID: input.sessionID,
           name: input.name,
+          delivery: input.delivery ?? "steer",
           when: input.when ?? { type: "every", every: "30 seconds" },
           tz: "America/New_York",
           if: input.if,
@@ -160,12 +161,14 @@ describe("ScheduleTools", () => {
       expect(
         yield* run(registry, "schedule_create", {
           name: "build",
+          delivery: "queue",
           when: { in: "20 minutes" },
           prompt: "check the build",
         }),
       ).toMatchObject({
         id: "sch_1",
         name: "build",
+        delivery: "queue",
         when: { type: "in", in: "20 minutes" },
         prompt: "check the build",
         status: "active",
@@ -174,7 +177,7 @@ describe("ScheduleTools", () => {
       expect([...rows.values()][0]).toMatchObject({ sessionID, action: { type: "prompt", prompt: "check the build" } })
 
       expect(yield* run(registry, "schedule_list", {})).toMatchObject({
-        schedules: [{ id: "sch_1", status: "active" }],
+        schedules: [{ id: "sch_1", status: "active", delivery: "queue" }],
       })
       expect(yield* run(registry, "schedule_pause", { id: "sch_1" })).toMatchObject({ status: "paused" })
       expect(yield* run(registry, "schedule_resume", { id: "sch_1" })).toMatchObject({ status: "active" })
@@ -238,14 +241,14 @@ describe("ScheduleTools", () => {
       expect(
         yield* direct(registry, "schedule_create", { name: "ci", when: { every: "1 hour" }, prompt: "check CI" }),
       ).toBe(
-        'Scheduled: sch_1 "ci": every 1 hour (America/New_York), active, next 2026-10-27T09:20:00.000-04:00, prompt: "check CI"',
+        'Scheduled: sch_1 "ci": every 1 hour (America/New_York), delivery steer, active, next 2026-10-27T09:20:00.000-04:00, prompt: "check CI"',
       )
       yield* direct(registry, "schedule_create", { when: { cron: "0 9 * * 1-5" }, prompt: "x".repeat(100) })
       yield* direct(registry, "schedule_pause", { id: "sch_2" })
       const list = yield* direct(registry, "schedule_list", {})
       expect(list?.split("\n").slice(1)).toEqual([
-        'sch_1 "ci": every 1 hour (America/New_York), active, next 2026-10-27T09:20:00.000-04:00, prompt: "check CI"',
-        `sch_2: cron "0 9 * * 1-5" (America/New_York), paused, next 2026-10-27T09:20:00.000-04:00, prompt: "${"x".repeat(79)}…"`,
+        'sch_1 "ci": every 1 hour (America/New_York), delivery steer, active, next 2026-10-27T09:20:00.000-04:00, prompt: "check CI"',
+        `sch_2: cron "0 9 * * 1-5" (America/New_York), delivery steer, paused, next 2026-10-27T09:20:00.000-04:00, prompt: "${"x".repeat(79)}…"`,
       ])
       expect(list).toStartWith("Now: ")
     }),
@@ -289,13 +292,13 @@ describe("ScheduleTools", () => {
           if: { run: "git status -s", changes: true },
           prompt: "working tree changed",
         }),
-      ).toContain('if "git status -s", active')
+      ).toContain('if "git status -s", delivery steer, active')
       expect(
         yield* direct(registry, "schedule_create", {
           until: { code: "return (await tools.slack.read_thread({})).ok" },
           prompt: "thread ok",
         }),
-      ).toContain('until code "return (await tools.slack.read_thread({})).ok", active')
+      ).toContain('until code "return (await tools.slack.read_thread({})).ok", delivery steer, active')
       expect(
         yield* call(registry, "schedule_create", {
           until: { run: "true", code: "return true" },

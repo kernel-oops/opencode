@@ -1676,6 +1676,7 @@ const EndpointExperimentalScheduleCreate =
         payload: {
           sessionID: input["sessionID"],
           name: input["name"],
+          delivery: input["delivery"],
           when: input["when"],
           if: input["if"],
           until: input["until"],

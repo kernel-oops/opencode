@@ -9,6 +9,7 @@ import {
   Condition,
   ConditionInput,
   CreateInput,
+  Delivery,
   durationMillis,
   type Ends,
   ID,
@@ -34,7 +35,7 @@ import { SessionInboxTable } from "./session/sql.js"
 import { ScheduleCheck } from "./schedule/check.js"
 import { ScheduleTable } from "./schedule/sql.js"
 
-export { ID, Info, CreateInput, Request, Condition, ConditionInput, When, Status, Outcome, toCreateInput }
+export { ID, Info, CreateInput, Delivery, Request, Condition, ConditionInput, When, Status, Outcome, toCreateInput }
 
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("Schedule.NotFoundError", {
   scheduleID: ID,
@@ -186,6 +187,7 @@ const toInfo = (row: Row, lastOutput?: string): Info => ({
   id: row.id,
   sessionID: row.session_id ?? undefined,
   name: row.name ?? undefined,
+  delivery: row.delivery ?? "steer",
   when: row.when,
   tz: row.tz,
   if: row.check?.mode === "if" ? row.check.condition : undefined,
@@ -269,7 +271,7 @@ const layer = Layer.effect(
         sessionID,
         id,
         text,
-        delivery: "steer",
+        delivery: row.delivery ?? "steer",
         metadata: {
           schedule: {
             id: row.id,
@@ -768,6 +770,7 @@ const layer = Layer.effect(
               id: scheduleID,
               session_id: session.id,
               name: input.name ?? null,
+              delivery: input.delivery ?? null,
               check: check ?? null,
               state: seeded.state,
               checks: 1,
@@ -797,6 +800,7 @@ const layer = Layer.effect(
             id: scheduleID,
             session_id: session.id,
             name: input.name ?? null,
+            delivery: input.delivery ?? null,
             check: check ?? null,
             state: seeded.state,
             checks: seeded.checks,

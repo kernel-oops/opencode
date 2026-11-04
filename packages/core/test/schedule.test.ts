@@ -366,6 +366,7 @@ describe("Schedule", () => {
         action: { type: "prompt", prompt: "check the build" },
       })
       expect(schedule.tz).toBe("America/New_York")
+      expect(schedule.delivery).toBe("steer")
 
       yield* TestClock.adjust("4 minutes")
       yield* schedules.tick
@@ -391,6 +392,27 @@ describe("Schedule", () => {
       yield* TestClock.adjust("10 minutes")
       yield* schedules.tick
       expect(yield* pending).toEqual([messageID(schedule, 1)])
+    }),
+  )
+
+  it.effect("keeps a queued wake until the next turn boundary and promotes it once", () =>
+    Effect.gen(function* () {
+      const schedules = yield* setup()
+      const schedule = yield* schedules.create({
+        sessionID,
+        delivery: "queue",
+        when: { type: "in", in: "1 minute" },
+        action: { type: "prompt", prompt: "queued wake" },
+      })
+      yield* TestClock.adjust("1 minute")
+      yield* schedules.tick
+      const { db } = yield* Database.Service
+      const bus = yield* Bus.Service
+      expect(yield* SessionInbox.promote(db, bus, sessionID, "steer")).toBe(0)
+      expect(yield* pending).toEqual([messageID(schedule, 1)])
+      expect(yield* SessionInbox.promote(db, bus, sessionID, "input")).toBe(1)
+      expect(yield* SessionInbox.promote(db, bus, sessionID, "input")).toBe(0)
+      expect(yield* pending).toEqual([])
     }),
   )
 
@@ -482,6 +504,7 @@ describe("Schedule", () => {
       const schedules = yield* setup()
       const schedule = yield* schedules.create({
         sessionID,
+        delivery: "queue",
         when: { type: "every", every: "10 minutes" },
         action: { type: "prompt", prompt: "poll" },
       })
@@ -492,10 +515,45 @@ describe("Schedule", () => {
       expect(yield* pending).toEqual([messageID(schedule, 1)])
       const { db } = yield* Database.Service
       expect(yield* SessionInbox.find(db, messageID(schedule, 1))).toMatchObject({
+        delivery: "queue",
         payload: { metadata: { schedule: { id: schedule.id, run: 1, late: true } } },
       })
-      expect(yield* schedules.get(schedule.id)).toMatchObject({ runCount: 1, lastOutcome: "late" })
+      expect(yield* schedules.get(schedule.id)).toMatchObject({ delivery: "queue", runCount: 1, lastOutcome: "late" })
       expect(iso((yield* schedules.get(schedule.id)).nextDueAt)).toBe("2026-10-26T13:10:00.000Z")
+    }),
+  )
+
+  it.effect("recovers a queued schedule after a crash before prompt admission", () =>
+    Effect.gen(function* () {
+      const schedules = yield* setup()
+      const schedule = yield* schedules.create({
+        sessionID,
+        delivery: "queue",
+        when: { type: "in", in: "1 minute" },
+        action: { type: "prompt", prompt: "once" },
+      })
+      yield* TestClock.adjust("1 minute")
+      // The process died with the due schedule still stored and no prompt admitted.
+      expect(yield* pending).toEqual([])
+      yield* schedules.tick
+      const { db } = yield* Database.Service
+      expect(yield* SessionInbox.find(db, messageID(schedule, 1))).toMatchObject({ delivery: "queue" })
+      expect(yield* schedules.get(schedule.id)).toMatchObject({ status: "done", runCount: 1 })
+    }),
+  )
+
+  it.effect("admits schedules without a delivery option as steer", () =>
+    Effect.gen(function* () {
+      const schedules = yield* setup()
+      const schedule = yield* schedules.create({
+        sessionID,
+        when: { type: "in", in: "1 minute" },
+        action: { type: "prompt", prompt: "once" },
+      })
+      yield* TestClock.adjust("1 minute")
+      yield* schedules.tick
+      const { db } = yield* Database.Service
+      expect(yield* SessionInbox.find(db, messageID(schedule, 1))).toMatchObject({ delivery: "steer" })
     }),
   )
 
@@ -529,15 +587,18 @@ describe("Schedule", () => {
       const sessions = yield* Session.Service
       const schedule = yield* schedules.create({
         sessionID,
+        delivery: "queue",
         when: { type: "in", in: "1 minute" },
         action: { type: "prompt", prompt: "once" },
       })
       yield* TestClock.adjust("1 minute")
       // The previous process admitted run 1 and died before advancing the row.
-      yield* sessions.prompt({ sessionID, id: messageID(schedule, 1), text: "once", resume: false })
+      yield* sessions.prompt({ sessionID, id: messageID(schedule, 1), text: "once", delivery: "queue", resume: false })
 
       yield* schedules.tick
       expect(yield* pending).toEqual([messageID(schedule, 1)])
+      const { db } = yield* Database.Service
+      expect(yield* SessionInbox.find(db, messageID(schedule, 1))).toMatchObject({ delivery: "queue" })
       expect(wakes).toEqual([sessionID])
       expect(yield* schedules.get(schedule.id)).toMatchObject({ status: "done", runCount: 1 })
     }),
