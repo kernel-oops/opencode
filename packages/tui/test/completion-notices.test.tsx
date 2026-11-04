@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { type Renderable, ScrollBoxRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
+import { isolatedGlobal } from "./fixture/app"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
 
@@ -83,7 +83,7 @@ test.each([40, 120])("shell completion notices do not navigate at width %s", asy
     if (url.pathname === `/api/session/${session.id}/permission`) return json({ data: [] })
     return undefined
   }, createEventStream())
-  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.serve(request) })
   const { run } = await import("../src/app")
   const task = Effect.runPromise(
     run({
@@ -97,7 +97,7 @@ test.each([40, 120])("shell completion notices do not navigate at width %s", asy
       args: { sessionID: session.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitForFrame((frame) => frame.includes("Shell cancelled"))
@@ -165,7 +165,7 @@ test.each([40, 120])("subagent completion notices navigate to the child session 
     if (url.pathname.endsWith("/inbox") || url.pathname.endsWith("/permission")) return json({ data: [] })
     return undefined
   }, createEventStream())
-  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.serve(request) })
   const { run } = await import("../src/app")
   const task = Effect.runPromise(
     run({
@@ -179,7 +179,7 @@ test.each([40, 120])("subagent completion notices navigate to the child session 
       args: { sessionID: parent.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitForFrame((frame) => frame.includes("General finished"))

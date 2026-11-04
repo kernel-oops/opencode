@@ -3,7 +3,7 @@ import { EmbeddedTerminalRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import type { ServerWebSocket } from "bun"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
+import { isolatedGlobal } from "./fixture/app"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
 
@@ -167,7 +167,7 @@ async function start(enabled: boolean) {
         if (client) counter.upgrades++
         return undefined
       }
-      return calls.fetch(request)
+      return calls.serve(request)
     },
     websocket: {
       data: {} as { url: URL },
@@ -201,7 +201,7 @@ async function start(enabled: boolean) {
       args: { sessionID: open.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   return {
     setup,

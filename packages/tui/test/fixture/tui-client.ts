@@ -64,6 +64,11 @@ export function createEventStream() {
   }
 }
 
+// A throw from a Bun.serve handler is reported against whichever test happens to be running, and Bun
+// abandons that test mid-body, so its app is never torn down and keeps requesting (2026-10-30 OOM).
+// Servers use serve, which answers 500 instead; the preload fails the owning test from this list.
+export const unexpectedRequests: Error[] = []
+
 export type FetchHandler = (url: URL, request: Request) => Response | undefined | Promise<Response | undefined>
 
 export function createFetch(override?: FetchHandler, events?: ReturnType<typeof createEventStream>) {
@@ -177,7 +182,12 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
     throw new Error(`unexpected request: ${url.pathname}`)
   }
   fetch.preconnect = () => {}
-  return { fetch, session }
+  const serve = (request: Request) =>
+    fetch(request).catch((error: Error) => {
+      unexpectedRequests.push(error)
+      return new Response(error.message, { status: 500 })
+    })
+  return { fetch, serve, session }
 }
 
 export function createApi(fetch: typeof globalThis.fetch) {

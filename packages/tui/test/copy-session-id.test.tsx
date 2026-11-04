@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test"
 import { InputRenderable, TextareaRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
+import { isolatedGlobal } from "./fixture/app"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
 
@@ -33,7 +33,7 @@ test.each(["success", "failure", "home"])("Copy session ID from Ctrl+P (%s)", as
       return json({ data: [] })
     return undefined
   }, events)
-  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.serve(request) })
   const { run } = await import("../src/app")
   const task = Effect.runPromise(
     run({
@@ -44,7 +44,7 @@ test.each(["success", "failure", "home"])("Copy session ID from Ctrl+P (%s)", as
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       args: mode === "home" ? {} : { sessionID },
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitFor(() => setup.renderer.currentFocusedEditor instanceof TextareaRenderable)

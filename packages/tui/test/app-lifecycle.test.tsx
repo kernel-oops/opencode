@@ -2,7 +2,6 @@ import { expect, spyOn, test } from "bun:test"
 import { EmbeddedTerminalRenderable, type Renderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
 import * as Open from "@opencode/util/open"
 import { waitForGoUpsellConnect } from "../src/component/dialog-go-upsell"
 import { GoUpsellArtRenderable } from "../src/component/go-upsell-art"
@@ -11,7 +10,7 @@ import path from "node:path"
 import { Writable } from "node:stream"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
-import { createAppFixture } from "./fixture/app"
+import { createAppFixture, isolatedGlobal } from "./fixture/app"
 import { waitForHighlightedFrame } from "./fixture/frame"
 import type { PluginInfo } from "@opencode/client"
 
@@ -262,7 +261,7 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
   const listeners = new Set(process.listeners("SIGHUP"))
   const events = createEventStream()
   const calls = createFetch(undefined, events)
-  const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, fetch: (request) => calls.serve(request) })
   try {
     const { run } = await import("../src/app")
     const task = Effect.runPromise(
@@ -274,7 +273,7 @@ test("SIGHUP clears title and disposes scoped resources once", async () => {
         terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
         args: {},
         log: () => {},
-      }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+      }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
     )
     await ready
     process.emit("SIGHUP")
@@ -334,7 +333,7 @@ test("session lifecycle updates the terminal title and prints the epilogue after
       return json({ data: {} })
     }
   }, events)
-  const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, fetch: (request) => calls.serve(request) })
   const originalWrite = process.stdout.write.bind(process.stdout)
   let stdout = ""
   process.stdout.write = ((chunk: string | Uint8Array) => {
@@ -353,7 +352,7 @@ test("session lifecycle updates the terminal title and prints the epilogue after
         terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
         args: { sessionID: "dummy" },
         log: () => {},
-      }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+      }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
     )
 
     await initialTitleSet
@@ -416,7 +415,7 @@ test("session title generated while an untitled session is loading remains visib
     if (url.pathname === "/api/session/dummy/inbox") return json({ data: [] })
     if (url.pathname === "/api/session/dummy/permission") return json({ data: [] })
   }, events)
-  const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, fetch: (request) => calls.serve(request) })
 
   try {
     const { run } = await import("../src/app")
@@ -429,7 +428,7 @@ test("session title generated while an untitled session is loading remains visib
         terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
         args: { sessionID: "dummy" },
         log: () => {},
-      }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+      }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
     )
 
     await sessionRequested.promise
@@ -888,7 +887,7 @@ test("session startup prompt is submitted exactly once", async () => {
       return json({ data: {} })
     }
   }, events)
-  const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, fetch: (request) => calls.serve(request) })
 
   try {
     const { run } = await import("../src/app")
@@ -901,7 +900,7 @@ test("session startup prompt is submitted exactly once", async () => {
         terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
         args: { sessionID: "dummy", prompt: "RESUME_READY" },
         log: () => {},
-      }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+      }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
     )
 
     await Promise.race([
@@ -1443,7 +1442,7 @@ test.skipIf(process.platform === "win32").each(["manual", "select"] as const)(
       port: 0,
       fetch(request, server) {
         if (new URL(request.url).pathname.endsWith("/connect") && server.upgrade(request)) return undefined
-        return calls.fetch(request)
+        return calls.serve(request)
       },
       websocket: {
         open(socket) {
@@ -1474,7 +1473,7 @@ test.skipIf(process.platform === "win32").each(["manual", "select"] as const)(
           args: { sessionID: session.id },
           terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: ready.resolve }),
           log: () => {},
-        }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+        }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
       )
 
       await ready.promise

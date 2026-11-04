@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { BoxRenderable, EmbeddedTerminalRenderable, type Renderable, ScrollBoxRenderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
+import { isolatedGlobal } from "./fixture/app"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
 
@@ -63,7 +63,7 @@ test
     idleTimeout: 0,
     fetch(request, server) {
       if (new URL(request.url).pathname.endsWith("/connect") && server.upgrade(request)) return undefined
-      return calls.fetch(request)
+      return calls.serve(request)
     },
     websocket: {
       open(socket) {
@@ -86,7 +86,7 @@ test
       args: { sessionID: session.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitForFrame((frame) => frame.includes("History message 0019"))

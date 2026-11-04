@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
+import { isolatedGlobal } from "./fixture/app"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
@@ -54,7 +54,7 @@ test("clicking a backfilled thought group toggles it", async () => {
     if (url.pathname === `/api/session/${session.id}/inbox` || url.pathname === `/api/session/${session.id}/permission`)
       return json({ data: [] })
   }, createEventStream())
-  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, idleTimeout: 0, fetch: (request) => calls.serve(request) })
   const { run } = await import("../src/app")
   const task = Effect.runPromise(
     run({
@@ -65,7 +65,7 @@ test("clicking a backfilled thought group toggles it", async () => {
       args: { sessionID: session.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitForFrame((frame) => frame.includes("Turn 13 answer"))

@@ -7,6 +7,22 @@ import type { Config } from "../../src/config"
 import { tmpdir } from "./fixture"
 import { createEventStream, createFetch, type FetchHandler } from "./tui-client"
 
+// Every Global path lives under root (state is root itself unless given): a default would resolve to the
+// developer's real XDG directories, and the app discovers plugins from Global.config.
+export function isolatedGlobal(root: string, state = root) {
+  return Global.layerWith({
+    home: path.join(root, "home"),
+    data: path.join(root, "data"),
+    cache: path.join(root, "cache"),
+    config: path.join(root, "config"),
+    state,
+    bin: path.join(root, "cache", "bin"),
+    log: path.join(root, "data", "log"),
+    repos: path.join(root, "data", "repos"),
+    tmp: path.join(root, "tmp"),
+  })
+}
+
 export async function createAppFixture(
   input: {
     width?: number
@@ -35,7 +51,7 @@ export async function createAppFixture(
   const calls = createFetch(input.fetch, events)
   // Updates apply to a copy, as a config file would, so preference writes persist for the rest of the test.
   let config: Config.Info = structuredClone(input.config ?? { animations: false })
-  const server = Bun.serve({ port: 0, fetch: (request) => calls.fetch(request) })
+  const server = Bun.serve({ port: 0, fetch: (request) => calls.serve(request) })
   const task = Effect.runPromise(
     run({
       app: { name: "test", version: "test", channel: "test" },
@@ -54,19 +70,7 @@ export async function createAppFixture(
       args: input.args ?? {},
       log: () => {},
     }).pipe(
-      Effect.provide(
-        Global.layerWith({
-          home: path.join(root.path, "home"),
-          data: path.join(root.path, "data"),
-          cache: path.join(root.path, "cache"),
-          config: path.join(root.path, "config"),
-          state: input.state ?? path.join(root.path, "state"),
-          bin: path.join(root.path, "cache", "bin"),
-          log: path.join(root.path, "data", "log"),
-          repos: path.join(root.path, "data", "repos"),
-          tmp: path.join(root.path, "tmp"),
-        }),
-      ),
+      Effect.provide(isolatedGlobal(root.path, input.state ?? path.join(root.path, "state"))),
       Effect.provide(FileSystem.layerNoop({})),
     ),
   )
