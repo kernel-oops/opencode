@@ -7,9 +7,10 @@ import { ProviderCompatibility } from "../model-compatibility.js"
 import { Provider } from "../provider.js"
 import { optional } from "../schema.js"
 
-export const Settings = Schema.StructWithRest(Schema.Struct(Provider.Settings.schema.fields), [
-  Schema.Record(Schema.String, Schema.UndefinedOr(Schema.Json)),
-]).annotate({ identifier: "Config.Provider.Settings" })
+export const Settings = Schema.StructWithRest(
+  Schema.Struct(Provider.Settings.schema.fields),
+  [Schema.Record(Schema.String, Schema.UndefinedOr(Schema.Json))],
+).annotate({ identifier: "Config.Provider.Settings" })
 export type Settings = typeof Settings.Type
 
 export const ModelSettings = Schema.StructWithRest(Schema.Struct(Model.Settings.schema.fields), [
@@ -105,6 +106,8 @@ class ModelConfig extends Schema.Class<ModelConfig>("Config.Model")({
       .pipe(optional),
   }).pipe(Schema.Array, optional),
   cost: Schema.Union([Cost, Cost.pipe(Schema.Array)]).pipe(optional),
+  // Hide from model pickers without disabling explicit selections.
+  status: Schema.Literal("deprecated").pipe(optional),
   disabled: Schema.Boolean.pipe(optional),
   limit: Limit.pipe(optional),
 }) {}

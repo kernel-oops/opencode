@@ -35,6 +35,39 @@ function required<T>(value: T | undefined): T {
 const decode = Schema.decodeUnknownSync(Info)
 
 describe("ConfigProviderPlugin.Plugin", () => {
+  it.effect("keeps deprecated native aliases available and resolvable but out of automatic small-model selection", () =>
+    Effect.gen(function* () {
+      const models = yield* Model.Service
+      const providerID = Provider.ID.make("custom")
+      const normalized = ConfigNormalize.normalize({
+        providers: {
+          custom: {
+            package: "@opencode/ai/providers/openai/responses",
+            models: {
+              alias: { modelID: "upstream", status: "deprecated", family: "gemini-flash-lite", capabilities: { input: ["text"], output: ["text"] } },
+              active: { modelID: "upstream", family: "gemini-flash-lite", capabilities: { input: ["text"], output: ["text"] } },
+              disabled: { status: "deprecated", disabled: true },
+            },
+          },
+        },
+        provider: { legacy: { npm: "@ai-sdk/openai", models: { alias: { status: "deprecated" } } } },
+      })
+      if (normalized.type !== "normalized") throw new Error("Expected normalized config")
+      yield* addPlugin([new Document({ type: "document", info: decode(normalized.encoded) })])
+      const alias = required(yield* models.get(providerID, Model.ID.make("alias")))
+      const active = required(yield* models.get(providerID, Model.ID.make("active")))
+      expect(alias).toMatchObject({ status: "deprecated", enabled: true, modelID: "upstream" })
+      expect(active).toMatchObject({ status: "active", enabled: true, modelID: "upstream" })
+      const available = yield* models.available()
+      expect(available).toContainEqual(alias)
+      expect(available).toContainEqual(active)
+      expect(available.some((model) => model.id === "disabled" || model.providerID === "legacy")).toBe(false)
+      expect(yield* models.small(providerID)).toEqual(active)
+      expect(yield* ModelResolver.fromCatalogModel(alias)).toMatchObject({ id: "upstream", provider: "custom" })
+      expect(yield* models.get(Provider.ID.make("legacy"), Model.ID.make("alias"))).toMatchObject({ enabled: false })
+    }),
+  )
+
   it.effect("inherits the provider compaction setting with model overrides and rejects unsupported routes", () =>
     Effect.gen(function* () {
       const models = yield* Model.Service

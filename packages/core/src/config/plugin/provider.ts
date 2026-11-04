@@ -269,6 +269,7 @@ function overlay(
         },
       }))
     }
+    if (config.status !== undefined) model.status = config.status
     if (config.disabled !== undefined) model.enabled = !config.disabled
   })
 }
