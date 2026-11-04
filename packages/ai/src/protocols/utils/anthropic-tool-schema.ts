@@ -21,7 +21,6 @@ export const anthropicToolSchema = (schema: JsonSchema, name: string): JsonSchem
   // References into relocated locations need scope-aware pointer rewriting. Until that
   // is available, reject explicitly rather than change what a reference resolves to.
   const inspect = (value: unknown): void => {
-    if (Array.isArray(value)) return value.forEach(inspect)
     if (!isRecord(value)) return
     for (const [key, item] of Object.entries(value)) {
       if (["$ref", "$dynamicRef", "$recursiveRef"].includes(key) && typeof item === "string") {
@@ -36,7 +35,37 @@ export const anthropicToolSchema = (schema: JsonSchema, name: string): JsonSchem
         if (item.includes("#") && moved.includes(pointer))
           fail(`reference ${item} targets a relocated root keyword; use a root $defs reference instead`)
       }
-      inspect(item)
+      // Only schema-valued keywords introduce schema nodes. const/enum/default/examples
+      // are instance data, and names inside properties/$defs are not schema keywords.
+      if (
+        ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"].includes(key)
+      ) {
+        if (isRecord(item)) Object.values(item).forEach(inspect)
+        continue
+      }
+      if (["allOf", "anyOf", "oneOf", "prefixItems"].includes(key)) {
+        if (Array.isArray(item)) item.forEach(inspect)
+        continue
+      }
+      if (
+        [
+          "additionalProperties",
+          "unevaluatedProperties",
+          "additionalItems",
+          "unevaluatedItems",
+          "contains",
+          "propertyNames",
+          "not",
+          "if",
+          "then",
+          "else",
+          "contentSchema",
+          "items",
+        ].includes(key)
+      ) {
+        if (key === "items" && Array.isArray(item)) item.forEach(inspect)
+        else inspect(item)
+      }
     }
   }
   inspect(schema)

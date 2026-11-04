@@ -7,6 +7,22 @@ import { compileRequest } from "../src/route/client.js"
 import { it } from "./lib/effect.js"
 
 describe("Anthropic argument root projection", () => {
+  test("does not interpret instance data or property names as schema references", () => {
+    const literal = { $ref: "#/anyOf/0", $dynamicRef: "#/then", $recursiveRef: "#/%ZZ" }
+    const schema = {
+      type: "object",
+      anyOf: [{ required: ["a"] }, { required: ["b"] }],
+      properties: {
+        a: { const: literal, enum: [literal], default: literal, examples: [literal] },
+        $ref: { const: "#/anyOf/0" },
+      },
+      $defs: { $ref: { type: "string" } },
+    }
+    const projected = anthropicToolSchema(schema, "literal")
+    expect(projected.properties).toBe(schema.properties)
+    expect(projected.$defs).toBe(schema.$defs)
+    expect(projected.then).toEqual({ anyOf: schema.anyOf })
+  })
   test("keeps simultaneous applicators, conditionals, annotations and reference scope", () => {
     const schema = {
       type: "object",
