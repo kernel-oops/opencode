@@ -2,7 +2,15 @@ import { describe, expect } from "bun:test"
 import { Deferred, Effect, Fiber, Layer, Ref, Stream } from "effect"
 import { Headers, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/http"
 import { Socket } from "effect/socket"
-import { ai, AIError, HttpContext, InvalidProviderOutputError, isRetryable, TransportError } from "../src/effect.js"
+import {
+  ai,
+  AIError,
+  HttpContext,
+  InvalidProviderOutputError,
+  InvalidRequestError,
+  TransportError,
+  isRetryable,
+} from "../src/effect.js"
 import {
   LLMClient,
   RequestExecutor,
@@ -38,6 +46,17 @@ const expectAIError = (error: unknown) => {
 const largeProviderMessage = `Upstream request failed: ${"validation failed; ".repeat(1_000)}`
 
 describe("RequestExecutor", () => {
+  it.effect("preserves a typed local admission failure without a transport retry", () =>
+    Effect.gen(function* () {
+      const executor = yield* RequestExecutor.Service
+      const blocked = new AIError({
+        reason: new InvalidRequestError({ parameter: "contextBudget", message: "Local budget admission refused" }),
+      })
+      const error = yield* executor.execute(request, () => blocked).pipe(Effect.flip)
+      expect(error).toBe(blocked)
+      expect(isRetryable(error)).toBe(false)
+    }).pipe(Effect.provide(dynamicResponse(() => Effect.die("must not dispatch")))),
+  )
   it.effect("preserves externally captured HTTP errors without inventing response context", () =>
     Effect.sync(() => {
       const cause = new Error("upstream request failed")
@@ -959,6 +978,26 @@ describe("WebSocket channel execution", () => {
       const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(sseEvents(...frames))))
 
       expect(response.text).toBe("Hi")
+    }),
+  )
+
+  it.effect("preserves a local admission error and its payload through lazy WebSocket frames", () =>
+    Effect.gen(function* () {
+      class AdmissionError extends AIError {
+        readonly assessment = { estimated: 490_000 }
+      }
+      const original = new AdmissionError({
+        reason: new InvalidRequestError({ message: "Local request admission stopped before send", parameter: "admission" }),
+      })
+      const error = yield* LLMClient.generate(request, {
+        webSocket: {
+          execute: () => Effect.succeed({ frames: Stream.unwrap(Effect.fail(original)), complete: Effect.void }),
+        },
+      }).pipe(Effect.provide(fixedResponse("")), Effect.flip)
+
+      expect(error).toBe(original)
+      expect(error).toBeInstanceOf(AdmissionError)
+      expect(isRetryable(error)).toBe(false)
     }),
   )
 

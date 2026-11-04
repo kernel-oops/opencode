@@ -166,6 +166,7 @@ const httpError = (input: {
   readonly operation: HttpOperation
   readonly http?: HttpContext
 }) => {
+  if (input.error instanceof AIError) return input.error
   const request = HttpClientError.isHttpClientError(input.error) ? input.error.request : input.request
   const transportError = (failure: { readonly message: string; readonly code?: string | undefined }) =>
     new AIError({

@@ -491,12 +491,15 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
                 requireTerminalEvent(route),
                 Stream.mapError(
                   (error) =>
-                    new AIError({
+                    // Pre-dispatch controls carry local state; preserve them when there is no context to add.
+                    error.reason.http !== undefined || execution.http === undefined
+                      ? error
+                      : new AIError({
                       reason: AIErrorReason.make({
                         ...error.reason,
                         message: error.reason.message,
                         cause: error.reason.cause,
-                        http: error.reason.http ?? execution.http,
+                        http: execution.http,
                       }),
                     }),
                 ),
