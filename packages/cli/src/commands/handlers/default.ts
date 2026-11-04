@@ -20,7 +20,10 @@ export default Runtime.handler(Commands, (input) =>
   Effect.gen(function* () {
     const requestedDirectory = Option.getOrUndefined(input.directory)
     const requestedServer = Option.getOrUndefined(input.server)
-    if (requestedDirectory !== undefined) process.chdir(requestedDirectory)
+    // Alongside an explicit --server the directory names a path on that server, which need not
+    // exist on this machine, so it is forwarded to the TUI rather than entered locally.
+    const remoteDirectory = requestedServer === undefined ? undefined : requestedDirectory
+    if (requestedDirectory !== undefined && remoteDirectory === undefined) process.chdir(requestedDirectory)
     const preflight = UpdatePreflight.make()
     yield* Effect.addFinalizer(() => Effect.promise(() => preflight.close()))
     const serviceStarts = yield* Queue.unbounded<{
@@ -94,6 +97,7 @@ export default Runtime.handler(Commands, (input) =>
     const runPromise = Effect.runPromiseWith(context)
     const service = server.service
     yield* run({
+      directory: remoteDirectory,
       app: {
         name: process.env.OPENCODE_CLIENT ?? OPENCODE_ARTIFACT,
         version: OPENCODE_VERSION,

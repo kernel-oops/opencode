@@ -186,6 +186,8 @@ const appBindingCommands = [
 ] as const
 
 export type TuiInput = {
+  /** Project directory as the server sees it; defaults to this process's working directory. */
+  directory?: string
   app: TuiApp
   server: {
     endpoint: Endpoint
@@ -224,7 +226,8 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
     fetch: noTimeoutFetch,
   }
   const api = OpenCode.make(options)
-  const location = yield* Effect.tryPromise(() => api.file.list({ location: { directory: process.cwd() } })).pipe(
+  const requestedDirectory = input.directory ?? process.cwd()
+  const location = yield* Effect.tryPromise(() => api.file.list({ location: { directory: requestedDirectory } })).pipe(
     Effect.map((response) => response.location),
     // An explicitly requested directory must not silently fall back to the server's default project.
     Effect.catch((error) =>
@@ -346,7 +349,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                     >
                       <TuiPathsProvider
                         value={{
-                          cwd: process.cwd(),
+                          cwd: requestedDirectory,
                           home: global.home,
                           state: global.state,
                           worktree: global.data + "/worktree",
