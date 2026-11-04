@@ -149,6 +149,22 @@ it.live("attaches a client MCP server and routes its tools with the session", ()
   }),
 )
 
+it.live("Location shutdown closes attached stacks and refuses new attachments", () =>
+  Effect.gen(function* () {
+    const mcp = yield* Mcp.Service
+    const first = yield* clientServer("first", ["shared"])
+    const second = yield* clientServer("second", ["shared"])
+    const late = yield* clientServer("late", ["late"])
+    yield* mcp.attach("tui", first.client)
+    yield* mcp.attach("tui", second.client)
+    yield* mcp.shutdown
+    expect(yield* mcp.tools()).toEqual([])
+    expect(yield* mcp.callTool({ server: "tui", name: "shared" }).pipe(Effect.flip)).toBeInstanceOf(Mcp.NotFoundError)
+    expect(Exit.isFailure(yield* mcp.attach("late", late.client).pipe(Effect.exit))).toBe(true)
+    expect(yield* mcp.tools()).toEqual([])
+  }),
+)
+
 it.live("removes an attached entry when its scope closes", () =>
   Effect.gen(function* () {
     const mcp = yield* Mcp.Service

@@ -556,12 +556,15 @@ const permissions = Layer.mock(Permission.Service, {
     }),
 })
 const events = Layer.mock(Bus.Service, { subscribe: () => Stream.never })
+const toolLocation = Location.node.replace(Layer.succeed(Location.Service,
+  Location.Service.of(location({ directory: AbsolutePath.make("/synthetic") }))))
 const outputData = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-mcp-output-"))
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
     Mcp.node.replace(mcp),
     Permission.node.replace(permissions),
     Bus.node.replace(events),
+    toolLocation,
     Image.node.replace(imagePassthrough),
     Global.node.replace(Global.layerWith({ data: outputData })),
   ]),
@@ -821,6 +824,48 @@ test("reports a local MCP server as failed when the location has no execution pl
     }).pipe(Effect.provide(resourceMcpLayer(config, undefined, undefined, { environment }))),
   )
 })
+
+const testMcpShutdown = process.platform === "win32" ? test.skip : test
+testMcpShutdown("shutdown closes local servers and refuses to start them again", async () => {
+  // A unique argument identifies this test's server process on the host.
+  const marker = `mcp-shutdown-${crypto.randomUUID()}`
+  const running = () =>
+    Effect.promise(async () => {
+      const found = Bun.spawnSync(["pgrep", "-f", marker])
+      return found.stdout.toString().trim().split("\n").filter(Boolean).length
+    })
+  const config = new ConfigMCP.Local({
+    type: "local",
+    command: [process.execPath, path.join(import.meta.dir, "fixture/mcp-output-schema.ts"), marker],
+  })
+
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const service = yield* Mcp.Service
+      expect(yield* settled(service)).toEqual({ status: "connected" })
+      expect(yield* running()).toBe(1)
+
+      yield* service.shutdown
+
+      expect((yield* service.servers()).find((server) => server.name === "resources")?.status).toEqual({
+        status: "disabled",
+      })
+      expect(yield* service.tools()).toEqual([])
+      const stopped = yield* running().pipe(
+        Effect.repeat({ while: (count) => count > 0, schedule: Schedule.spaced("25 millis") }),
+        Effect.timeout("5 seconds"),
+      )
+      expect(stopped).toBe(0)
+
+      // A later start (for example a reconnect) must not respawn it.
+      yield* service.connect("resources")
+      expect((yield* service.servers()).find((server) => server.name === "resources")?.status).toEqual({
+        status: "disabled",
+      })
+      expect(yield* running()).toBe(0)
+    }).pipe(Effect.scoped, Effect.provide(resourceMcpLayer(config))),
+  )
+}, 15_000)
 
 test("rejects sends before the stdio transport is started", async () => {
   await Effect.runPromise(
@@ -2389,6 +2434,7 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
       Effect.provide(
         Layer.fresh(
           AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
+            toolLocation,
             Mcp.node.replace(
               Layer.mock(Mcp.Service, {
                 tools: () => Ref.get(catalog),
@@ -2431,6 +2477,7 @@ testEffect(Layer.empty).effect("coalesces queued MCP tool notifications after in
   }).pipe(
     Effect.provide(
       AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, Bus.node]), [
+        toolLocation,
         Mcp.node.replace(
           Layer.mock(Mcp.Service, {
             tools: () =>

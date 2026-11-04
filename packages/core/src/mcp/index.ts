@@ -130,6 +130,12 @@ export interface Interface extends State.Transformable<Editor> {
   readonly disconnect: (server: ServerName | string) => Effect.Effect<void, NotFoundError>
   readonly remove: (server: ServerName | string) => Effect.Effect<void, NotFoundError>
   /**
+   * Closes every connection for good when the Location shuts down. Running steps can keep an invalidated
+   * Location's graph (and so its scope) alive long after shutdown, so without this its stdio servers
+   * outlive it. Later starts, such as event-driven reconnects, are refused.
+   */
+  readonly shutdown: Effect.Effect<void>
+  /**
    * Attaches a client-hosted MCP server for the lifetime of the calling scope. Its tools are named after
    * `name` like any server's. Attaching a name again stacks the new connection on top: it serves the
    * name until it closes, then the most recent remaining connection takes over.
@@ -191,6 +197,7 @@ export const layer = (options?: Options) =>
       const callbacks = yield* FiberSet.makeRuntime<never, void, never>()
 
       const entries = new Map<ServerName, ServerEntry>()
+      let closed = false
       const attached = new Map<ServerName, AttachedEntry[]>()
       // Serializes lifecycle operations per server. Anything taking this lock from a connection
       // callback must stay forked: lifecycle operations close scopes while holding it, firing onClose.
@@ -455,6 +462,8 @@ export const layer = (options?: Options) =>
 
       const startServer = (name: ServerName, entry: ServerEntry) =>
         Effect.gen(function* () {
+          // A shut-down Location must not respawn servers (for example on a credential reconnect).
+          if (closed) return
           // Announce the handshake so connect() and credential reconnects don't show a stale
           // disabled/failed status for the duration of the connection attempt.
           entry.status = { status: "pending" }
@@ -578,8 +587,9 @@ export const layer = (options?: Options) =>
         // Unlocked reads must never pick a closing connection, so update the stack before closing it.
         attached.set(name, remaining)
         yield* Scope.close(entry.scope, Exit.void)
-        // Closing an idle connection changes nothing visible.
-        if (stack.at(-1) !== entry) return
+        // Shutdown closes the whole stack; it must not re-list a connection that is next to close.
+        // Closing an idle connection otherwise changes nothing visible.
+        if (closed || stack.at(-1) !== entry) return
         // Idle connections ignore tool list changes, so the one taking over lists its tools again. A short
         // timeout keeps a half-open connection from holding the lock; it then keeps its stored tools.
         const previous = next.tools
@@ -599,11 +609,12 @@ export const layer = (options?: Options) =>
       // fallback for its name; the lock only guards adding the finished connection to the stack.
       const attach = Effect.fnUntraced(function* (name: ServerName, transport: Transport) {
         const { McpClient } = yield* Effect.promise(() => import("./client.js"))
+        if (closed) return yield* new McpClient.ConnectError({ server: name, message: "Location is shut down" })
         const scope = yield* Effect.acquireRelease(Scope.fork(root), (scope) => Scope.close(scope, Exit.void))
         // The client registers its own close only once initialized; closing the scope mid-handshake (caller
         // interruption or Location shutdown) must still close the transport right away.
         yield* Scope.addFinalizer(scope, Effect.promise(() => transport.close()).pipe(Effect.ignore))
-        let closed = false
+        let connectionClosed = false
         const result = yield* McpClient.connect(
           name,
           { type: "attached", transport },
@@ -615,7 +626,7 @@ export const layer = (options?: Options) =>
           Effect.tap((connection) =>
             Effect.sync(() =>
               connection.onClose(() => {
-                closed = true
+                connectionClosed = true
               }),
             ),
           ),
@@ -630,7 +641,7 @@ export const layer = (options?: Options) =>
           ),
         )
         const register = Effect.gen(function* () {
-          if (closed) {
+          if (closed || connectionClosed) {
             yield* Scope.close(scope, Exit.void)
             return yield* new McpClient.ConnectError({ server: name, message: "Connection closed" })
           }
@@ -795,6 +806,25 @@ export const layer = (options?: Options) =>
             yield* bus.publish(McpEvent.StatusChanged, { server: name })
           }).pipe(locks.withLock(name))
         }),
+        shutdown: Effect.gen(function* () {
+          closed = true
+          // Attached callers can retain their scopes after Location shutdown, just like active steps.
+          yield* Effect.forEach(Array.from(attached), ([name, stack]) =>
+            Effect.forEach(stack.toReversed(), (entry) => detach(name, entry), { discard: true })
+              .pipe(attachedLocks.withLock(name)),
+            { discard: true, concurrency: "unbounded" },
+          )
+          yield* Effect.forEach(
+            Array.from(entries),
+            ([name, entry]) =>
+              Effect.gen(function* () {
+                yield* stopServer(name, entry)
+                entry.status = { status: "disabled" }
+                yield* bus.publish(McpEvent.StatusChanged, { server: name })
+              }).pipe(locks.withLock(name)),
+            { discard: true, concurrency: "unbounded" },
+          )
+        }).pipe(Effect.withSpan("MCP.shutdown")),
         remove: Effect.fn("MCP.remove")(function* (server) {
           const name = ServerName.make(server)
           yield* requireServer(name)
