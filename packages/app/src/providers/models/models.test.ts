@@ -23,10 +23,10 @@ test("keeps the newest model of each provider and family", () => {
   ])
 })
 
-test("a tie in release date keeps the first model listed", () => {
+test("a tie in release date keeps all models", () => {
   expect(
     latestModels([model("a", "first", "2026-01-01", "f"), model("a", "second", "2026-01-01", "f")]),
-  ).toEqual([{ providerID: "a", modelID: "first" }])
+  ).toEqual([{ providerID: "a", modelID: "first" }, { providerID: "a", modelID: "second" }])
 })
 
 test("groups free models apart from their paid twin", () => {
