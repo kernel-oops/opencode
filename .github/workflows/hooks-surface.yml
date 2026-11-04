@@ -1,0 +1,16 @@
+name: Hooks surface
+on:
+  push:
+    branches: [b12-hooks, hooks-*]
+  pull_request:
+    branches: [b12-hooks, hooks-*]
+jobs:
+  surface:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-bun
+      - run: bun script/check-hook-surface.ts --self-test
+      - run: bun script/check-hook-surface.ts v2.2.5

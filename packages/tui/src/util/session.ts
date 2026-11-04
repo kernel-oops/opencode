@@ -1,5 +1,5 @@
-// Shared pure presentation helpers now belong to the CLI task plugin package.
-export * from "@kernel-oops/opencode-background-tasks/session"
+// shortcut: keep the existing TUI callers local until their presentation moves to the external task plugin.
+export * from "./task-session"
 
 import type { ModelInfo, SessionMessageInfo } from "@opencode/client"
 import { lastAssistantWithUsage } from "@opencode/client/solid"
