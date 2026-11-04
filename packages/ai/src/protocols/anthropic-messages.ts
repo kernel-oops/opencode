@@ -33,6 +33,7 @@ import * as Cache from "./utils/cache.js"
 import { claudeVersion, supportsThinkingBlockBinding, THINKING_BINDING_BETA } from "./utils/claude-model.js"
 import { Lifecycle } from "./utils/lifecycle.js"
 import { ToolStream } from "./utils/tool-stream.js"
+import { anthropicToolSchema } from "./utils/anthropic-tool-schema.js"
 
 const ADAPTER = "anthropic-messages"
 export const DEFAULT_BASE_URL = "https://api.anthropic.com/v1"
@@ -561,7 +562,7 @@ const redactedDataFromMetadata = (metadata: ProviderMetadata | undefined, key: s
 const lowerTool = (breakpoints: Cache.Breakpoints, tool: ToolDefinition): AnthropicTool => ({
   name: tool.name,
   description: tool.description,
-  input_schema: tool.inputSchema,
+  input_schema: anthropicToolSchema(tool.inputSchema, tool.name),
   cache_control: cacheControl(breakpoints, tool.cache),
 })
 
