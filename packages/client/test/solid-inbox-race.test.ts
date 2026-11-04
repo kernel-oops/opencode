@@ -47,6 +47,81 @@ const enqueued: OpenCodeEvent = {
   },
 }
 
+test.each(["session.execution.failed", "session.execution.succeeded"] as const)(
+  "reconciles a missed delivery at %s without dropping other pending inputs",
+  async (type) => {
+    const digest: SessionInboxItem = {
+      id: "msg_digest", sessionID: item.sessionID, type: "synthetic", delivery: "steer",
+      time: { created: 1 }, payload: { text: "digest" },
+    }
+    const queued: SessionInboxItem = { ...item, id: "msg_queued", delivery: "queue" }
+    const gate = Promise.withResolvers<void>()
+    let pending: SessionInboxItem[] = [digest, item, queued]
+    const setup = fixture(async (request) => {
+      if (request.method === "GET") return Response.json({ data: pending })
+      return Response.json({ data: { id: "msg_local" } })
+    })
+    try {
+      await setup.data.session.pending.sync(item.sessionID)
+      const admission = setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_local", text: "local", gate: gate.promise })
+      // The server consumed the digest, but this client missed the delivery event.
+      pending = [item, queued]
+      setup.emit({
+        id: "evt_terminal", created: 3, type,
+        durable: { aggregateID: item.sessionID, seq: 3, version: 1 },
+        data: { sessionID: item.sessionID, ...(type === "session.execution.failed" ? { error: { type: "provider.no-route", message: "failure" } } : {}) },
+      })
+      await setup.data.session.pending.sync(item.sessionID)
+      expect(setup.data.session.pending.list(item.sessionID).map((entry) => entry.id)).toEqual([item.id, queued.id, "msg_local"])
+      expect(setup.data.session.message.get(item.sessionID, digest.id)?.text).toBe("digest")
+      gate.resolve()
+      await admission
+    } finally {
+      gate.resolve()
+      setup.dispose()
+    }
+  },
+)
+
+test("revalidates an older in-flight inbox snapshot at an execution boundary", async () => {
+  const response = Promise.withResolvers<Response>()
+  let reads = 0
+  const setup = fixture(async () => ++reads === 1 ? response.promise : Response.json({ data: [] }))
+  try {
+    const older = setup.data.session.pending.sync(item.sessionID)
+    setup.emit({
+      id: "evt_terminal", created: 3, type: "session.execution.succeeded",
+      durable: { aggregateID: item.sessionID, seq: 3, version: 1 }, data: { sessionID: item.sessionID },
+    })
+    response.resolve(Response.json({ data: [item] }))
+    await older
+    await setup.data.session.pending.sync(item.sessionID)
+    expect(reads).toBe(2)
+    expect(setup.data.session.pending.list(item.sessionID)).toEqual([])
+  } finally {
+    response.resolve(Response.json({ data: [] }))
+    setup.dispose()
+  }
+})
+
+test("a successful admission reconciles a consumed optimistic input when both events were missed", async () => {
+  const response = Promise.withResolvers<Response>()
+  const setup = fixture(async (request) => request.method === "GET" ? Response.json({ data: [item] }) : response.promise)
+  try {
+    const admission = setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_local", text: "local" })
+    await setup.data.session.pending.sync(item.sessionID)
+    expect(setup.data.session.input.list(item.sessionID)).toContain("msg_local")
+    response.resolve(Response.json({ data: { ...item, id: "msg_local", payload: { text: "local" } } }))
+    await admission
+    await setup.data.session.pending.sync(item.sessionID)
+    expect(setup.data.session.input.list(item.sessionID)).toEqual([item.id])
+    expect(setup.data.session.message.get(item.sessionID, "msg_local")?.type).toBe("user")
+  } finally {
+    response.resolve(Response.json({ data: item }))
+    setup.dispose()
+  }
+})
+
 test.each(["delivered", "cancelled"] as const)(
   "a delayed inbox snapshot cannot resurrect a %s prompt",
   async (action) => {
@@ -105,7 +180,7 @@ test("hydration preserves submission order across optimistic admissions", async 
   const response = Promise.withResolvers<Response>()
   const gate = Promise.withResolvers<void>()
   const setup = fixture((request) =>
-    request.method === "GET" ? response.promise : Promise.resolve(Response.json({ data: { id: "msg_admitted" } })),
+    request.method === "GET" ? response.promise.then((value) => value.clone()) : Promise.resolve(Response.json({ data: { id: "msg_admitted" } })),
   )
   try {
     const first = setup.data.session.prompt({
