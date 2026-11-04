@@ -901,9 +901,87 @@ const appendToUserTurn = (messages: AnthropicMessage[], block: AnthropicUserBloc
   else messages.push({ role: "user", content: [block] })
 }
 
+// The retired CLI marked host-owned tools as providerExecuted too. This is a
+// representation fallback, not proof of CLI origin: only complete, adjacent,
+// unambiguous textual pairs without native replay state can use ordinary blocks.
+const ordinaryExecutedHistory = Effect.fnUntraced(function* (request: LLMRequest) {
+  const output: Array<LLMRequest["messages"][number]> = []
+  let converted = false
+  const counts = new Map<string, { calls: number; results: number }>()
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type !== "tool-call" && part.type !== "tool-result") continue
+    const id = scrubToolCallID(part.id)
+    const count = counts.get(id) ?? { calls: 0, results: 0 }
+    if (part.type === "tool-call") count.calls++
+    else count.results++
+    counts.set(id, count)
+  }
+  const candidate = (part: ToolCallPart | ToolResultPart) =>
+    part.providerExecuted === true && serverToolResultType(part.name) === undefined
+  const replayState = (part: ToolCallPart | ToolResultPart) =>
+    Object.keys(part.metadata ?? {}).length > 0 ||
+    Object.values(part.providerMetadata ?? {}).some((state) => Object.keys(state).length > 0)
+  const reservedName = (name: string) =>
+    /^(?:bash_code_execution|text_editor_code_execution|tool_search(?:_|$)|mcp_tool(?:_|$))/.test(name)
+  const textual = (part: ToolResultPart) => {
+    if (part.result.type === "text") return typeof part.result.value === "string"
+    if (part.result.type === "content") return part.result.value.every((item) => item.type === "text")
+    if (part.result.type === "error") {
+      const value = part.result.value
+      if (typeof value === "string") return true
+      return ProviderShared.isRecord(value) && ProviderShared.isRecord(value.error) &&
+        typeof value.error.message === "string" && Array.isArray(value.content) &&
+        value.content.every((item: unknown) => ProviderShared.isRecord(item) && item.type === "text" && typeof item.text === "string")
+    }
+    return false
+  }
+  for (const message of request.messages) {
+    let content: Array<LLMRequest["messages"][number]["content"][number]> = []
+    for (let index = 0; index < message.content.length; index++) {
+      const part = message.content[index]!
+      if ((part.type !== "tool-call" && part.type !== "tool-result") || !candidate(part)) {
+        content.push(part)
+        continue
+      }
+      const result = message.content[index + 1]
+      const count = counts.get(scrubToolCallID(part.id))!
+      if (message.role !== "assistant" || part.type !== "tool-call" || reservedName(part.name) || replayState(part) ||
+        result?.type !== "tool-result" || !candidate(result) || replayState(result) ||
+        part.id.length === 0 || part.id !== scrubToolCallID(part.id) || result.id !== part.id || result.name !== part.name || count.calls !== 1 || count.results !== 1 ||
+        !textual(result))
+        return yield* invalid(`Anthropic Messages cannot safely replay provider-executed tool ${part.name}: expected a unique adjacent call and textual result without native replay state`)
+      content.push({ ...part, providerExecuted: false })
+      converted = true
+      output.push({ ...message, content })
+      output.push({ role: "tool", content: [{ ...result, providerExecuted: false }] })
+      content = []
+      index++
+    }
+    if (content.length > 0) output.push({ ...message, content })
+  }
+  // A compatibility split must not strand an ordinary call in its prefix or
+  // move its result past an intervening assistant/system/user turn.
+  if (converted) {
+    const pending = new Set<string>()
+    for (const message of output) {
+      if (pending.size > 0 && message.role !== "tool")
+        return yield* invalid("Anthropic Messages compatibility replay cannot split an ordinary tool call from its immediately following results")
+      for (const part of message.content) {
+        if (message.role === "assistant" && part.type === "tool-call" && part.providerExecuted !== true)
+          pending.add(part.id)
+        if (message.role === "tool" && part.type === "tool-result") pending.delete(part.id)
+      }
+    }
+    if (pending.size > 0)
+      return yield* invalid("Anthropic Messages compatibility replay requires complete ordinary tool results")
+  }
+  return output
+})
+
 const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, breakpoints: Cache.Breakpoints) {
   const messages: AnthropicMessage[] = []
   const providerMetadataKey = request.model.route.providerMetadataKey ?? request.model.provider
+  const history = yield* ordinaryExecutedHistory(request)
   // Text updates stay where they are unless a user turn follows them; then they move after the latest
   // user turn, the nearest spot where Anthropic accepts a native system message.
   const holdUpdates = supportsNativeSystemUpdates(request)
@@ -916,7 +994,7 @@ const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, breakpoi
     }
   })
 
-  for (const [index, message] of request.messages.entries()) {
+  for (const [index, message] of history.entries()) {
     if (message.role === "system") {
       const update = effortUpdate(message)
       if (update) {
@@ -924,7 +1002,7 @@ const lowerMessages = Effect.fnUntraced(function* (request: LLMRequest, breakpoi
         messages.push({ role: "system", content: [], output_config: { effort: update.effort ?? DEFAULT_EFFORT } })
         continue
       }
-      if (splitsLocalToolResults(request.messages, index))
+      if (splitsLocalToolResults(history, index))
         return yield* invalid("Anthropic Messages system updates cannot split a local tool call from its tool result")
       if (holdUpdates) held.push(message)
       else appendToUserTurn(messages, yield* lowerWrappedSystemUpdate(message, breakpoints))
