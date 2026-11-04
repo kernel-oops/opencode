@@ -20,6 +20,61 @@ const model = Model.Ref.make({ id: Model.ID.make("model"), providerID: Provider.
 const build = Agent.defaultID
 
 describe("toLLMMessages", () => {
+  for (const done of [false, true, "missing-proof"] as const) test(`length terminal preserves readable output and only DONE opaque reasoning (${done})`, () => {
+    const assistant = SessionMessage.Assistant.make({
+      id: id(`length-proof-${done}`), type: "assistant", agent: build, model, finish: "length",
+      native: { nativeObserved: true, completedOutputItems: done ? [{ type: "reasoning", id: "rs_length", ...(done === true ? { encrypted_content: "ack-only" } : {}), summary: [] }] : [] },
+      content: [
+        { type: "text", text: "Truncated answer" },
+        { type: "reasoning", text: "Readable partial", native: { itemId: "rs_length", reasoningEncryptedContent: "unacknowledged-latest" }, time: { created, completed: created } },
+      ],
+      time: { created, completed: created },
+    })
+    const messages = toLLMMessages([assistant], model)
+    expect(JSON.stringify(messages)).toContain("Truncated answer")
+    expect(JSON.stringify(messages)).not.toContain("unacknowledged-latest")
+    if (done === true) expect(JSON.stringify(messages)).toContain("ack-only")
+    else {
+      expect(JSON.stringify(messages)).not.toContain("ack-only")
+      if (done === false) expect(messages[0].content).toContainEqual({ type: "text", text: "Readable partial" })
+    }
+    const foreign = toLLMMessages([assistant], { ...model, id: Model.ID.make("foreign") })
+    expect(JSON.stringify(foreign)).not.toContain("ack-only")
+    expect(JSON.stringify(foreign)).not.toContain("unacknowledged-latest")
+    const otherProvider = toLLMMessages([assistant], { ...model, providerID: Provider.ID.make("other-provider") })
+    expect(JSON.stringify(otherProvider)).not.toContain("ack-only")
+    expect(JSON.stringify(otherProvider)).not.toContain("unacknowledged-latest")
+  })
+  test("steering replays readable partial output without opaque reasoning, retaining settled tool proof", () => {
+    const assistant = SessionMessage.Assistant.make({
+      id: id("steered"), type: "assistant", agent: build, model, interruption: "steer",
+      native: { responseId: "cancelled-response" },
+      content: [
+        { type: "text", text: "Partial text", native: { itemId: "partial-text" } },
+        { type: "reasoning", text: "Readable thought", native: { signature: "unfinished", reasoningEncryptedContent: "opaque" } },
+        { type: "reasoning", text: "", native: { reasoningEncryptedContent: "opaque-only" } },
+        { type: "tool", id: "settled", name: "lookup", native: { signature: "valid-tool-proof" },
+          state: { status: "completed", input: {}, content: [{ type: "text", text: "Result" }] },
+          time: { created, ran: created, completed: created } },
+        { type: "tool", id: "incomplete", name: "lookup",
+          state: { status: "error", input: {}, error: { type: "tool.superseded", message: "Not executed" } },
+          time: { created, completed: created } },
+      ],
+      time: { created, completed: created },
+    })
+    const messages = toLLMMessages([assistant], model)
+    expect(messages[0].content).toEqual([
+      { type: "text", text: "Partial text", providerMetadata: undefined },
+      { type: "text", text: "Readable thought" },
+      expect.objectContaining({ type: "tool-call", id: "settled", providerMetadata: { provider: { signature: "valid-tool-proof" } } }),
+    ])
+    expect(messages[1].content).toContainEqual(expect.objectContaining({ type: "tool-result", id: "settled" }))
+    expect(JSON.stringify(messages)).not.toContain("opaque")
+    expect(JSON.stringify(messages)).not.toContain("cancelled-response")
+    expect(JSON.stringify(messages)).not.toContain("incomplete")
+    const changed = toLLMMessages([assistant], { ...model, id: Model.ID.make("other-model") })
+    expect(changed[0].content.find((part) => part.type === "tool-call")?.providerMetadata).toBeUndefined()
+  })
   test("background user shells enter model context only through their completion notification", () => {
     const shell = SessionMessage.Shell.make({
       id: id("background-shell"),

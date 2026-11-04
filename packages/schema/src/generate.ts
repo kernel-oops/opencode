@@ -4,7 +4,36 @@ import { Schema } from "effect"
 import { Model } from "./model.js"
 import { Money } from "./money.js"
 import { Base64 } from "./prompt.js"
-import { PositiveInt, optional } from "./schema.js"
+import { NonNegativeInt, PositiveInt, optional } from "./schema.js"
+
+/** Native constrained output request; consumers must still validate the returned data. */
+export const ResponseSchema = Schema.Struct({
+  name: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{1,64}$/u)),
+  schema: Schema.Record(Schema.String, Schema.Json),
+}).annotate({ identifier: "Generate.ResponseSchema" })
+export interface ResponseSchema extends Schema.Schema.Type<typeof ResponseSchema> {}
+
+/** Actual provider usage; absent categories are unknown, not zero. */
+export const Usage = Schema.Struct({
+  contextTokens: NonNegativeInt.pipe(optional),
+  inputTokens: NonNegativeInt.pipe(optional),
+  outputTokens: NonNegativeInt.pipe(optional),
+  nonCachedInputTokens: NonNegativeInt.pipe(optional),
+  cacheReadInputTokens: NonNegativeInt.pipe(optional),
+  cacheWriteInputTokens: NonNegativeInt.pipe(optional),
+  reasoningTokens: NonNegativeInt.pipe(optional),
+  totalTokens: NonNegativeInt.pipe(optional),
+  providerMetadata: Schema.Record(Schema.String, Schema.Json).pipe(optional),
+}).annotate({ identifier: "Generate.Usage" })
+export interface Usage extends Schema.Schema.Type<typeof Usage> {}
+
+export const Result = Schema.Struct({
+  text: Schema.String,
+  responseSchemaName: Schema.String.pipe(optional),
+  usage: Usage.pipe(optional),
+  model: Model.Ref.pipe(optional),
+}).annotate({ identifier: "Generate.Result" })
+export interface Result extends Schema.Schema.Type<typeof Result> {}
 
 const description = (text: string) => ({ description: text })
 
@@ -19,11 +48,11 @@ export const File = Schema.Struct({
   name: Schema.String.pipe(optional),
 }).annotate({ identifier: "Generate.File" })
 
-export interface Usage extends Schema.Schema.Type<typeof Usage> {}
-export const Usage = Schema.Struct({
+export interface MediaUsage extends Schema.Schema.Type<typeof MediaUsage> {}
+export const MediaUsage = Schema.Struct({
   input: Schema.Finite.pipe(optional),
   output: Schema.Finite.pipe(optional),
-}).annotate({ identifier: "Generate.Usage", description: "Token counts, when the provider reports them" })
+}).annotate({ identifier: "Generate.MediaUsage", description: "Token counts, when the provider reports them" })
 
 export const Native = Schema.Record(Schema.String, Schema.Unknown).annotate({
   identifier: "Generate.Native",
@@ -73,7 +102,7 @@ export interface ImageResult extends Schema.Schema.Type<typeof ImageResult> {}
 export const ImageResult = Schema.Struct({
   images: Schema.Array(ImageOutput),
   cost: Money.USD.pipe(optional),
-  tokens: Usage.pipe(optional),
+  tokens: MediaUsage.pipe(optional),
   native: Native.pipe(optional),
 }).annotate({ identifier: "Generate.ImageResult" })
 
@@ -198,6 +227,6 @@ export interface DecisionResult extends Schema.Schema.Type<typeof DecisionResult
 export const DecisionResult = Schema.Struct({
   answers: Schema.Array(DecisionAnswer).annotate(description("One answer per question, in question order")),
   cost: Money.USD.pipe(optional),
-  tokens: Usage.pipe(optional),
+  tokens: MediaUsage.pipe(optional),
   native: Native.pipe(optional),
 }).annotate({ identifier: "Generate.DecisionResult" })

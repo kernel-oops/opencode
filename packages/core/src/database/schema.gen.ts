@@ -5,6 +5,43 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
   up(tx) {
     return Effect.gen(function* () {
       yield* tx.run(`
+        CREATE TABLE \`new_session_launch\` (
+          \`id\` text PRIMARY KEY,
+          \`creator_id\` text NOT NULL,
+          \`launch_key\` text NOT NULL,
+          \`payload_hash\` text NOT NULL,
+          \`payload\` text NOT NULL,
+          \`project_id\` text NOT NULL,
+          \`ownership_key\` text NOT NULL,
+          \`canonical\` text NOT NULL,
+          \`workdir\` text NOT NULL,
+          \`directory_identity\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`prompt_id\` text NOT NULL,
+          \`notification_id\` text NOT NULL,
+          \`stage\` text NOT NULL,
+          \`terminal\` text,
+          \`notification_admitted\` integer DEFAULT false NOT NULL,
+          \`evidence\` text,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_delegation\` (
+          \`session_id\` text PRIMARY KEY,
+          \`origin_id\` text NOT NULL,
+          \`creator_id\` text NOT NULL,
+          \`source_agent\` text NOT NULL,
+          \`source_directory\` text NOT NULL,
+          \`source_directory_identity\` text NOT NULL,
+          \`agent_rules\` text NOT NULL,
+          \`session_rules\` text NOT NULL,
+          \`target_agent\` text NOT NULL,
+          \`target_model\` text NOT NULL,
+          \`client_model\` text
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`account_state\` (
           \`id\` integer PRIMARY KEY,
           \`active_account_id\` text,
@@ -274,6 +311,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`tokens_cache_write\` integer DEFAULT 0 NOT NULL,
           \`revert\` text,
           \`permission\` text,
+          \`context_budget\` text,
+          \`context_budget_state\` text,
           \`agent\` text,
           \`model\` text,
           \`time_created\` integer NOT NULL,
@@ -308,6 +347,15 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           CONSTRAINT \`fk_worktree_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`new_session_creator_key\` ON \`new_session_launch\` (\`creator_id\`,\`launch_key\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`new_session_owner\` ON \`new_session_launch\` (\`project_id\`,\`ownership_key\`) WHERE "new_session_launch"."stage" <> 'accepted';`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`new_session_workdir\` ON \`new_session_launch\` (\`workdir\`) WHERE "new_session_launch"."stage" <> 'accepted';`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`job_session_idx\` ON \`job\` (\`session_id\`);`)

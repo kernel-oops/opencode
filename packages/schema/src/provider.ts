@@ -74,6 +74,9 @@ export const Settings = Schema.StructWithRest(
     compaction: Compaction.pipe(optional),
     cache: Cache.pipe(optional),
     transport: Transport.pipe(optional),
+    nativeInterrupt: Schema.String.pipe(optional),
+    /** Operator allowance only; the exact-session native test API still opts execution in. */
+    nativeSteer: Schema.Literal("response.steer").pipe(optional),
     encoding: Encoding.pipe(optional),
   }),
   [Schema.Record(Schema.String, Schema.Any)],

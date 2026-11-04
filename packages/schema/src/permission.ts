@@ -31,6 +31,7 @@ const RequestFields = {
   metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(optional),
   source: Source.pipe(optional),
   message: Schema.String.pipe(optional),
+  review: Schema.Struct({ kind: Schema.Literal("model-refusal"), reason: Schema.String }).pipe(optional),
 }
 
 export const Request = Schema.Struct({
@@ -39,7 +40,7 @@ export const Request = Schema.Struct({
 }).annotate({ identifier: "Permission.Request" })
 export interface Request extends Schema.Schema.Type<typeof Request> {}
 
-export const Reply = Schema.Literals(["once", "always", "reject"]).annotate({ identifier: "Permission.Reply" })
+export const Reply = Schema.Literals(["once", "always", "reject", "review_once"]).annotate({ identifier: "Permission.Reply" })
 export type Reply = typeof Reply.Type
 
 const Asked = ephemeral({ type: "permission.asked", schema: Request.fields })

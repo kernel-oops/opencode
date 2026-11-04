@@ -32,6 +32,7 @@ import type {
   SessionListInput,
   SessionInboxInfo,
   SessionInboxCompaction,
+  SessionTaskStatus,
   ShellInfo,
   SkillInfo,
   ToolContent,
@@ -315,6 +316,53 @@ export function createData(config: CreateDataInput) {
   })
 
   const [defaultLocation, setDefaultLocation] = createSignal<LocationRef>({ directory: config.directory })
+  // UI-only observation of the existing authoritative task endpoint. All views of a
+  // Session share one timer and in-flight read; the last view releases the cache.
+  const [taskStatuses, setTaskStatuses] = createStore<Record<string, SessionTaskStatus | undefined>>({})
+  type TaskObservation = {
+    views: number
+    client: OpenCodeClient
+    timer?: ReturnType<typeof setInterval>
+    pending?: Promise<void>
+    unavailableUntil: number
+  }
+  const taskObservations = new Map<string, TaskObservation>()
+  const syncTasks = (sessionID: string): Promise<void> => {
+    const entry = taskObservations.get(sessionID)
+    if (!entry) return Promise.resolve()
+    const client = api()
+    if (entry.client !== client) {
+      entry.client = client
+      entry.unavailableUntil = 0
+      setTaskStatuses(sessionID, undefined)
+    }
+    if (entry.pending) return entry.pending
+    if (Date.now() < entry.unavailableUntil || typeof client.session.task?.status !== "function")
+      return Promise.resolve()
+    const current = () => taskObservations.get(sessionID) === entry && entry.client === client && api() === client
+    entry.pending = client.session.task.status({ sessionID })
+      .then((value) => { if (current()) setTaskStatuses(sessionID, reconcile(value)) })
+      .catch(() => {
+        if (!current()) return
+        entry.unavailableUntil = Date.now() + 30_000
+        setTaskStatuses(sessionID, undefined)
+      })
+      .finally(() => { entry.pending = undefined })
+    return entry.pending
+  }
+  const releaseTasks = (sessionID: string, entry: TaskObservation) => {
+    if (taskObservations.get(sessionID) !== entry || --entry.views > 0) return
+    clearInterval(entry.timer)
+    taskObservations.delete(sessionID)
+    setTaskStatuses(sessionID, undefined)
+  }
+  onCleanup(() => {
+    for (const [sessionID, entry] of taskObservations) {
+      clearInterval(entry.timer)
+      setTaskStatuses(sessionID, undefined)
+    }
+    taskObservations.clear()
+  })
   const sessions = createMemo(() =>
     Object.values(store.session.info).toSorted((a, b) => b.time.updated - a.time.updated),
   )
@@ -323,6 +371,7 @@ export function createData(config: CreateDataInput) {
   const sync = createSync()
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
+  const shellUpdates = new Map<string, Map<string, ShellWithLocation | undefined>>()
 
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
@@ -592,6 +641,12 @@ export function createData(config: CreateDataInput) {
     return current
   }
 
+  const descendantUpdates = new Set<(sessionID: string) => void>()
+
+  function notifySessionInfo(sessionID: string) {
+    for (const update of descendantUpdates) update(sessionID)
+  }
+
   // Register one session into the family index. Idempotent: syncing an
   // existing session never duplicates its ID. When a tentative family keyed by
   // sessionID exists (descendants arrived while sessionID's own info was
@@ -600,6 +655,7 @@ export function createData(config: CreateDataInput) {
   function registerSession(sessionID: string) {
     const info = store.session.info[sessionID]
     if (!info) return
+    notifySessionInfo(sessionID)
     const rootID = resolveRoot(sessionID)
     setStore(
       "session",
@@ -699,6 +755,7 @@ export function createData(config: CreateDataInput) {
         }
       }),
     )
+    notifySessionInfo(sessionID)
   }
 
   function handleEvent(event: OpenCodeEvent) {
@@ -760,16 +817,20 @@ export function createData(config: CreateDataInput) {
         markDeleted(event.data.sessionID)
         return
       case "session.usage.updated":
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, {
             cost: event.data.cost,
             tokens: event.data.tokens,
           })
+          notifySessionInfo(event.data.sessionID)
+        }
         return
       case "session.agent.selected": {
         const previous = store.session.info[event.data.sessionID]?.agent
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "agent", event.data.agent)
+          notifySessionInfo(event.data.sessionID)
+        }
         message.insert(event.data.sessionID, {
           id: SessionMessage.ID.fromEvent(event.id),
           type: "agent-switched",
@@ -781,8 +842,10 @@ export function createData(config: CreateDataInput) {
       }
       case "session.model.selected": {
         const previous = event.data.previous ?? store.session.info[event.data.sessionID]?.model
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "model", event.data.model)
+          notifySessionInfo(event.data.sessionID)
+        }
         if (!store.session.message[event.data.sessionID]) return
         message.insert(event.data.sessionID, {
           id: SessionMessage.ID.fromEvent(event.id),
@@ -811,15 +874,39 @@ export function createData(config: CreateDataInput) {
             ? result.session.sync(event.data.sessionID, { children: true })
             : Promise.resolve()
           return Promise.all([result.session.sync(event.data.sessionID), family]).then(() => {
-            if (store.session.info[event.data.sessionID])
+            if (store.session.info[event.data.sessionID]) {
               setStore("session", "info", event.data.sessionID, "title", event.data.title)
+              notifySessionInfo(event.data.sessionID)
+            }
           })
         })
         return
       }
+      case "session.metadata.updated":
+        // Providers mark mirrored subagent sessions running here (see the sidebar's Subagents list).
+        if (store.session.info[event.data.sessionID]) {
+          setStore("session", "info", event.data.sessionID, "metadata", event.data.metadata)
+          notifySessionInfo(event.data.sessionID)
+        }
+        return
       case "session.permissions":
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "permissions", event.data.permissions)
+          notifySessionInfo(event.data.sessionID)
+        }
+        return
+      case "session.context-budget.configured":
+        if (store.session.info[event.data.sessionID]) {
+          setStore("session", "info", event.data.sessionID, "contextBudget", event.data.policy ?? undefined)
+          setStore("session", "info", event.data.sessionID, "contextBudgetState", undefined)
+          notifySessionInfo(event.data.sessionID)
+        }
+        return
+      case "session.context-budget.changed":
+        if (store.session.info[event.data.sessionID]) {
+          setStore("session", "info", event.data.sessionID, "contextBudgetState", event.data.state ?? undefined)
+          notifySessionInfo(event.data.sessionID)
+        }
         return
       case "session.metadata.updated":
         // The event carries the whole record, so keys it drops must go too.
@@ -845,6 +932,7 @@ export function createData(config: CreateDataInput) {
           setStore("session", "info", event.data.sessionID, "location", event.data.location)
           setStore("session", "info", event.data.sessionID, "projectID", event.data.projectID)
           setStore("session", "info", event.data.sessionID, "subpath", event.data.subpath)
+          notifySessionInfo(event.data.sessionID)
           message.insert(event.data.sessionID, {
             id: SessionMessage.ID.fromEvent(event.id),
             type: "location-switched",
@@ -876,6 +964,7 @@ export function createData(config: CreateDataInput) {
           if (!adopted) continue
           setStore("session", "info", sessionID, "projectID", adopted.projectID)
           setStore("session", "info", sessionID, "subpath", adopted.subpath)
+          notifySessionInfo(sessionID)
         }
         return
       }
@@ -1021,6 +1110,21 @@ export function createData(config: CreateDataInput) {
         })
         return
       }
+      case "session.step.native-ended":
+        message.editAssistant(event.data.sessionID, event.data.assistantMessageID, (assistant) => {
+          assistant.time.completed = event.created
+          assistant.finish = event.data.finish
+          assistant.rawFinish = event.data.rawFinish
+          // Merge: done-item proof observed during the response survives its terminal.
+          assistant.native = { ...assistant.native, ...event.data.native }
+          // Absent usage is unknown: keep it absent rather than projecting zero.
+          if (event.data.usage) {
+            assistant.cost = event.data.usage.cost
+            assistant.tokens = event.data.usage.tokens
+          }
+          if (event.data.snapshot) assistant.snapshot = { ...assistant.snapshot, end: event.data.snapshot }
+        })
+        return
       case "session.step.failed":
         // A budget refusal means the cached usage limits are out of date, which is what the refusal sends people to.
         if (
@@ -1216,16 +1320,21 @@ export function createData(config: CreateDataInput) {
         refresh(() => result.session.sync(event.data.sessionID))
         return
       case "session.revert.staged":
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", event.data.revert)
+          notifySessionInfo(event.data.sessionID)
+        }
         return
       case "session.revert.cleared":
-        if (store.session.info[event.data.sessionID])
+        if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
+          notifySessionInfo(event.data.sessionID)
+        }
         return
       case "session.revert.committed":
         if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
+          notifySessionInfo(event.data.sessionID)
         }
         // The projector also deletes inbox items enqueued at or after the boundary without a cancel event.
         setStore(
@@ -1381,6 +1490,8 @@ export function createData(config: CreateDataInput) {
         ])
         break
       case "shell.created":
+        if (event.data.info.status !== "running") break
+        shellUpdates.get(locationKey(location))?.set(event.data.info.id, { ...event.data.info, location })
         setStore("location", locationKey(location), (data) => ({
           shell: {
             ...data?.shell,
@@ -1390,7 +1501,7 @@ export function createData(config: CreateDataInput) {
         break
       case "shell.exited":
       case "shell.deleted":
-        if (!store.location[locationKey(location)]?.shell?.[event.data.id]) break
+        shellUpdates.get(locationKey(location))?.set(event.data.id, undefined)
         setStore("location", locationKey(location), (data) => ({
           shell: Object.fromEntries(Object.entries(data?.shell ?? {}).filter(([id]) => id !== event.data.id)),
         }))
@@ -1488,14 +1599,34 @@ export function createData(config: CreateDataInput) {
 
   const vcs = locationResource("vcs", (location) => api().vcs.get({ location }))
   const usageLimits = locationResource("usageLimits", (location) => api().experimental.usage.limits({ location }))
-  const shells = locationResource("shell", async (location) => {
-    const response = await api().shell.list({ location })
-    const ref = { directory: response.location.directory }
-    return {
-      location: response.location,
-      data: Object.fromEntries(response.data.map((info) => [info.id, { ...info, location: ref }])),
-    }
-  })
+  const shells = {
+    list: (ref?: LocationRef) => store.location[locationKey(ref ?? defaultLocation())]?.shell,
+    sync: (ref?: LocationRef) => {
+      const location = ref ?? defaultLocation()
+      const key = locationKey(location)
+      return sync.run(`location.shell:${key}`, async () => {
+        const updates = new Map<string, ShellWithLocation | undefined>()
+        shellUpdates.set(key, updates)
+        try {
+          const response = await api().shell.list({ location: locationQuery(location) })
+          const snapshot = new Map(
+            response.data
+              .filter((info) => info.status === "running")
+              .map((info) => [info.id, { ...info, location: response.location }]),
+          )
+          // Events arriving during the inventory request supersede its stale snapshot.
+          updates.forEach((info, id) => {
+            if (!info) return snapshot.delete(id)
+            snapshot.set(id, info)
+          })
+          setStore("location", locationKey(response.location), { shell: Object.fromEntries(snapshot) })
+        } finally {
+          if (shellUpdates.get(key) === updates) shellUpdates.delete(key)
+        }
+      })
+    },
+    invalidate: (ref?: LocationRef) => sync.invalidate(`location.shell:${locationKey(ref ?? defaultLocation())}`),
+  }
 
   const result = {
     on: config.event.on,
@@ -1551,6 +1682,24 @@ export function createData(config: CreateDataInput) {
       },
       status(sessionID: string) {
         return store.session.active[sessionID] ?? "idle"
+      },
+      task: {
+        get(sessionID: string) { return taskStatuses[sessionID] },
+        sync: syncTasks,
+        observe(sessionID: string) {
+          const entry: TaskObservation = taskObservations.get(sessionID) ?? { views: 0, client: api(), unavailableUntil: 0 }
+          if (entry.views++ === 0) {
+            taskObservations.set(sessionID, entry)
+            entry.timer = setInterval(() => void syncTasks(sessionID), 2_000)
+            void syncTasks(sessionID)
+          }
+          let disposed = false
+          return () => {
+            if (disposed) return
+            disposed = true
+            releaseTasks(sessionID, entry)
+          }
+        },
       },
       active() {
         return Object.entries(store.session.active).flatMap(([sessionID, status]) =>
@@ -1816,6 +1965,124 @@ export function createData(config: CreateDataInput) {
           })
         })
       },
+      descendants: {
+        async sync(sessionID: string, options?: { signal?: AbortSignal }) {
+          if (options?.signal?.aborted) return
+          await result.session.sync(sessionID)
+          if (options?.signal?.aborted) return
+          const visited = new Set<string>()
+          const pending = [sessionID]
+          const children = new Map<string, Set<string>>()
+          const parents = new Map<string, string | undefined>()
+          const membership = new Map<string, boolean>([[sessionID, true]])
+          const update = (id: string) => {
+            const info = store.session.info[id]
+            const previous = parents.get(id)
+            if (parents.has(id) && previous === info?.parentID && info) return
+            if (previous) children.get(previous)?.delete(id)
+            if (!info) parents.delete(id)
+            else parents.set(id, info.parentID)
+            membership.clear()
+            membership.set(sessionID, true)
+            if (!info?.parentID) return
+            const siblings = children.get(info.parentID) ?? new Set<string>()
+            children.set(info.parentID, siblings)
+            siblings.add(id)
+            // Events can add children after their parent's inventory was visited.
+            if (visited.has(info.parentID)) pending.push(id)
+          }
+          const belongs = (id: string) => {
+            const path = new Set<string>()
+            let current: string | undefined = id
+            while (current && !membership.has(current) && !path.has(current)) {
+              path.add(current)
+              current = parents.get(current)
+            }
+            const allowed = current ? membership.get(current) === true : false
+            for (const member of path) membership.set(member, allowed)
+            return allowed
+          }
+          let work = 0
+          const yieldWork = async () => {
+            if (++work % 128 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+          }
+          // Only active traversals keep an index. Observe updates across awaits so
+          // newly fetched/event-created owners join it, without rescanning the store.
+          descendantUpdates.add(update)
+          try {
+            for (const id of Object.keys(store.session.info)) {
+              if (options?.signal?.aborted) return
+              update(id)
+              await yieldWork()
+            }
+            for (let position = 0; position < pending.length; position++) {
+              await yieldWork()
+              if (options?.signal?.aborted) return
+              const parentID = pending[position]!
+              if (visited.has(parentID)) continue
+              if (!belongs(parentID)) continue
+              visited.add(parentID)
+              // A shared parent inventory may finish for another observer after this caller leaves.
+              // The caller's signal fences further subtree traversal, not the coalesced request.
+              await sync.run(`session.children:${parentID}`, async () => {
+                const children: SessionInfo[] = []
+                const updated = new Set<string>()
+                const observe = (id: string) => updated.add(id)
+                descendantUpdates.add(observe)
+                try {
+                  const cursors = new Set<string>()
+                  let cursor: string | undefined
+                  do {
+                    const response = await api().session.list({ parentID, order: "desc", cursor })
+                    children.push(...response.data.filter((child) => child.parentID === parentID))
+                    cursor = response.cursor.next ?? undefined
+                    if (cursor && cursors.has(cursor)) throw new Error("Repeated session children cursor")
+                    if (cursor) cursors.add(cursor)
+                  } while (cursor)
+                  for (let position = 0; position < children.length; position += 128) {
+                    batch(() => {
+                      for (const child of children.slice(position, position + 128)) {
+                        // A live metadata sync/deletion during paging supersedes this snapshot.
+                        if (updated.has(child.id)) continue
+                        setStore("session", "info", child.id, child)
+                        sync.complete(`session:${child.id}`)
+                        registerSession(child.id)
+                      }
+                    })
+                    // Large cold pages must not become one uninterruptible UI batch.
+                    // Finish the shared inventory even if one observer has cancelled.
+                    if (position + 128 < children.length) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+                  }
+                } finally {
+                  descendantUpdates.delete(observe)
+                }
+              })
+              if (options?.signal?.aborted) return
+              for (const id of children.get(parentID) ?? []) pending.push(id)
+            }
+          } finally {
+            descendantUpdates.delete(update)
+          }
+        },
+        invalidate(sessionID: string) {
+          const children = new Map<string, string[]>()
+          for (const child of Object.values(store.session.info)) {
+            if (!child.parentID) continue
+            const siblings = children.get(child.parentID) ?? []
+            children.set(child.parentID, siblings)
+            siblings.push(child.id)
+          }
+          const visited = new Set<string>()
+          const pending = [sessionID]
+          for (let position = 0; position < pending.length; position++) {
+            const id = pending[position]!
+            if (visited.has(id)) continue
+            visited.add(id)
+            sync.invalidate(`session.children:${id}`)
+            for (const child of children.get(id) ?? []) pending.push(child)
+          }
+        },
+      },
       invalidate(sessionID: string) {
         sync.invalidate(`session:${sessionID}`)
       },
@@ -1954,13 +2221,20 @@ export function createData(config: CreateDataInput) {
         invalidate(sessionID: string) {
           sync.invalidate(`session.permission:${sessionID}`)
         },
+        // A request the server no longer has is removed locally either way. Ordinary replies to it stay benign, but
+        // a manual review approval did not approve anything, so it still fails for its caller.
         async reply(input: PermissionReplyInput) {
-          await api()
+          const stale = await api()
             .permission.reply(input)
-            .catch((error: unknown) => {
-              if (!isPermissionNotFoundError(error)) throw error
-            })
+            .then(
+              () => undefined,
+              (error: unknown) => {
+                if (!isPermissionNotFoundError(error)) throw error
+                return error
+              },
+            )
           removePermission(input.sessionID, input.requestID)
+          if (stale && input.decision === "review_once") throw stale
         },
       },
       form: {

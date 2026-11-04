@@ -10,15 +10,33 @@ import { SessionEvent } from "./event.js"
 import { SessionRunCoordinator } from "./run-coordinator.js"
 import { SessionRunner } from "./runner/index.js"
 import { SessionSchema } from "./schema.js"
+import type { SessionMessage } from "./message.js"
 import { SessionStore } from "./store.js"
 import { toSessionError } from "./to-session-error.js"
 import { SessionInbox } from "./inbox.js"
+import { SessionStateCheckpoint } from "./state-checkpoint.js"
+import { SessionNativeTest } from "./native-test.js"
+import { SessionModelTransport } from "./model-transport.js"
+import { SessionContextBudget } from "./context-budget.js"
+
+export type Interrupt = (
+  reason?: "user" | "inactivity",
+  options?: { readonly awaitSettlement?: boolean },
+) => Effect.Effect<boolean>
+
+/** Complete the exact admission's ownership hand-off before releasing its interruption mask. */
+export const AdmissionInterrupt = Context.Reference<((messageID: SessionMessage.ID, bound: Interrupt) => Effect.Effect<void>) | undefined>(
+  "@opencode/SessionExecution/AdmissionInterrupt",
+  { defaultValue: () => undefined },
+)
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
   /** Checks process-local ownership, including interruption cleanup and terminal settlement. */
   readonly isActive: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
+  /** Internal cancellation binding to the currently owned busy period, never its successor. */
+  readonly bindInterrupt: (sessionID: SessionSchema.ID) => Effect.Effect<Interrupt>
   /** Starts execution while idle or joins the active execution. */
   readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
   /** Registers newly recorded work. Repeated wakeups may coalesce. */
@@ -27,12 +45,15 @@ export interface Interface {
    * Interrupt active work owned by this process. Idle interruption is a no-op. Resolves once
    * the interruption is accepted; cleanup settles asynchronously in the execution fiber.
    * Returns whether an active execution was interrupted. Compose with `awaitIdle` when
-   * settlement matters.
+   * settlement matters. `awaitSettlement` waits only for the interrupted execution,
+   * rather than fresh work admitted during its cleanup.
    */
   readonly interrupt: (
     sessionID: SessionSchema.ID,
     options?: {
       readonly resume?: boolean
+      readonly reason?: "user" | "inactivity"
+      readonly awaitSettlement?: boolean
     },
   ) => Effect.Effect<boolean>
   /** Resolves once this process owns no active execution for the Session. Returns immediately when idle and never starts work. */
@@ -42,7 +63,7 @@ export interface Interface {
 /** Routes execution from a Session ID to its selected instance's runner. */
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionExecution") {}
 
-type InterruptReason = "user" | "shutdown"
+type InterruptReason = "user" | "shutdown" | "inactivity"
 
 export function terminal(exit: Exit.Exit<void, SessionRunner.RunError>, reason?: InterruptReason) {
   if (Exit.isSuccess(exit)) return { type: "succeeded" as const }
@@ -59,6 +80,8 @@ export const layer = Layer.effect(
     const bus = yield* Bus.Service
     const jobs = yield* Job.Service
     const db = (yield* Database.Service).db
+    const nativeTest = yield* SessionNativeTest.Service
+    const modelTransport = yield* SessionModelTransport.Service
     const reportLifecycle = <A>(sessionID: SessionSchema.ID, effect: Effect.Effect<A>) =>
       effect.pipe(
         Effect.tapCause((cause) =>
@@ -107,15 +130,30 @@ export const layer = Layer.effect(
       })
     })
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({
+      canStart: (sessionID) =>
+        Effect.gen(function* () {
+          const session = yield* store.get(sessionID)
+          const blocked = session?.contextBudgetState?.blocked
+          const held = yield* SessionStateCheckpoint.held(db, sessionID)
+          if (!held && (!session || !blocked || blocked.selection !== SessionContextBudget.selection(session))) return true
+          // Ordinary arrivals and job receipts remain durable without reporting/retrying the same floor.
+          const next = yield* SessionInbox.nextPromotable(db, sessionID, "control")
+          return next?.type === "compaction" || next?.type === "move"
+        }),
+      // The native test lane snapshot is taken before any model work and kept for the whole busy period.
+      // A changed policy generation retires the previous channel here, whatever transport the new execution uses.
       started: (sessionID) =>
-        reportLifecycle(
-          sessionID,
-          bus.publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID)),
+        nativeTest.start(sessionID).pipe(
+          Effect.andThen(Effect.suspend(() => modelTransport.retire(sessionID, nativeTest.generation(sessionID)))),
+          Effect.andThen(reportLifecycle(
+            sessionID,
+            bus.publish(SessionEvent.Execution.Started, { sessionID }, claimOnCommit(sessionID)),
+          )),
         ),
       drain: (sessionID, force, promotable) => drain(sessionID, force, undefined, promotable),
       // One terminal observation per busy period, covering every coalesced drain.
       settled: (sessionID, exit, reason) =>
-        reportLifecycle(
+        nativeTest.finish(sessionID).pipe(Effect.andThen(reportLifecycle(
           sessionID,
           Effect.gen(function* () {
             const outcome = terminal(exit, reason)
@@ -142,15 +180,17 @@ export const layer = Layer.effect(
               releaseOnCommit(sessionID),
             )
           }),
-        ),
+        ))),
     })
 
     return Service.of({
       active: coordinator.active,
       isActive: coordinator.isActive,
+      bindInterrupt: coordinator.bindInterrupt,
       interrupt: (sessionID, options) =>
         Effect.gen(function* () {
-          const interrupted = yield* coordinator.interrupt(sessionID, "user")
+          const interruptOwner = yield* coordinator.bindInterrupt(sessionID)
+          const interrupted = yield* interruptOwner(options?.reason ?? "user", options)
           if (!options?.resume) return interrupted
           // Resume steering input and between-turn control work from the interrupted
           // intent. Queued next-turn prompts stay parked: a steer-scoped drain never
@@ -176,7 +216,7 @@ export const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node],
+  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionNativeTest.node, SessionModelTransport.node],
 })
 
 /** Low-level compatibility layer for callers that only need durable Session recording. */
@@ -185,6 +225,7 @@ export const noopLayer = Layer.succeed(
   Service.of({
     active: Effect.succeed(new Set()),
     isActive: () => Effect.succeed(false),
+    bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
     resume: () => Effect.void,
     wake: () => Effect.void,
     interrupt: () => Effect.succeed(false),

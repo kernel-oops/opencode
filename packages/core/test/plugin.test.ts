@@ -2,7 +2,7 @@ import { expect } from "bun:test"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "path"
-import { Clock, Deferred, Effect, Fiber, Stream } from "effect"
+import { Clock, Deferred, Effect, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 import { Agent } from "@opencode/core/agent"
 import { Command } from "@opencode/core/command"
@@ -20,70 +20,83 @@ import { Watcher } from "@opencode/core/filesystem/watcher"
 import { fromPromise } from "@opencode/plugin/promise/adapter"
 import { testEffect } from "./lib/effect"
 import { PluginTestLayer } from "./plugin/fixture"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { ConfigPluginSource } from "@opencode/core/config/plugin/source"
+import { Config } from "@opencode/core/config"
+import { Global } from "@opencode/util/global"
+import { Document, Info } from "@opencode/schema/config"
+import { AbsolutePath } from "@opencode/core/schema"
+import { tmpdirScoped } from "./fixture/tmpdir"
+import { Stream } from "effect"
 
 const it = testEffect(PluginTestLayer)
 
-it.effect("does not let a Promise plugin cleanup that waits for readiness wedge its reload", () =>
+it.live("loader-authenticated Promise hooks review sources; copied SDK generations only review targets", () =>
   Effect.gen(function* () {
-    const plugins = yield* Plugin.Service
-    const commands = yield* Command.Service
-    const cleaned = yield* Deferred.make<void>()
-    const plugin = (revision: string) => ({
-      ...fromPromise({
-        id: "awaits-readiness",
-        async setup(ctx) {
-          await ctx.command.transform((editor) => editor.add({ name: `greet-${revision}`, execute: async () => {} }))
-          return async () => {
-            await Effect.runPromise(plugins.awaitActivation)
-            await Effect.runPromise(Deferred.succeed(cleaned, undefined))
-          }
-        },
-      }),
-      revision,
+    const directory = yield* tmpdirScoped()
+    const configDirectory = path.join(directory.path, "config")
+    const document = path.join(configDirectory, "opencode.json")
+    const target = path.join(configDirectory, "plugins/luna-permission-reviewer")
+    yield* Effect.promise(() => Bun.write(document, "{}"))
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(target, "index.ts"),
+        `export default {
+      id: "opencode-luna-permission-reviewer",
+      async setup(ctx) {
+        const root = await ctx.session.reviewRoot({ sessionID: "ses_unknown" })
+        if (root.complete) throw new Error("unknown lineage must be incomplete")
+        const evidence = await ctx.session.reviewEvidence({ sessionID: "ses_unknown", request: { type: "search", query: "deploy" } })
+        if (evidence.ok || evidence.error !== "not_found") throw new Error("unknown subject must not yield evidence")
+        await ctx.permission.hook("evaluate", (event) => { event.effect = "allow" })
+      }
+    }`,
+      ),
+    )
+    const config = Config.Service.of({
+      entries: () =>
+        Effect.succeed([
+          new Document({
+            type: "document",
+            path: AbsolutePath.make(document),
+            info: new Info({ plugins: [{ package: target, options: { mode: "fixture" } }] }),
+          }),
+        ]),
+      changes: () => Stream.never,
     })
-    yield* plugins.activate([plugin("1")])
-    const reload = yield* plugins.activate([plugin("2")]).pipe(Effect.forkChild)
-    yield* TestClock.adjust("5 seconds")
-    yield* Fiber.join(reload)
-    yield* plugins.awaitActivation
-    yield* Deferred.await(cleaned)
-    expect(yield* commands.get("greet-1")).toBeUndefined()
-    expect(yield* commands.get("greet-2")).toBeDefined()
-    expect((yield* plugins.list()).map((plugin) => plugin.state.status)).toEqual(["active"])
-  }),
-)
-
-it.live("an agent lookup made while a reload has the agent unloaded waits for the reload instead of failing", () =>
-  Effect.gen(function* () {
-    const plugins = yield* Plugin.Service
-    const unloading = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
-    let host: Parameters<Plugin.Generation["effect"]>[0] | undefined
-    const probe: Plugin.Generation = {
-      id: "probe", revision: "1", effect: (ctx) => Effect.sync(() => void (host = ctx)),
-    }
-    const slow = (revision: string): Plugin.Generation => ({
-      id: "slow", revision,
-      effect: () => Effect.addFinalizer(() => revision === "1"
-        ? Deferred.succeed(unloading, undefined).pipe(Effect.andThen(Deferred.await(release))) : Effect.void),
-    })
-    const agents: Plugin.Generation = {
-      id: "agents", revision: "1",
-      effect: (ctx) => ctx.agent.transform((editor) => editor.update("Cat", () => {})).pipe(Effect.asVoid),
-    }
-    yield* plugins.activate([probe, slow("1"), agents])
-    expect((yield* host!.agent.get({ agentID: Agent.ID.make("Cat") })).data.id).toBe(Agent.ID.make("Cat"))
-    const reload = yield* plugins.activate([probe, slow("2"), agents]).pipe(Effect.forkChild)
-    yield* Deferred.await(unloading)
-    const lookup = yield* host!.agent.get({ agentID: Agent.ID.make("Cat") }).pipe(Effect.forkChild)
-    yield* Effect.sleep("50 millis")
-    expect(lookup.pollUnsafe()).toBeUndefined()
-    yield* Deferred.succeed(release, undefined)
-    yield* Fiber.join(reload)
-    expect((yield* Fiber.join(lookup)).data.id).toBe(Agent.ID.make("Cat"))
-    expect(yield* host!.agent.get({ agentID: Agent.ID.make("Nobody") }).pipe(
-      Effect.flip, Effect.map((error) => (error as Error).message),
-    )).toBe("Agent not found: Nobody")
+    yield* Effect.gen(function* () {
+      const scanner = yield* ConfigPluginSource.Service
+      const modules = yield* PluginModule.make()
+      const operation = (yield* scanner.operations()).find(
+        (item): item is Extract<ConfigPluginSource.Operation, { type: "add" }> => item.type === "add",
+      )!
+      const loaded = yield* modules.load(operation)
+      if (!("effect" in loaded)) throw new Error("fixture failed to load")
+      const plugins = yield* Plugin.Service
+      const hooks = yield* PluginHooks.Service
+      const event = () => ({
+        sessionID: Session.ID.make("ses_unknown"),
+        action: "read",
+        resources: ["/external/PHP"],
+        effect: "ask" as const,
+      })
+      yield* plugins.activate([{ ...loaded }])
+      expect((yield* hooks.trigger("permission", "evaluate", event())).effect).toBe("allow")
+      const untrusted = yield* hooks.reviewSource(event())
+      expect(untrusted.event.effect).toBe("ask")
+      expect(untrusted.valid()).toBe(false)
+      yield* plugins.activate([loaded])
+      const trusted = yield* hooks.reviewSource(event())
+      expect(trusted.event.effect).toBe("allow")
+      expect(trusted.valid()).toBe(true)
+      yield* plugins.activate([{ ...loaded }])
+      expect(trusted.valid()).toBe(false)
+      expect((yield* hooks.reviewSource(event())).valid()).toBe(false)
+    }).pipe(
+      Effect.provide(ConfigPluginSource.layer),
+      Effect.provideService(Config.Service, config),
+      Effect.provideService(Global.Service, Global.make({ config: configDirectory })),
+    )
   }),
 )
 
@@ -548,6 +561,39 @@ it.effect("does not let asynchronous plugin cleanup block recovered registry rea
   }),
 )
 
+it.effect("does not let a Promise plugin cleanup that waits for readiness wedge its reload", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const commands = yield* Command.Service
+    const cleaned = yield* Deferred.make<void>()
+    const plugin = (revision: string) => ({
+      ...fromPromise({
+        id: "awaits-readiness",
+        async setup(ctx) {
+          await ctx.command.transform((editor) => editor.add({ name: `greet-${revision}`, execute: async () => {} }))
+          // Like delivering held messages with session.prompt, which waits for plugin activation.
+          return async () => {
+            await Effect.runPromise(plugins.awaitActivation)
+            await Effect.runPromise(Deferred.succeed(cleaned, undefined))
+          }
+        },
+      }),
+      revision,
+    })
+    yield* plugins.activate([plugin("1")])
+
+    const reload = yield* plugins.activate([plugin("2")]).pipe(Effect.forkChild)
+    yield* TestClock.adjust("5 seconds")
+    yield* Fiber.join(reload)
+    yield* plugins.awaitActivation
+    yield* Deferred.await(cleaned)
+
+    expect(yield* commands.get("greet-1")).toBeUndefined()
+    expect(yield* commands.get("greet-2")).toBeDefined()
+    expect((yield* plugins.list()).map((plugin) => plugin.state.status)).toEqual(["active"])
+  }),
+)
+
 it.live("retains Promise plugin groups for later registrations and ignores a disabled group's attempts", () =>
   Effect.gen(function* () {
     const plugins = yield* Plugin.Service
@@ -733,6 +779,56 @@ it.effect("refreshes expired OAuth credentials through the context during activa
       }),
     ).toEqual(refreshed)
     expect(refreshes).toEqual([expired])
+  }),
+)
+
+it.live("an agent lookup made while a reload has the agent unloaded waits for the reload instead of failing", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const unloading = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    let host: Parameters<Plugin.Generation["effect"]>[0] | undefined
+    const probe: Plugin.Generation = {
+      id: "probe",
+      revision: "1",
+      effect: (ctx) => Effect.sync(() => void (host = ctx)),
+    }
+    // Stands in for a plugin whose cleanup takes a while (opencode-meta delivering held messages, say).
+    const slow = (revision: string): Plugin.Generation => ({
+      id: "slow",
+      revision,
+      effect: () =>
+        Effect.addFinalizer(() =>
+          revision === "1"
+            ? Deferred.succeed(unloading, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+        ),
+    })
+    // Like the config agent plugin, which loads after every package plugin and so is unloaded by any reload.
+    const agents: Plugin.Generation = {
+      id: "agents",
+      revision: "1",
+      effect: (ctx) => ctx.agent.transform((editor) => editor.update("Cat", () => {})).pipe(Effect.asVoid),
+    }
+    yield* plugins.activate([probe, slow("1"), agents])
+    expect((yield* host!.agent.get({ agentID: Agent.ID.make("Cat") })).data.id).toBe(Agent.ID.make("Cat"))
+
+    const reload = yield* plugins.activate([probe, slow("2"), agents]).pipe(Effect.forkChild)
+    yield* Deferred.await(unloading)
+    const lookup = yield* host!.agent.get({ agentID: Agent.ID.make("Cat") }).pipe(Effect.forkChild)
+    yield* Effect.sleep("50 millis")
+    expect(lookup.pollUnsafe()).toBeUndefined()
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(reload)
+
+    expect((yield* Fiber.join(lookup)).data.id).toBe(Agent.ID.make("Cat"))
+    // Outside a reload a missing agent still fails at once.
+    expect(
+      yield* host!.agent.get({ agentID: Agent.ID.make("Nobody") }).pipe(
+        Effect.flip,
+        Effect.map((error) => (error as Error).message),
+      ),
+    ).toBe("Agent not found: Nobody")
   }),
 )
 

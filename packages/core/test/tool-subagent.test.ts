@@ -25,8 +25,8 @@ import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { Session } from "@opencode/core/session"
 import { SessionEvent } from "@opencode/core/session/event"
 import { SessionExecution } from "@opencode/core/session/execution"
-import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { SessionInbox } from "@opencode/core/session/inbox"
+import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionStore } from "@opencode/core/session/store"
@@ -66,13 +66,16 @@ const executionNode = makeGlobalNode({
       const bus = yield* Bus.Service
       const store = yield* SessionStore.Service
       const completed = new Set<Session.ID>()
+      const { db } = yield* Database.Service
+      const inbox = yield* SessionInbox.make()
       const complete = Effect.fn("SubagentTest.complete")(function* (sessionID: Session.ID) {
-        if (completed.has(sessionID)) return
+        if (completed.has(sessionID) && (yield* inbox.list(sessionID)).length === 0) return
         if ((yield* store.get(sessionID))?.title?.includes("fail")) {
           yield* new SessionRunnerModel.ModelNotSelectedError({ sessionID })
           return
         }
         completed.add(sessionID)
+        yield* SessionInbox.promote(db, bus, sessionID, "input")
         const assistantMessageID = SessionMessage.ID.create()
         yield* bus.publish(SessionEvent.Step.Started, {
           sessionID,
@@ -103,6 +106,7 @@ const executionNode = makeGlobalNode({
       return SessionExecution.Service.of({
         active: Effect.succeed(new Set()),
         isActive: () => Effect.succeed(false),
+        bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
         resume: complete,
         wake: () => Effect.void,
         interrupt: () => Effect.succeed(false),
@@ -110,7 +114,7 @@ const executionNode = makeGlobalNode({
       })
     }),
   ),
-  deps: [Bus.node, SessionStore.node],
+  deps: [Bus.node, SessionStore.node, Database.node],
 })
 
 const subagentPluginSupervisor = makeLocationNode({
@@ -129,6 +133,7 @@ const subagentPluginSupervisor = makeLocationNode({
     Session.node,
     Job.node,
     SubagentJob.node,
+    SessionExecution.node,
     Tool.node,
     PluginHooks.node,
   ],
@@ -339,6 +344,51 @@ describe("SubagentTool", () => {
     ),
   )
 
+  it.live("says which rule refused a subagent", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.gen(function* () {
+          const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+          const sessions = yield* Session.Service
+          const parent = yield* sessions.create({ location })
+          yield* withSubagent(parent.location)
+          const locations = yield* LocationServiceMap.Service
+          yield* Agent.Service.use((agents) =>
+            agents.transform((editor) =>
+              editor.update(toolIdentity.agent, (agent) => {
+                agent.permissions.push({ action: SubagentTool.name, resource: "*", effect: "deny" })
+              }),
+            ),
+          ).pipe(Effect.provide(locations.get(location)))
+          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
+
+          expect(
+            yield* executeTool(registry, {
+              sessionID: parent.id,
+              ...toolIdentity,
+              call: {
+                type: "tool-call",
+                id: "call-refused",
+                name: SubagentTool.name,
+                input: { agent: "reviewer", description: "refused", prompt: "should fail" },
+              },
+            }),
+          ).toEqual({
+            status: "error",
+            // The model sees the permission error itself, which names the deciding rule.
+            error: {
+              type: "permission.rejected",
+              message: `Permission denied: ${SubagentTool.name} (agent ${toolIdentity.agent}: ${SubagentTool.name} * deny for reviewer)`,
+            },
+          })
+        }),
+      ),
+    ),
+  )
+
   it.live("prevents subagents from launching subagents by default", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
@@ -390,7 +440,10 @@ describe("SubagentTool", () => {
           )
           const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
           const sessions = yield* Session.Service
-          const root = yield* sessions.create({ location })
+          const root = yield* sessions.create({
+            location,
+            permissions: [{ action: "edit", resource: "*", effect: "deny" }],
+          })
           const parent = yield* sessions.create({ parentID: root.id, title: "parent", model: parentModel })
           yield* withSubagent(parent.location)
           const locations = yield* LocationServiceMap.Service
@@ -417,6 +470,23 @@ describe("SubagentTool", () => {
             status: "completed",
           })
           expect((yield* sessions.get(outputSessionID(settled.metadata))).parentID).toBe(parent.id)
+          const grandchild = yield* sessions.get(outputSessionID(settled.metadata))
+          expect(grandchild.permissions).toEqual(parent.permissions)
+          const blocked = yield* executeTool(registry, {
+            sessionID: grandchild.id,
+            ...toolIdentity,
+            call: {
+              type: "tool-call",
+              id: "call-depth-three-subagent",
+              name: SubagentTool.name,
+              input: { agent: "reviewer", description: "too deep", prompt: "must not run" },
+            },
+          })
+          expect(blocked).toMatchObject({
+            status: "error",
+            error: { type: "tool.execution", message: expect.stringContaining("Subagent depth limit reached (2)") },
+          })
+          expect((yield* sessions.list({ parentID: grandchild.id })).data).toHaveLength(0)
         }),
       ),
     ),
@@ -464,9 +534,11 @@ describe("SubagentTool", () => {
             agent: "reviewer",
             model: childModel,
           })
-          expect((yield* sessions.inbox(child.id)).find((message) => message.type === "user")?.payload.text).toBe(
-            "You are a subagent spawned by another session.\nreview this",
-          )
+          expect(
+            (yield* sessions.messages({ sessionID: child.id }))
+              .filter((message) => message.type === "user")
+              .map((message) => message.text),
+          ).toEqual(["You are a subagent spawned by another session.\nreview this"])
 
           const fallback = yield* executeTool(registry, {
             sessionID: parent.id,
@@ -531,9 +603,9 @@ describe("SubagentTool", () => {
           expect((yield* sessions.list({ parentID: parent.id })).data).toHaveLength(1)
           expect((yield* sessions.get(childID)).title).toBe("review")
           expect(
-            (yield* sessions.inbox(childID)).flatMap((message) =>
-              message.type === "user" ? [message.payload.text] : [],
-            ),
+            (yield* sessions.messages({ sessionID: childID, order: "asc" }))
+              .filter((message) => message.type === "user")
+              .map((message) => message.text),
           ).toEqual(["You are a subagent spawned by another session.\nreview this", "continue this"])
           expect(second.content).toEqual([{ type: "text", text: completedOutput(childID) }])
         }),
@@ -844,7 +916,7 @@ describe("SubagentTool", () => {
             status: "error",
             error: {
               type: "tool.execution",
-              message: expect.stringContaining("No model is available for session"),
+              message: expect.stringContaining("Subagent continuation remains undelivered"),
             },
           })
         }),
@@ -852,7 +924,7 @@ describe("SubagentTool", () => {
     ),
   )
 
-  it.live("notifies once when background work completes", () =>
+  it.live("notifies the immediate parent once when nested background work completes", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
@@ -861,7 +933,11 @@ describe("SubagentTool", () => {
         Effect.gen(function* () {
           const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
           const sessions = yield* Session.Service
-          const parent = yield* sessions.create({ location })
+          yield* Effect.promise(() =>
+            Bun.write(path.join(dir.path, "opencode.json"), JSON.stringify({ experimental: { subagent_depth: 2 } })),
+          )
+          const root = yield* sessions.create({ location })
+          const parent = yield* sessions.create({ parentID: root.id })
           yield* withSubagent(parent.location)
           const locations = yield* LocationServiceMap.Service
           const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
@@ -909,6 +985,8 @@ describe("SubagentTool", () => {
           expect(synthetic).toHaveLength(1)
           expect(synthetic[0]?.text).toContain(`<subagent sessionID="${childID}" state="completed"`)
           expect(synthetic[0]?.text).toContain(childText)
+          expect(yield* sessions.inbox(root.id)).toEqual([])
+          expect(yield* sessions.context(root.id)).toEqual([])
         }),
       ),
     ),

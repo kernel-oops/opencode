@@ -41,7 +41,7 @@ for (const position of ["top", "bottom"] as const) {
     await expect(navigation).toHaveCount(1)
     await expect(message).toBeVisible()
     await expect(composer).toBeVisible()
-    await expect(tabs.getByRole("tab")).toHaveText(["Session", "Changes", "More..."])
+    await expect(tabs.getByRole("tab")).toHaveText(["Session", "Changes", "Background", "More..."])
     await expect(tabs).toHaveCSS("padding-left", "0px")
     await expect(tabs).toHaveCSS("padding-right", "0px")
 

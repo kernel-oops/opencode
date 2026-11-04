@@ -1,8 +1,8 @@
 import { describe, expect } from "bun:test"
 import { ai, LanguageModel, Message } from "@opencode/ai/effect"
-import { OpenAIChat } from "@opencode/ai/protocols"
+import { OpenAIChat, OpenAIResponses } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/testing"
-import { ConfigProvider, Effect, Layer } from "effect"
+import { ConfigProvider, Effect, Exit, Layer } from "effect"
 import { Headers } from "effect/http"
 import { AISDKNative } from "@opencode/core/aisdk-native"
 import { Credential } from "@opencode/core/credential"
@@ -82,6 +82,88 @@ function withConfigEnv<A, E, R>(env: Record<string, string>, effect: () => Effec
 }
 
 describe("ModelResolver", () => {
+  for (const contract of [undefined, "discard_partial_items", "unconfirmed-contract"] as const) {
+    it.effect(`retired native interruption settings do not enable control (${contract ?? "absent"})`, () => Effect.gen(function* () {
+      const selected = model("@opencode/ai/providers/openai", {
+        settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture", nativeInterrupt: "discard_partial_items" },
+      })
+      const providers = Layer.mock(Provider.Service, { get: () => Effect.succeed(Provider.Info.make({
+        id: selected.providerID, name: "Fixture", activation: "auto", package: "@opencode/ai/providers/openai", settings: {
+          transport: "websocket",
+          ...(contract === undefined ? {} : { nativeInterrupt: contract }),
+        },
+      })) })
+      const integrations = Layer.mock(Integration.Service, { revision: () => 0, connection: {
+        active: () => Effect.undefined, resolve: () => Effect.die("unused"), key: () => Effect.die("unused"),
+        external: () => Effect.die("unused"),
+        activate: () => Effect.die("unused"), update: () => Effect.die("unused"), remove: () => Effect.die("unused"), status: () => Effect.die("unused"),
+      }, oauth: { connect: () => Effect.die("unused"), status: () => Effect.die("unused"), complete: () => Effect.die("unused"), cancel: () => Effect.die("unused") },
+      command: { connect: () => Effect.die("unused"), status: () => Effect.die("unused"), cancel: () => Effect.die("unused") } })
+      const layer = ModelResolver.layer.pipe(Layer.provide(Layer.mergeAll(providers, integrations,
+        Layer.mock(Model.Service, {}), Layer.mock(Npm.Service, {}), Layer.mock(AISDK.Service, { hook: { sdk: () => Effect.die("unused"), language: () => Effect.die("unused") } }))))
+      const resolved = yield* ModelResolver.Service.use((resolver) => resolver.resolveModel(selected)).pipe(Effect.provide(layer))
+      expect(resolved.model.route.transport).toBe(OpenAIResponses.transport)
+      expect(resolved.model.route.defaults.providerOptions).not.toHaveProperty("nativeInterrupt")
+    }))
+  }
+  const steeringLayer = (selected: Info, settings: Provider.Info["settings"], packageName = "@opencode/ai/providers/openai") => {
+    const providers = Layer.mock(Provider.Service, { get: () => Effect.succeed(Provider.Info.make({
+      id: selected.providerID, name: "Fixture", activation: "auto", package: packageName, settings,
+    })) })
+    const integrations = Layer.mock(Integration.Service, { revision: () => 0, connection: {
+      active: () => Effect.undefined, resolve: () => Effect.die("unused"), key: () => Effect.die("unused"),
+      external: () => Effect.die("unused"),
+      activate: () => Effect.die("unused"), update: () => Effect.die("unused"), remove: () => Effect.die("unused"), status: () => Effect.die("unused"),
+    }, oauth: { connect: () => Effect.die("unused"), status: () => Effect.die("unused"), complete: () => Effect.die("unused"), cancel: () => Effect.die("unused") },
+    command: { connect: () => Effect.die("unused"), status: () => Effect.die("unused"), cancel: () => Effect.die("unused") } })
+    return ModelResolver.layer.pipe(Layer.provide(Layer.mergeAll(providers, integrations,
+      Layer.mock(Model.Service, { default: () => Effect.succeed(selected) }), Layer.mock(Npm.Service, {}),
+      Layer.mock(AISDK.Service, { hook: { sdk: () => Effect.die("unused"), language: () => Effect.die("unused") } }))))
+  }
+  // The provider literal is an operator allowance only; an exact session's execution policy is the activation.
+  for (const allowance of [false, true])
+    for (const optIn of [false, true])
+      for (const transport of ["http", "websocket"] as const)
+        for (const branch of ["explicit", "default"] as const)
+          it.effect(`public native steering needs allowance and session opt-in (allowance=${allowance}, optIn=${optIn}, transport=${transport}, ${branch})`, () => Effect.gen(function* () {
+            const selected = model("@opencode/ai/providers/openai", { modelID: "gpt-6-sol", settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture" } })
+            const settings = { transport, ...(allowance ? { nativeSteer: "response.steer" as const } : {}) }
+            const options = optIn ? { nativeSteer: "response.steer" as const } : undefined
+            const resolved = yield* ModelResolver.Service.use((resolver) =>
+              branch === "explicit" ? resolver.resolveModel(selected, undefined, options) : resolver.resolve(undefined, options).pipe(Effect.map((value) => value!)),
+            ).pipe(Effect.provide(steeringLayer(selected, settings)))
+            const active = allowance && optIn
+            expect(resolved.model.route.transport === OpenAIResponses.nativeSteerTransport).toBe(active)
+            expect(resolved.transport).toBe(active ? "websocket" : transport)
+            expect(resolved.nativeTest).toBe(optIn ? (allowance ? "active" : "allowance-missing") : undefined)
+            expect(resolved.model.route.defaults.providerOptions).not.toHaveProperty("nativeSteer")
+            // A fresh route for the session: the shared default route object is untouched.
+            expect(OpenAIResponses.route.transport).toBe(OpenAIResponses.transport)
+          }))
+  it.effect("model-only nativeSteer metadata never grants the allowance", () => Effect.gen(function* () {
+    const selected = model("@opencode/ai/providers/openai", {
+      settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture", nativeSteer: "response.steer" },
+    })
+    const resolved = yield* ModelResolver.Service.use((resolver) => resolver.resolveModel(selected, undefined, { nativeSteer: "response.steer" }))
+      .pipe(Effect.provide(steeringLayer(selected, { transport: "websocket" })))
+    expect(resolved.model.route.transport).not.toBe(OpenAIResponses.nativeSteerTransport)
+    expect(resolved.nativeTest).toBe("allowance-missing")
+  }))
+  it.effect("an opted-in session never turns a different protocol into OpenAI Responses", () => Effect.gen(function* () {
+    const selected = model("@opencode/ai/providers/openai-compatible", { settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture" } })
+    const resolved = yield* ModelResolver.Service.use((resolver) => resolver.resolveModel(selected, undefined, { nativeSteer: "response.steer" }))
+      .pipe(Effect.provide(steeringLayer(selected, { transport: "http", nativeSteer: "response.steer" }, "@opencode/ai/providers/openai-compatible")))
+    expect(resolved.model.route.protocol).not.toBe(OpenAIResponses.protocol.id)
+    expect(resolved.model.route.transport).not.toBe(OpenAIResponses.nativeSteerTransport)
+    expect(resolved.transport).toBe("http")
+    expect(resolved.nativeTest).toBe("protocol-unsupported")
+  }))
+  it.effect("retired interruption settings do not conflict with explicit public steering", () => Effect.gen(function* () {
+    const selected = model("@opencode/ai/providers/openai", { modelID: "gpt-6-sol", settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture" } })
+    const resolved = yield* ModelResolver.Service.use((resolver) => resolver.resolveModel(selected))
+      .pipe(Effect.provide(steeringLayer(selected, { transport: "websocket", nativeSteer: "response.steer", nativeInterrupt: "discard_partial_items" })), Effect.exit)
+    expect(Exit.isSuccess(resolved)).toBe(true)
+  }))
   it.effect("constructs native Azure requests with deployment IDs and projected resource URLs", () =>
     Effect.gen(function* () {
       const responses = yield* ModelResolver.fromCatalogModel(

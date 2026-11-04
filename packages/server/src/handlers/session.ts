@@ -1,9 +1,12 @@
 import { Instance } from "@opencode/core/instance/service"
 import { Session } from "@opencode/core/session"
+import { SessionClientModel } from "@opencode/core/session/client-model"
+import { SessionTaskControl } from "@opencode/core/session/task-control"
 import { SessionStats } from "@opencode/core/session/stats"
 import { SessionTitle } from "@opencode/core/session/title"
 import { SessionTransfer } from "@opencode/core/session/transfer"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { Form } from "@opencode/core/form"
 import { DateTime, Effect, Stream } from "effect"
 import { HttpServerResponse } from "effect/http"
@@ -27,7 +30,7 @@ import {
   SkillNotFoundError,
 } from "@opencode/protocol/errors"
 import { AbsolutePath } from "@opencode/core/schema"
-import { locationErrors } from "../location"
+import { awaitPlugins, locationErrors } from "../location"
 import { failedMessageDecode, failedSnapshot, missingMessage, missingSession } from "./session-error"
 
 function missingForm(id: Form.ID) {
@@ -37,7 +40,9 @@ function missingForm(id: Form.ID) {
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
+    const selectClientModel = yield* SessionClientModel.make()
     const transfer = yield* SessionTransfer.Service
+    const nativeTest = yield* SessionNativeTest.Service
     const instructions = yield* InstructionEntry.Service
     const instances = yield* Instance.Service
     const requireSession = (sessionID: Session.ID) =>
@@ -48,6 +53,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       if (info.sessionID !== sessionID) return yield* missingForm(formID)
       return { form, info }
     })
+    const tasks = yield* SessionTaskControl.Service
     const busySession = (error: Session.BusyError) =>
       new SessionBusyError({
         sessionID: error.sessionID,
@@ -110,6 +116,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                 model: ctx.payload.model,
                 metadata: ctx.payload.metadata,
                 permissions: ctx.payload.permissions,
+                // A child inherits its parent's location; never supply both fields.
                 ...(ctx.payload.parentID === undefined
                   ? { location: ctx.payload.location ?? { directory: AbsolutePath.make(process.cwd()) } }
                   : { parentID: ctx.payload.parentID }),
@@ -216,18 +223,24 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
       .handle(
         "session.switchAgent",
         Effect.fn(function* (ctx) {
-          yield* session
-            .switchAgent({ sessionID: ctx.params.sessionID, agent: ctx.payload.agent })
-            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          yield* session.switchAgent({ sessionID: ctx.params.sessionID, agent: ctx.payload.agent }).pipe(
+            Effect.catchTag("Session.NotFoundError", missingSession),
+            Effect.catchTag("Session.DelegationBlockedError", (error) =>
+              Effect.fail(new InvalidRequestError({ message: error.message })),
+            ),
+          )
           return HttpApiSchema.NoContent.make()
         }),
       )
       .handle(
         "session.switchModel",
         Effect.fn(function* (ctx) {
-          yield* session
-            .switchModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model })
-            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          yield* selectClientModel({ sessionID: ctx.params.sessionID, model: ctx.payload.model }).pipe(
+            Effect.catchTag("Session.NotFoundError", missingSession),
+            Effect.catchTag("Session.DelegationBlockedError", (error) =>
+              Effect.fail(new InvalidRequestError({ message: error.message })),
+            ),
+          )
           return HttpApiSchema.NoContent.make()
         }),
       )
@@ -255,6 +268,16 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             yield* session
               .setPermissions({ sessionID: ctx.params.sessionID, permissions: ctx.payload.permissions })
               .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          if (ctx.payload.contextBudget !== undefined)
+            yield* session
+              .setContextBudget({ sessionID: ctx.params.sessionID, contextBudget: ctx.payload.contextBudget })
+              .pipe(
+                Effect.catchTag("Session.NotFoundError", missingSession),
+                Effect.catchTag(
+                  "Session.InvalidContextBudgetError",
+                  (error) => new InvalidRequestError({ message: error.message }),
+                ),
+              )
           if (ctx.payload.archived !== undefined)
             yield* (ctx.payload.archived ? session.archive : session.unarchive)(ctx.params.sessionID).pipe(
               Effect.catchTag("Session.NotFoundError", missingSession),
@@ -273,6 +296,9 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             })
             .pipe(
               Effect.catchTag("Session.NotFoundError", missingSession),
+              Effect.catchTag("Session.DelegationBlockedError", (error) =>
+                Effect.fail(new InvalidRequestError({ message: error.message })),
+              ),
               Effect.catchTag("Session.DestinationNotFoundError", (error) =>
                 Effect.fail(new InvalidRequestError({ message: `Directory does not exist: ${error.directory}` })),
               ),
@@ -401,6 +427,26 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   }),
                 ),
               ),
+            )
+          return { data }
+        }),
+      )
+      .handle(
+        "session.append",
+        Effect.fn(function* (ctx) {
+          const data = yield* session
+            .append({
+              sessionID: ctx.params.sessionID,
+              id: ctx.payload.id,
+              text: ctx.payload.text,
+              final: ctx.payload.final,
+              agent: ctx.payload.agent,
+              model: ctx.payload.model,
+              metadata: ctx.payload.metadata,
+            })
+            .pipe(
+              Effect.catchTag("Session.NotFoundError", missingSession),
+              Effect.catchTag("Session.MessageNotFoundError", missingMessage),
             )
           return { data }
         }),
@@ -558,6 +604,28 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         }),
       )
       .handle(
+        "session.nativeTest.get",
+        Effect.fn(function* (ctx) {
+          const info = yield* session
+            .get(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          // The allowance check reads the settled catalog, as the model routes do.
+          yield* awaitPlugins
+          return { data: yield* SessionNativeTest.status(nativeTest, info) }
+        }),
+      )
+      .handle(
+        "session.nativeTest.put",
+        Effect.fn(function* (ctx) {
+          const info = yield* session
+            .get(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+          // The allowance check reads the settled catalog, as the model routes do.
+          yield* awaitPlugins
+          return { data: yield* SessionNativeTest.update(nativeTest, info, ctx.payload) }
+        }),
+      )
+      .handle(
         "session.instructions.entry.list",
         Effect.fn(function* (ctx) {
           yield* requireSession(ctx.params.sessionID)
@@ -609,6 +677,38 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         Effect.fn(function* (ctx) {
           yield* requireSession(ctx.params.sessionID)
           return { interrupted: yield* session.interrupt(ctx.params.sessionID, { resume: ctx.query.resume }) }
+        }),
+      )
+      .handle(
+        "session.task.status",
+        Effect.fn(function* (ctx) {
+          return yield* tasks
+            .status(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+        }),
+      )
+      .handle(
+        "session.task.stopResponse",
+        Effect.fn(function* (ctx) {
+          return yield* tasks
+            .stopResponse(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+        }),
+      )
+      .handle(
+        "session.task.resume",
+        Effect.fn(function* (ctx) {
+          return yield* tasks
+            .resume(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
+        }),
+      )
+      .handle(
+        "session.task.stopAll",
+        Effect.fn(function* (ctx) {
+          return yield* tasks
+            .stopAll(ctx.params.sessionID)
+            .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
         }),
       )
       .handle(

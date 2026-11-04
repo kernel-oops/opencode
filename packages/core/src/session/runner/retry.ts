@@ -1,4 +1,5 @@
 export * as SessionRunnerRetry from "./retry.js"
+import { SessionContextBudget } from "../context-budget.js"
 
 import { AIError, isRetryable } from "@opencode/ai/effect"
 import { Agent } from "@opencode/schema/agent"
@@ -34,6 +35,7 @@ export const policy = (sessionID: SessionSchema.ID) =>
     const decide = yield* ModelRetry.policy
     return (input: Input) =>
       Effect.gen(function* () {
+        if (SessionContextBudget.isBlocked(input.cause)) return { retry: false as const }
         const next = yield* decide(input)
         if (!next) return { retry: false as const }
         const event: PluginHooks.Domains["session"]["retry"] = {

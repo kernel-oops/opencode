@@ -1,4 +1,5 @@
 export * as SessionProjector from "./projector.js"
+import { ClientModelSelection } from "./client-model-selection.js"
 
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema, Stream } from "effect"
@@ -26,6 +27,7 @@ import { AbsolutePath, RelativePath } from "../schema.js"
 import type { SessionSchema } from "./schema.js"
 import { SessionHistory } from "./history.js"
 import { ProjectTable } from "../project/sql.js"
+import { SessionDelegation } from "./delegation.js"
 
 type DatabaseService = Database.Interface["db"]
 type MessageEvent = Exclude<
@@ -538,8 +540,28 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const db = (yield* Database.Service).db
+    yield* bus.project(SessionEvent.Execution.Started, (event) => SessionDelegation.open(db, event.data.sessionID))
     yield* bus.project(SessionEvent.Created, (event) =>
       Effect.gen(function* () {
+        if (event.data.parentID) yield* SessionDelegation.inherit(db, event.data.parentID, event.data.sessionID)
+        yield* SessionDelegation.open(db, event.data.sessionID)
+        const delegated = yield* SessionDelegation.get(db, event.data.sessionID)
+        if (
+          delegated &&
+          delegated.origin_id === event.data.sessionID &&
+          (event.data.parentID ||
+            event.data.agent !== delegated.target_agent ||
+            event.data.location.directory !== delegated.source_directory ||
+            event.data.model?.id !== delegated.target_model.id ||
+            event.data.model?.providerID !== delegated.target_model.providerID ||
+            (event.data.model?.variant ?? "default") !== (delegated.target_model.variant ?? "default"))
+        )
+          return yield* Effect.die(
+            new SessionDelegation.BlockedError({
+              sessionID: event.data.sessionID,
+              message: "Delegated initial identity does not match reserved authority",
+            }),
+          )
         const stored = yield* db
           .insert(SessionTable)
           .values({
@@ -568,6 +590,20 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.Moved, (event) =>
       Effect.gen(function* () {
+        const current = yield* db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (
+          current &&
+          (current.directory !== event.data.location.directory ||
+            (current.path ?? "") !== (event.data.subpath ?? "") ||
+            current.workspace_id !== (event.data.location.workspaceID ?? null) ||
+            (event.data.projectID && current.project_id !== event.data.projectID))
+        )
+          yield* SessionDelegation.protect(db, event.data.sessionID).pipe(Effect.orDie)
         yield* run(db, event)
         yield* db
           .update(SessionTable)
@@ -622,23 +658,26 @@ const layer = Layer.effectDiscard(
           .pipe(Effect.orDie)
         yield* Effect.forEach(
           rows,
-          (row) => {
-            const directory = event.data.adopted?.includes(row.projectID)
-              ? row.canonical
-              : AbsolutePath.make(path.resolve(row.directory))
-            if (!FSUtil.contains(event.data.directory, directory)) return Effect.void
-            return db
-              .update(SessionTable)
-              .set({
-                project_id: event.data.projectID,
-                path: RelativePath.make(path.relative(event.data.directory, directory).replaceAll("\\", "/")),
-                // Self-assignment suppresses the column's $onUpdate: adoption is not activity.
-                time_updated: sql`${SessionTable.time_updated}`,
-              })
-              .where(eq(SessionTable.id, row.id))
-              .run()
-              .pipe(Effect.orDie)
-          },
+          (row) =>
+            Effect.gen(function* () {
+              // A directory re-resolution must not change delegated authority.
+              if (yield* SessionDelegation.get(db, row.id)) return
+              const directory = event.data.adopted?.includes(row.projectID)
+                ? row.canonical
+                : AbsolutePath.make(path.resolve(row.directory))
+              if (!FSUtil.contains(event.data.directory, directory)) return
+              yield* db
+                .update(SessionTable)
+                .set({
+                  project_id: event.data.projectID,
+                  path: RelativePath.make(path.relative(event.data.directory, directory).replaceAll("\\", "/")),
+                  // Self-assignment suppresses the column's $onUpdate: adoption is not activity.
+                  time_updated: sql`${SessionTable.time_updated}`,
+                })
+                .where(eq(SessionTable.id, row.id))
+                .run()
+                .pipe(Effect.orDie)
+            }),
           { discard: true },
         )
       }),
@@ -651,6 +690,14 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.AgentSelected, (event) =>
       Effect.gen(function* () {
+        const current = yield* db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (current?.agent !== event.data.agent)
+          yield* SessionDelegation.protect(db, event.data.sessionID).pipe(Effect.orDie)
         yield* run(db, event)
         yield* db
           .update(SessionTable)
@@ -662,6 +709,34 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.ModelSelected, (event) =>
       Effect.gen(function* () {
+        const client = yield* ClientModelSelection.matches(event.data.sessionID, event.data.model, event.id)
+        const current = yield* db
+          .select()
+          .from(SessionTable)
+          .where(eq(SessionTable.id, event.data.sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (
+          client ||
+          current?.model?.id !== event.data.model.id ||
+          current?.model?.providerID !== event.data.model.providerID ||
+          (current?.model?.variant ?? "default") !== (event.data.model.variant ?? "default")
+        )
+          yield* SessionDelegation.assertModelTransition(
+            db,
+            event.data.sessionID,
+            event.data.model,
+            false,
+            event.id,
+          ).pipe(Effect.scoped, Effect.orDie)
+        // Operational authority, like delegation itself, survives SQLite reopen, not event imports.
+        if (client)
+          yield* db
+            .update(SessionDelegation.Table)
+            .set({ client_model: event.data.model })
+            .where(eq(SessionDelegation.Table.session_id, event.data.sessionID))
+            .run()
+            .pipe(Effect.orDie)
         yield* run(db, event)
         yield* db
           .update(SessionTable)
@@ -683,6 +758,22 @@ const layer = Layer.effectDiscard(
       db
         .update(SessionTable)
         .set({ metadata: event.data.metadata, time_updated: event.created })
+        .where(eq(SessionTable.id, event.data.sessionID))
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* bus.project(SessionEvent.ContextBudgetConfigured, (event) =>
+      db
+        .update(SessionTable)
+        .set({ context_budget: event.data.policy, context_budget_state: null, time_updated: event.created })
+        .where(eq(SessionTable.id, event.data.sessionID))
+        .run()
+        .pipe(Effect.orDie),
+    )
+    yield* bus.project(SessionEvent.ContextBudgetChanged, (event) =>
+      db
+        .update(SessionTable)
+        .set({ context_budget_state: event.data.state, time_updated: sql`${SessionTable.time_updated}` })
         .where(eq(SessionTable.id, event.data.sessionID))
         .run()
         .pipe(Effect.orDie),
@@ -727,9 +818,23 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.MessageContentUpdated, (event) => run(db, event))
     yield* bus.project(SessionEvent.UsageRecorded, (event) => applyUsage(db, event.data.sessionID, event.data))
-    yield* bus.project(SessionEvent.Forked, (event) => projectFork(db, event))
+    yield* bus.project(SessionEvent.Forked, (event) =>
+      Effect.gen(function* () {
+        const reserved = yield* SessionDelegation.get(db, event.data.sessionID)
+        if (reserved?.origin_id === event.data.sessionID)
+          return yield* Effect.die(
+            new SessionDelegation.BlockedError({
+              sessionID: event.data.sessionID,
+              message: "Reserved independent owner cannot be replaced by a fork",
+            }),
+          )
+        yield* SessionDelegation.inherit(db, event.data.parentID, event.data.sessionID)
+        yield* projectFork(db, event)
+      }),
+    )
     yield* bus.project(SessionEvent.InboxDelivered, (event) =>
       Effect.gen(function* () {
+        yield* SessionDelegation.open(db, event.data.sessionID)
         const input = yield* SessionInbox.projectDelivered(db, {
           id: event.data.inboxID,
           sessionID: event.data.sessionID,
@@ -810,15 +915,33 @@ const layer = Layer.effectDiscard(
     yield* bus.project(SessionEvent.Shell.Ended, (event) => run(db, event))
     yield* bus.project(SessionEvent.Step.Started, (event) =>
       Effect.gen(function* () {
+        yield* SessionDelegation.open(db, event.data.sessionID)
         yield* run(db, event)
         yield* touch(db, event)
       }),
     )
     yield* bus.project(SessionEvent.Step.Streamed, (event) => run(db, event))
+    yield* bus.project(SessionEvent.Step.Observed, (event) => run(db, event))
+    yield* bus.project(SessionEvent.Step.Interrupted, (event) =>
+      Effect.gen(function* () {
+        yield* run(db, event)
+        if (event.data.cost !== undefined && event.data.tokens !== undefined)
+          yield* applyUsage(db, event.data.sessionID, { cost: event.data.cost, tokens: event.data.tokens })
+      }),
+    )
     yield* bus.project(SessionEvent.Step.Ended, (event) =>
       Effect.gen(function* () {
         yield* run(db, event)
-        yield* applyUsage(db, event.data.sessionID, event.data, event.created)
+        if (event.data.cost !== undefined && event.data.tokens !== undefined)
+          yield* applyUsage(db, event.data.sessionID, { cost: event.data.cost, tokens: event.data.tokens }, event.created)
+        else yield* touch(db, event)
+      }),
+    )
+    yield* bus.project(SessionEvent.Step.NativeEnded, (event) =>
+      Effect.gen(function* () {
+        yield* run(db, event)
+        // Absent usage is unknown, never zero.
+        if (event.data.usage) yield* applyUsage(db, event.data.sessionID, event.data.usage)
       }),
     )
     yield* bus.project(SessionEvent.Step.Failed, (event) =>
@@ -849,6 +972,13 @@ const layer = Layer.effectDiscard(
       Effect.gen(function* () {
         yield* run(db, event)
         yield* InstructionState.advanceEpoch(db, event.data.sessionID, event.durable.seq)
+        if (event.data.reason === "manual")
+          yield* db
+            .update(SessionTable)
+            .set({ context_budget_state: null, time_updated: sql`${SessionTable.time_updated}` })
+            .where(eq(SessionTable.id, event.data.sessionID))
+            .run()
+            .pipe(Effect.orDie)
       }),
     )
     yield* bus.project(SessionEvent.Compaction.Failed, (event) => run(db, event))
@@ -912,10 +1042,11 @@ const layer = Layer.effectDiscard(
         yield* SessionBlob.releaseFrom(db, event.data.sessionID, boundary.seq)
       }),
     )
-    yield* bus.subscribe([SessionEvent.Step.Ended, SessionEvent.Step.Failed, SessionEvent.UsageRecorded]).pipe(
+    yield* bus.subscribe([SessionEvent.Step.Ended, SessionEvent.Step.NativeEnded, SessionEvent.Step.Failed, SessionEvent.Step.Interrupted, SessionEvent.UsageRecorded]).pipe(
       Stream.runForEach((event) => {
+        if (event.type === SessionEvent.Step.NativeEnded.type && event.data.usage === undefined) return Effect.void
         if (
-          event.type === SessionEvent.Step.Failed.type &&
+          (event.type === SessionEvent.Step.Ended.type || event.type === SessionEvent.Step.Failed.type || event.type === SessionEvent.Step.Interrupted.type) &&
           (event.data.cost === undefined || event.data.tokens === undefined)
         )
           return Effect.void

@@ -6,7 +6,7 @@ import { Session } from "@opencode/core/session"
 import { Effect } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/http-api"
 import { Api } from "../api"
-import { ConflictError, PermissionNotFoundError, PermissionSavedNotFoundError } from "@opencode/protocol/errors"
+import { ConflictError, InvalidRequestError, PermissionNotFoundError, PermissionSavedNotFoundError } from "@opencode/protocol/errors"
 import { locationErrors, response, sessionInfo } from "../location"
 import { missingSession } from "./session-error"
 
@@ -77,9 +77,14 @@ export const PermissionHandler = HttpApiBuilder.group(Api, "server.permission", 
         "session.permission.reply",
         Effect.fn(function* (ctx) {
           const owned = yield* requireOwnedRequest(ctx.params.sessionID, ctx.params.requestID)
+          // This is the existing client-control boundary, not cryptographic proof of a human gesture.
+          // Plugin replies never receive this private origin argument; prompt text is not interpreted here.
           yield* owned.permission
-            .reply({ requestID: ctx.params.requestID, reply: ctx.payload.decision, message: ctx.payload.message, experimental: ctx.payload.experimental })
-            .pipe(Effect.catchTag("Permission.NotFoundError", () => missingRequest(ctx.params.requestID)))
+            .reply({ requestID: ctx.params.requestID, reply: ctx.payload.decision, message: ctx.payload.message, experimental: ctx.payload.experimental }, true)
+            .pipe(
+              Effect.catchTag("Permission.NotFoundError", () => missingRequest(ctx.params.requestID)),
+              Effect.catchTag("Permission.InvalidReplyError", (error) => new InvalidRequestError({ message: error.message })),
+            )
           return HttpApiSchema.NoContent.make()
         }),
       )

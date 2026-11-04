@@ -17,6 +17,8 @@ interface CheckpointValue {
   readonly responseID: string
   readonly request: Readonly<Record<string, unknown>>
   readonly output: ReadonlyArray<unknown>
+  readonly steer?: string
+  readonly automatic?: boolean
 }
 
 /**
@@ -40,6 +42,7 @@ export interface DriverInput {
   readonly message: string
   readonly base: BaseDriver
   readonly continuation?: Shape
+  readonly steering?: boolean
 }
 
 const checkpointValue = (checkpoint: ChannelCheckpoint | undefined): CheckpointValue | undefined => {
@@ -53,6 +56,8 @@ const checkpointValue = (checkpoint: ChannelCheckpoint | undefined): CheckpointV
     responseID: checkpoint.value.responseID,
     request: checkpoint.value.request,
     output: checkpoint.value.output,
+    steer: typeof checkpoint.value.steer === "string" ? checkpoint.value.steer : undefined,
+    automatic: checkpoint.value.automatic === true,
   }
 }
 
@@ -115,7 +120,7 @@ const incremental = (
   if (!Array.isArray(input) || !Array.isArray(previousInput)) return undefined
   if (canonical(invariant(request)) !== canonical(invariant(checkpoint.request))) return undefined
   const baseline = [...previousInput, ...checkpoint.output]
-  if (input.length <= baseline.length) return undefined
+  if (input.length < baseline.length) return undefined
   if (!baseline.every((item, index) => canonical(comparable(item)) === canonical(comparable(input[index]))))
     return undefined
   return input.slice(baseline.length)
@@ -144,25 +149,119 @@ const rejected = (
   }),
 })
 
+const unsupported = new Set<string>()
+const decodeSteer = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    id: Schema.optional(Schema.NonEmptyString),
+    previous_response_id: Schema.NonEmptyString,
+  }),
+)
+
 export const driver = (input: DriverInput): WebSocketChannelDriver => {
   const { previous_response_id: _previousResponseID, ...request } = input.request
   const shape = input.continuation ?? ((fields: Readonly<Record<string, unknown>>) => fields)
   let output: OpenResponses.StreamItem[] = []
+  let responseID: string | undefined
+  let steer: string | undefined
+  let accepted = false
+  let steerID: string | undefined
+  let terminal: Extract<ChannelObservation, { type: "completed" | "incomplete" }> | undefined
+  const handoff = (automatic: boolean, continuation?: string): ChannelObservation => ({
+    ...terminal!,
+    continuation,
+    checkpoint: {
+      protocol: PROTOCOL,
+      pendingInput: true,
+      value: {
+        ...checkpointValue(terminal!.checkpoint)!,
+        steer,
+        automatic,
+      } satisfies CheckpointValue,
+    },
+  })
   return {
+    steer: input.steering
+      ? (text) =>
+          Effect.sync(() => {
+            // shortcut: one update per response; additional messages use the normal inbox boundary.
+            if (
+              !responseID ||
+              terminal ||
+              steer !== undefined ||
+              !text.trim() ||
+              unsupported.has(String(request.model))
+            )
+              return undefined
+            steer = text
+            return ProviderShared.encodeJson({ type: "response.steer", previous_response_id: responseID, input: text })
+          })
+      : undefined,
     create: (checkpoint) =>
-      Effect.sync(() => {
-        output = []
-        const previous = checkpointValue(checkpoint)
-        // Ask the route first: diffing the whole history is wasted when it declines the continuation.
-        const fields = previous ? shape(request) : undefined
-        const delta = previous && fields ? incremental(request, previous) : undefined
-        if (!previous || !fields || !delta)
-          return { message: ProviderShared.encodeJson(request), mode: "full" as const }
-        return {
-          message: ProviderShared.encodeJson({ ...fields, input: delta, previous_response_id: previous.responseID }),
-          mode: "incremental" as const,
-        }
-      }),
+      input.base.create(undefined).pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            output = []
+            const previous = checkpointValue(checkpoint)
+            // Ask the route first: diffing the whole history is wasted when it declines the continuation.
+            const fields = previous ? shape(request) : undefined
+            const delta = previous && fields ? incremental(request, previous) : undefined
+            if (previous?.automatic && (!fields || !delta))
+              return yield* new AIError({
+                reason: new TransportError({
+                  message: "Conversation changed before the automatic steering continuation",
+                  transport: "websocket",
+                  operation: "request",
+                  recovery: "rotate-and-retry-full",
+                }),
+              })
+            if (!previous || !fields || !delta || (delta.length === 0 && previous.steer === undefined))
+              return { message: ProviderShared.encodeJson(request), mode: "full" as const }
+            const steerIndex =
+              previous.steer === undefined
+                ? -1
+                : delta.findIndex(
+                    (item) =>
+                      ProviderShared.isRecord(item) &&
+                      item.role === "user" &&
+                      Array.isArray(item.content) &&
+                      item.content.length === 1 &&
+                      ProviderShared.isRecord(item.content[0]) &&
+                      item.content[0].type === "input_text" &&
+                      item.content[0].text === previous.steer,
+                  )
+            if (previous.steer !== undefined && steerIndex === -1)
+              return yield* new AIError({
+                reason: new TransportError({
+                  message: "Accepted steering is missing from canonical history",
+                  transport: "websocket",
+                  operation: "request",
+                  recovery: "rotate-and-retry-full",
+                }),
+              })
+            const remaining = delta.filter((_, index) => index !== steerIndex)
+            if (previous.automatic) {
+              if (remaining.length > 0)
+                return yield* new AIError({
+                  reason: new TransportError({
+                    message: "New input requires a fresh request after steering",
+                    transport: "websocket",
+                    operation: "request",
+                    recovery: "rotate-and-retry-full",
+                  }),
+                })
+              return { message: "", mode: "automatic" as const }
+            }
+            return {
+              message: ProviderShared.encodeJson({
+                ...fields,
+                input: remaining,
+                previous_response_id: previous.responseID,
+              }),
+              mode: "incremental" as const,
+            }
+          }),
+        ),
+      ),
     observe: (create, frame) =>
       Effect.gen(function* () {
         const event = yield* OpenResponses.decodeChannelEvent(frame).pipe(
@@ -170,6 +269,40 @@ export const driver = (input: DriverInput): WebSocketChannelDriver => {
             ProviderShared.eventError(input.id, `Invalid ${input.name} WebSocket event`, frame, cause),
           ),
         )
+        if (input.steering && event.type.startsWith("response.steer.")) {
+          const identity = yield* decodeSteer(event.steer).pipe(
+            Effect.mapError((cause) =>
+              ProviderShared.eventError(input.id, "Invalid steering acknowledgement", frame, cause),
+            ),
+          )
+          if (
+            steer === undefined ||
+            identity.previous_response_id !== responseID ||
+            (event.type !== "response.steer.failed" && identity.id === undefined) ||
+            (steerID !== undefined && identity.id !== steerID)
+          )
+            return yield* ProviderShared.eventError(
+              input.id,
+              "Steering acknowledgement does not match the active update",
+              frame,
+            )
+          steerID = identity.id
+          if (event.type === "response.steer.accepted") {
+            accepted = true
+            return { type: "ignore" }
+          }
+          if (event.type === "response.steer.failed") {
+            if (ProviderShared.isRecord(event.error) && event.error.code === "steering_not_supported")
+              unsupported.add(String(request.model))
+            steer = undefined
+            accepted = false
+            return terminal ?? { type: "ignore" }
+          }
+          if (terminal && accepted && event.type === "response.steer.pending") return handoff(false)
+          return { type: "ignore" }
+        }
+        if (terminal && accepted && event.type === "response.created") return handoff(true, frame)
+        if (event.type === "response.created") responseID = event.response?.id
         const observation = yield* input.base.observeEvent
           ? input.base.observeEvent(create, frame, event)
           : input.base.observe(create, frame)
@@ -188,22 +321,36 @@ export const driver = (input: DriverInput): WebSocketChannelDriver => {
           )
             return rejected(observation, "retry-full")
         }
-        if (observation.type !== "completed") return observation
+        if (observation.type !== "completed" && !(observation.type === "incomplete" && steer !== undefined))
+          return observation
+        if (
+          steer !== undefined &&
+          observation.type === "incomplete" &&
+          event.response?.incomplete_details?.reason !== "steered"
+        )
+          return yield* new AIError({
+            reason: new TransportError({
+              message: "Steering parent ended without a steering continuation",
+              transport: "websocket",
+              operation: "read",
+              recovery: "rotate-and-retry-full",
+            }),
+          })
         // A trigger installs a different context window. Clear the append baseline, retaining the socket.
         if (
           Array.isArray(request.input) &&
           request.input.some((item) => ProviderShared.isRecord(item) && item.type === "compaction_trigger")
         )
           return observation
-        const responseID = event.response?.id
-        if (!responseID || responseID.trim().length === 0) return observation
-        return {
+        const finishedID = event.response?.id
+        if (!finishedID || finishedID.trim().length === 0) return observation
+        const completed = {
           ...observation,
           checkpoint: {
             protocol: PROTOCOL,
             value: {
               version: VERSION,
-              responseID,
+              responseID: finishedID,
               request,
               // Completion can re-encrypt reasoning. Callers replay the item already emitted by output_item.done.
               output: event.response?.output?.length
@@ -216,6 +363,9 @@ export const driver = (input: DriverInput): WebSocketChannelDriver => {
             } satisfies CheckpointValue,
           },
         }
+        terminal = completed
+        if (steer !== undefined) return { type: "ignore" }
+        return completed
       }),
   }
 }

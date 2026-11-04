@@ -155,16 +155,38 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
 const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
   const sameProvider = message.model.providerID === model.providerID
   const sameModel = sameProvider && message.model.id === model.id
-  const reuseProviderMetadata = sameModel && message.error === undefined
-  const reasoningInterrupted = message.content.some(
+  // A public steered parent ends at the provider's done prefix exactly like a native interrupt.
+  const nativeInterrupted = message.native?.nativeInterrupted === true || message.native?.nativeSteered === true
+  const nativeAmbiguous = message.native?.nativeAmbiguous === true
+  const nativeObserved = message.native?.nativeObserved === true
+  const nativeRestricted = nativeInterrupted || nativeAmbiguous || (nativeObserved && (message.error !== undefined || message.finish === undefined))
+  // A length terminal can close display reasoning without acknowledging its
+  // opaque provider item. Keep readable partial output, but require DONE proof.
+  const reasoningRestricted = nativeRestricted || (nativeObserved && message.finish === "length")
+  const completed = Array.isArray(message.native?.completedOutputItems)
+    ? message.native.completedOutputItems.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    : []
+  const acknowledged = (state: Record<string, unknown> | undefined) => completed.find((item) => item.id === state?.itemId)
+  const acknowledgedText = (item: Record<string, unknown> | undefined, field: "content" | "summary") =>
+    Array.isArray(item?.[field]) ? item[field].flatMap((part: unknown) => {
+      if (typeof part !== "object" || part === null) return []
+      if ("text" in part && typeof part.text === "string") return [part.text]
+      if ("refusal" in part && typeof part.refusal === "string") return [part.refusal]
+      return []
+    }).join("\n") : ""
+  // A later owned-tool failure does not revoke the provider's acknowledged items.
+  // Native receipts still restrict replay below to the authoritative done prefix.
+  const reuseProviderMetadata = sameModel && (message.error === undefined || nativeInterrupted || nativeObserved) && (message.interruption === undefined || nativeInterrupted || nativeObserved)
+  const reasoningInterrupted = (nativeObserved && message.finish === "length") || message.content.some(
     (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
   )
   const content = message.content.flatMap((item): ContentPart[] => {
+    if (nativeRestricted && item.type !== "tool" && !acknowledged(item.native)) return []
     if (item.type === "text")
       return [
         {
           type: "text",
-          text: item.text,
+          text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "content") : item.text,
           // Text can carry provider-bound state (e.g. Gemini thought signatures),
           // which is only replayable against the model that produced it.
           providerMetadata: reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
@@ -172,17 +194,22 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
     if (item.type === "reasoning") {
-      if (message.error !== undefined || reasoningInterrupted) return []
-      return reuseProviderMetadata
+      if (!reasoningRestricted && (message.error !== undefined || reasoningInterrupted)) return []
+      // A durable native done receipt can precede the display's Reasoning.Ended event.
+      // Ordinary unfinished reasoning still loses its provider-bound state.
+      return reuseProviderMetadata && (!reasoningInterrupted || (reasoningRestricted && acknowledged(item.native)))
         ? [
             {
               type: "reasoning",
-              text: item.text,
-              providerMetadata: providerMetadata(providerMetadataKey, item.native),
+              text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary") : item.text,
+              providerMetadata: providerMetadata(providerMetadataKey, reasoningRestricted ? {
+                ...item.native,
+                reasoningEncryptedContent: acknowledged(item.native)?.encrypted_content ?? null,
+              } : item.native),
             },
           ]
-        : item.text.length > 0
-          ? [{ type: "reasoning", text: item.text }]
+        : (nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary").length > 0 : item.text.length > 0)
+          ? [{ type: message.error === undefined && message.interruption === undefined && !reasoningInterrupted ? "reasoning" : "text", text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary") : item.text }]
           : []
     }
     // Call-side metadata is model-scoped proof of generation (Gemini thought
@@ -190,7 +217,12 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
     // replay it.
     const reuseToolProviderMetadata =
       reuseProviderMetadata ||
-      (sameModel && item.executed === true && (item.state.status === "completed" || item.state.status === "error"))
+      (sameModel && (item.executed === true || message.interruption !== undefined) && item.state.status === "completed") ||
+      (sameModel && (item.executed === true || (message.interruption !== undefined && item.time.ran !== undefined)) && item.state.status === "error" && item.state.error.type !== "tool.superseded" && item.state.error.type !== "tool.outcome-unknown")
+    if ((message.interruption || nativeAmbiguous) && item.executed === true && item.state.status === "error" && item.state.error.type === "tool.outcome-unknown")
+      return [Message.text(`The provider-hosted tool ${item.name} (${item.id}) did not report its result before generation was superseded. Its external outcome is unknown; do not assume it did not run or automatically repeat it.`)]
+    // Incomplete arguments are display history, not a generated executable call.
+    if ((message.interruption || nativeRestricted) && item.time.ran === undefined && !((nativeInterrupted || nativeObserved) && acknowledged(item.native))) return []
     const call = toolCall(
       item,
       reuseToolProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
@@ -202,6 +234,23 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
     const result = toolResult(item, sameProvider ? providerMetadata(providerMetadataKey, item.native) : undefined)
     return result ? [call, result] : [call]
   })
+  // A crash can occur after the acknowledgement transaction but before display-part publication.
+  // Recover only complete text/reasoning proof; never reconstruct an executable hosted/local call.
+  if (nativeRestricted) for (const item of completed) {
+    if (message.content.some((part) => part.type !== "tool" && part.native?.itemId === item.id)) continue
+    if (item.type === "message") content.push(Message.text(acknowledgedText(item, "content")))
+    if (item.type === "reasoning") {
+      const text = acknowledgedText(item, "summary")
+      if (sameModel) content.push({ type: "reasoning", text, providerMetadata: providerMetadata(providerMetadataKey, {
+        itemId: item.id, reasoningEncryptedContent: typeof item.encrypted_content === "string" ? item.encrypted_content : null,
+      }) })
+      else if (text) content.push(Message.text(text))
+    }
+  }
+  if (nativeRestricted && Array.isArray(message.native?.unresolvedHostedItems))
+    for (const item of message.native.unresolvedHostedItems)
+      if (typeof item === "object" && item !== null && "id" in item && "type" in item)
+        content.push(Message.text(`The provider started hosted action ${String(item.type).slice(0, 128).replace(/[^\w.:-]/g, "_")} (${String(item.id).slice(0, 128).replace(/[^\w.:-]/g, "_")}) but did not acknowledge its completion. Its external outcome is unknown; do not assume it did not run or automatically repeat it.`))
   const meaningful = content.filter((part) => {
     if (part.type === "text") return part.text !== ""
     if (part.type !== "reasoning") return true
@@ -209,6 +258,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
   })
   const results = message.content
     .filter((item): item is SessionMessage.AssistantTool => item.type === "tool" && item.executed !== true)
+    .filter((item) => (!message.interruption && !nativeRestricted) || item.time.ran !== undefined || ((nativeInterrupted || nativeObserved) && acknowledged(item.native)))
     .map((item) =>
       toolResult(item, reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined),
     )

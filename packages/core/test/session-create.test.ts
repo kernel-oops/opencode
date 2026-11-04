@@ -32,6 +32,8 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionTransfer } from "@opencode/core/session/transfer"
+import { SessionDelegation } from "@opencode/core/session/delegation"
+import { NewSessionTable } from "@opencode/core/session/new-session.sql"
 import { Workspace } from "@opencode/core/workspace"
 import { Expected } from "./lib/session-message"
 import { testEffect } from "./lib/effect"
@@ -85,6 +87,167 @@ const projectIt = testEffect(
 )
 const location = Location.Ref.make({ directory: AbsolutePath.make("/project") })
 const id = Session.ID.create()
+
+it.effect(
+  "persists an explicit session budget without child/fork inheritance and re-arms only by explicit maintenance",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const bus = yield* Bus.Service
+      const db = (yield* Database.Service).db
+      const parent = yield* sessions.create({ location })
+      expect(parent.contextBudget).toBeUndefined()
+      const policy = { target: 400_000, maximum: 480_000 }
+      for (const invalid of [
+        { target: 4, maximum: 4 },
+        { target: 5, maximum: 4 },
+        { target: 0, maximum: 1 },
+      ])
+        expect(
+          (yield* sessions.setContextBudget({ sessionID: parent.id, contextBudget: invalid }).pipe(Effect.flip))._tag,
+        ).toBe("Session.InvalidContextBudgetError")
+      yield* sessions.setContextBudget({ sessionID: parent.id, contextBudget: policy })
+      yield* bus.publish(SessionEvent.ContextBudgetChanged, {
+        sessionID: parent.id,
+        state: {
+          attempted: { binding: "fixture", estimated: 450_000 },
+          blocked: { reason: "Protected floor", maximum: 480_000, estimated: 500_000, selection: "null" },
+        },
+      })
+      expect(yield* sessions.get(parent.id)).toMatchObject({
+        contextBudget: policy,
+        contextBudgetState: { attempted: { binding: "fixture" }, blocked: { reason: "Protected floor" } },
+      })
+      expect((yield* sessions.create({ parentID: parent.id })).contextBudget).toBeUndefined()
+      yield* sessions.prompt({ sessionID: parent.id, text: "Pending work", resume: false })
+      yield* SessionInbox.promote(db, bus, parent.id, "steer")
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+      expect(fork.contextBudget).toBeUndefined()
+      expect(fork.contextBudgetState).toBeUndefined()
+      yield* sessions.setContextBudget({ sessionID: parent.id, contextBudget: policy })
+      expect((yield* sessions.get(parent.id)).contextBudgetState).toBeUndefined()
+      yield* sessions.setContextBudget({ sessionID: parent.id, contextBudget: null })
+      expect((yield* sessions.get(parent.id)).contextBudget).toBeUndefined()
+    }),
+)
+
+describe("native immutable delegation projection and transitions", () => {
+  it.effect("explicit child overrides and forks retain immutable provenance", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const db = (yield* Database.Service).db
+      const model = Model.Ref.make({ id: Model.ID.make("fixture"), providerID: Provider.ID.make("fixture") })
+      const creator = yield* sessions.create({ location, agent: Agent.ID.make("build"), model })
+      const owner = yield* sessions.create({ location, agent: Agent.ID.make("build"), model })
+      yield* db
+        .insert(NewSessionTable)
+        .values({
+          id: owner.id,
+          creator_id: creator.id,
+          launch_key: "fixture",
+          payload_hash: "fixture",
+          payload: "{}",
+          project_id: owner.projectID,
+          ownership_key: "fixture",
+          canonical: location.directory,
+          workdir: location.directory,
+          directory_identity: "fixture",
+          session_id: owner.id,
+          prompt_id: SessionMessage.ID.create(),
+          notification_id: SessionMessage.ID.create(),
+          stage: "running",
+          time_created: 0,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionDelegation.Table)
+        .values({
+          session_id: owner.id,
+          origin_id: owner.id,
+          creator_id: creator.id,
+          source_agent: Agent.ID.make("build"),
+          source_directory: location.directory,
+          source_directory_identity: "fixture",
+          agent_rules: [{ action: "subagent", resource: "John", effect: "deny" }],
+          session_rules: [],
+          target_agent: Agent.ID.make("build"),
+          target_model: model,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      const child = yield* sessions.create({
+        parentID: owner.id,
+        agent: Agent.ID.make("God"),
+        model,
+        permissions: [{ action: "*", resource: "*", effect: "allow" }],
+      })
+      expect((yield* SessionDelegation.get(db, child.id))?.origin_id).toBe(owner.id)
+      yield* sessions.append({ sessionID: owner.id, text: "Fixture evidence only", final: true })
+      const fork = yield* sessions.fork({ sessionID: owner.id })
+      expect(fork.parentID).toBeUndefined()
+      expect((yield* SessionDelegation.get(db, fork.id))?.origin_id).toBe(owner.id)
+      yield* sessions.setMetadata({ sessionID: fork.id, metadata: { origin: "human" } })
+      yield* sessions.setPermissions({
+        sessionID: fork.id,
+        permissions: [{ action: "*", resource: "*", effect: "allow" }],
+      })
+      expect(
+        (yield* sessions.switchAgent({ sessionID: fork.id, agent: Agent.ID.make("God") }).pipe(Effect.flip))._tag,
+      ).toBe("Session.DelegationBlockedError")
+      expect(
+        (yield* sessions
+          .switchModel({ sessionID: fork.id, model: { ...model, id: Model.ID.make("other") } })
+          .pipe(Effect.flip))._tag,
+      ).toBe("Session.DelegationBlockedError")
+      expect(
+        (yield* sessions.move({ sessionID: fork.id, directory: AbsolutePath.make("/elsewhere") }).pipe(Effect.flip))
+          ._tag,
+      ).toBe("Session.DelegationBlockedError")
+      yield* sessions.switchAgent({ sessionID: owner.id, agent: Agent.ID.make("build") })
+      yield* sessions.switchModel({ sessionID: owner.id, model })
+      const bus = yield* Bus.Service
+      for (const mutation of [
+        bus
+          .publish(SessionEvent.AgentSelected, {
+            sessionID: owner.id,
+            agent: Agent.ID.make("God"),
+            previous: Agent.ID.make("build"),
+          })
+          .pipe(Effect.asVoid),
+        bus
+          .publish(SessionEvent.ModelSelected, {
+            sessionID: owner.id,
+            model: { ...model, id: Model.ID.make("other") },
+            previous: model,
+          })
+          .pipe(Effect.asVoid),
+        bus
+          .publish(SessionEvent.Moved, {
+            sessionID: owner.id,
+            projectID: owner.projectID,
+            location: { directory: AbsolutePath.make("/elsewhere") },
+            subpath: RelativePath.make(""),
+          })
+          .pipe(Effect.asVoid),
+      ])
+        expect((yield* mutation.pipe(Effect.exit))._tag).toBe("Failure")
+      expect(String((yield* sessions.get(owner.id)).agent)).toBe("build")
+      const next = yield* Bus.latestSequence(db, owner.id)
+      expect(
+        (yield* bus
+          .replay({
+            id: "evt_fixture_forge" as never,
+            type: SessionEvent.AgentSelected.type,
+            seq: next + 1,
+            aggregateID: owner.id,
+            data: { sessionID: owner.id, agent: "God", previous: "build" },
+          })
+          .pipe(Effect.exit))._tag,
+      ).toBe("Failure")
+    }),
+  )
+})
 
 /** Public session events from a `log` read, without synced markers. */
 const logEvents = (session: Session.Interface, sessionID: Session.ID, follow?: boolean) =>
@@ -852,9 +1015,10 @@ describe("Session.create", () => {
       const session = yield* Session.Service
       const parent = yield* session.create({ location })
 
-      expect(
-        yield* session.fork({ sessionID: parent.id }).pipe(Effect.flip),
-      ).toMatchObject({ _tag: "Session.ForkEmptyError", sessionID: parent.id })
+      expect(yield* session.fork({ sessionID: parent.id }).pipe(Effect.flip)).toMatchObject({
+        _tag: "Session.ForkEmptyError",
+        sessionID: parent.id,
+      })
     }),
   )
 

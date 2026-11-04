@@ -438,6 +438,8 @@ export interface ProviderAdapter {
 const BASE_ADAPTER: ProviderAdapter = { id: ADAPTER, name: NAME }
 
 export interface ParserState {
+  readonly unfinishedHostedItems: Readonly<Record<string, { readonly id: string; readonly type: string }>>
+  readonly completedOutputItems: ReadonlyArray<StreamItem>
   readonly provider: LLMRequest["model"]["provider"]
   readonly completedCompactions: ReadonlySet<string>
   readonly id: string
@@ -446,6 +448,7 @@ export interface ParserState {
   readonly tools: ToolStream.State<string>
   readonly custom: ReadonlyMap<string, OpenAIFreeform.Custom>
   readonly hasFunctionCall: boolean
+  readonly hasRefusal: boolean
   readonly lifecycle: Lifecycle.State
   readonly outputItems: Readonly<Record<number, string>>
   readonly message: { readonly id: string; readonly phase: MessagePhase | null | undefined } | undefined
@@ -1098,6 +1101,8 @@ const reasoningMetadata = (state: ParserState, item: OutputItem) =>
 const onOutputItemAdded = (state: ParserState, event: NormalizedEvent): StepResult => {
   const item = event.item
   if (!item) return [state, NO_EVENTS]
+  if (!["message", "reasoning", "function_call", "custom_tool_call", "compaction"].includes(item.type))
+    return [{ ...state, unfinishedHostedItems: { ...state.unfinishedHostedItems, [item.id]: { id: item.id, type: item.type } } }, NO_EVENTS]
   if (item.type === "message") {
     const phase = messagePhase(item.phase)
     // A new message closes earlier messages, including ones that never streamed.
@@ -1241,6 +1246,7 @@ const onOutputItemDone = Effect.fnUntraced(function* (
   item: NormalizedEvent["item"],
 ) {
   if (!item) return [state, NO_EVENTS] satisfies StepResult
+  state = { ...state, completedOutputItems: [...state.completedOutputItems, item] }
 
   if (item.type === "compaction") {
     if (typeof item.encrypted_content !== "string")
@@ -1270,6 +1276,7 @@ const onOutputItemDone = Effect.fnUntraced(function* (
     for (const part of parts) {
       const decoded = Option.getOrUndefined(decodeMessagePart(part))
       if (!decoded) continue
+      if (decoded.type === "refusal") state = { ...state, hasRefusal: true }
       content.push(decoded.type === "output_text" ? decoded.text : decoded.refusal)
     }
     const text = content.length > 0 ? content.join("") : undefined
@@ -1295,7 +1302,7 @@ const onOutputItemDone = Effect.fnUntraced(function* (
     const registered = state.tools[item.id] !== undefined
     const closed = custom ? OpenAIFreeform.close(state.tools, [item.id], final) : undefined
     const tools = registered
-      ? (closed?.tools ?? state.tools)
+      ? { ...(closed?.tools ?? state.tools), [item.id]: { ...(closed?.tools ?? state.tools)[item.id]!, providerMetadata: metadata } }
       : ToolStream.start(state.tools, item.id, {
           id: item.call_id,
           name: item.name,
@@ -1376,8 +1383,22 @@ const onOutputItemDone = Effect.fnUntraced(function* (
   return [state, NO_EVENTS] satisfies StepResult
 })
 
-const onResponseFinish = Effect.fnUntraced(function* (state: ParserState, event: Event) {
-  let current = state
+const onResponseFinish = Effect.fnUntraced(function* (
+  state: ParserState,
+  event: Event,
+  boundary: "natural" | "interrupted" | "steered" = "natural",
+) {
+  const interrupted = boundary === "interrupted"
+  // Both native boundaries keep only done items as proof; neither manufactures partial acknowledgements.
+  const native = boundary !== "natural"
+  // Final-only gateways may omit refusal events and output_item.done entirely.
+  const finalRefusal = event.response?.output?.some(
+    (item) =>
+      item.type === "message" &&
+      Array.isArray(item.content) &&
+      item.content.some((part: unknown) => Option.getOrUndefined(decodeMessagePart(part))?.type === "refusal"),
+  )
+  let current = finalRefusal ? { ...state, hasRefusal: true } : state
   const events: LLMEvent[] = []
   if (event.type === "response.completed") {
     // An output item's array position is its output index.
@@ -1409,20 +1430,49 @@ const onResponseFinish = Effect.fnUntraced(function* (state: ParserState, event:
   }
   const lifecycle = Lifecycle.finish(current.lifecycle, events, {
     reason: {
-      normalized: mapFinishReason(event, current.hasFunctionCall),
+      normalized: native
+        ? "stop"
+        : current.hasRefusal
+          ? "content-filter"
+          : mapFinishReason(event, current.hasFunctionCall),
       raw: event.response?.incomplete_details?.reason,
     },
     usage: mapUsage(event.response?.usage, current.providerMetadataKey),
+    discardPartial: native,
     providerMetadata:
       event.response?.id || event.response?.service_tier
         ? providerMetadata(current, {
             responseId: event.response.id,
             serviceTier: event.response.service_tier,
+            ...(native ? {
+              ...(interrupted ? { nativeInterrupted: true } : { nativeSteered: true }),
+              completedOutputItems: current.completedOutputItems,
+              unresolvedHostedItems: Object.values(current.unfinishedHostedItems).filter((item) => !current.completedOutputItems.some((done) => done.id === item.id && done.type === item.type)),
+            } : {}),
           })
         : undefined,
   })
   return [{ ...current, lifecycle }, events] satisfies StepResult
 })
+
+/** Retain proof only from done items, and identities only for unfinished hosted actions.
+ * Never copy arbitrary hosted arguments, results, credentials or raw wire frames.
+ */
+export const observation = (previous: ParserState, next: ParserState): Record<string, unknown> | undefined => {
+  if (previous.completedOutputItems === next.completedOutputItems && previous.unfinishedHostedItems === next.unfinishedHostedItems) return
+  const completedOutputItems = next.completedOutputItems.map((item) => {
+    if (item.type === "reasoning") return { type: item.type, id: item.id,
+      summary: Array.isArray(item.summary) ? item.summary.filter((part) => typeof part.text === "string").map((part) => ({ type: "summary_text", text: part.text })) : [],
+      encrypted_content: typeof item.encrypted_content === "string" ? item.encrypted_content : null }
+    if (item.type === "message") return { type: item.type, id: item.id, role: "assistant",
+      content: Array.isArray(item.content) ? item.content.filter((part) => part.type === "output_text" && typeof part.text === "string").map((part) => ({ type: "output_text", text: part.text })) : [] }
+    if (item.type === "function_call") return { type: item.type, id: item.id, call_id: item.call_id ?? item.id,
+      name: typeof item.name === "string" ? item.name : "", arguments: typeof item.arguments === "string" ? item.arguments : "" }
+    return { type: item.type, id: item.id }
+  })
+  return { nativeObserved: true, completedOutputItems,
+    unresolvedHostedItems: Object.values(next.unfinishedHostedItems).filter((item) => !next.completedOutputItems.some((done) => done.id === item.id && done.type === item.type)) }
+}
 
 /** Error code and message from wherever the frame put them; top-level fields win over nested ones. */
 export const errorDetail = (event: Event) => {
@@ -1474,8 +1524,8 @@ export const step = (state: ParserState, event: NormalizedEvent) => {
       return ProviderShared.eventError(state.id, `${event.type} is malformed`)
     return Effect.succeed(
       event.type === "response.refusal.delta"
-        ? onOutputTextDelta(state, event, event.item_id)
-        : onOutputTextDone(state, { ...event, text: value }, event.item_id),
+        ? onOutputTextDelta({ ...state, hasRefusal: true }, event, event.item_id)
+        : onOutputTextDone({ ...state, hasRefusal: true }, { ...event, text: value }, event.item_id),
     )
   }
   if (event.type === "response.reasoning.delta" || event.type === "response.reasoning_summary_text.delta") {
@@ -1541,12 +1591,15 @@ export const step = (state: ParserState, event: NormalizedEvent) => {
  * implementations compose this baseline with their own tools and event variants.
  */
 export const initial = (request: LLMRequest, adapter: ProviderAdapter = BASE_ADAPTER): ParserState => ({
+  unfinishedHostedItems: {},
+  completedOutputItems: [],
   provider: request.model.provider,
   completedCompactions: new Set<string>(),
   id: adapter.id,
   name: adapter.name,
   providerMetadataKey: metadataKey(request.model),
   hasFunctionCall: false,
+  hasRefusal: false,
   tools: ToolStream.empty<string>(),
   custom: OpenAIFreeform.tools(request),
   lifecycle: Lifecycle.initial(),
@@ -1565,6 +1618,7 @@ export const protocol = Protocol.make({
     event: Protocol.jsonEvent(Event),
     initial,
     step: (state: ParserState, event: Event) => step(state, normalize(state, event)),
+    interrupted: (state: ParserState, event: Event) => onResponseFinish(state, event, "interrupted"),
     terminal,
   },
 })
@@ -1572,3 +1626,6 @@ export const protocol = Protocol.make({
 export const httpTransport = HttpTransport.sseJson.with<OpenResponsesBody>()
 
 export * as OpenResponses from "./open-responses.js"
+export const interrupted = (state: ParserState, event: Event) => onResponseFinish(state, event, "interrupted")
+/** The public `response.steer` parent terminal: raw `steered`, done-only proof, missing usage stays unknown. */
+export const steered = (state: ParserState, event: Event) => onResponseFinish(state, event, "steered")

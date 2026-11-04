@@ -1,7 +1,7 @@
 import { Money } from "@opencode/schema/money"
 import { Agent } from "@opencode/schema/agent"
 import { Session } from "@opencode/core/session"
-import { OpenAIResponses } from "@opencode/ai/protocols/openai-responses"
+import { OpenAIResponses } from "@opencode/ai/protocols"
 import { describe, expect } from "bun:test"
 import { DateTime, Effect } from "effect"
 import { Credential } from "@opencode/core/credential"
@@ -179,6 +179,11 @@ describe("OpenAIPlugin", () => {
       const child = yield* sessions.create({ parentID: parent.id })
       const childRequest = yield* request(Provider.ID.openai, "https://api.openai.com/v1", child.id)
       expect(childRequest.headers).toMatchObject({ "session-id": parent.id })
+      const grandchild = yield* sessions.create({ parentID: child.id })
+      expect((yield* request(Provider.ID.openai, "https://api.openai.com/v1", grandchild.id)).headers).toMatchObject({
+        "session-id": parent.id,
+        originator: "opencode",
+      })
       const eligible = required(yield* models.get(Provider.ID.openai, Model.ID.make("gpt-5.6-sol")))
       expect(eligible.package).toBe("@opencode/ai/providers/openai")
       expect(eligible.headers).toMatchObject({ originator: "opencode", "chatgpt-account-id": "acct_123" })
@@ -279,8 +284,11 @@ describe("OpenAIPlugin", () => {
       yield* addGithubCopilotPlugin()
       const executor = { execute: () => Effect.die("unused WebSocket execution") }
       const transport = SessionModelTransport.Service.of({
+        steer: () => Effect.succeed(false),
+        hasPendingInput: () => false,
         bind: () => executor,
         close: () => Effect.void,
+        retire: () => Effect.void,
         closeAll: Effect.void,
       })
       const sessionID = Session.ID.make("ses_websocket_hooks")
@@ -324,7 +332,7 @@ describe("OpenAIPlugin", () => {
       const disabled = yield* prepare("http")
 
       expect(prepared.options.webSocket).toBe(executor)
-      expect(prepared.options.http).toBeUndefined()
+      expect(prepared.options.http).toBeFunction()
       expect(defaulted.options.webSocket).toBeUndefined()
       expect(disabled.options.webSocket).toBeUndefined()
     }),

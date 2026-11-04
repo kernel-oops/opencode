@@ -19,6 +19,7 @@ import { Composer } from "../../../src/routes/session/composer"
 import { DialogProvider } from "../../../src/ui/dialog"
 import { ToastProvider } from "../../../src/ui/toast"
 import { createSessionRows, type SessionRow } from "../../../src/routes/session/rows"
+import { attemptStatus } from "../../../src/component/prompt/attempt-status"
 import { groupRefs } from "../../../src/routes/session/grouping/session"
 import { unwrap } from "solid-js/store"
 import { createApi, createEventStream, createFetch, directory, json, worktree } from "../../fixture/tui-client"
@@ -1548,6 +1549,22 @@ test("tracks session status from active sessions and execution events", async ()
       },
     })
     emitEvent(events, {
+      id: "evt_retry_attempt_failed",
+      created: 1_000,
+      type: "session.step.failed",
+      durable: durable("session-retry", 1),
+      data: {
+        sessionID: "session-retry",
+        assistantMessageID: "message-retry",
+        error: { type: "provider.transport", message: "Disconnected" },
+      },
+    })
+    await wait(() => {
+      const assistant = data.session.message.get("session-retry", "message-retry")
+      return assistant?.type === "assistant" && assistant.time.completed === 1_000
+    })
+    expect(attemptStatus(true, data.session.message.list("session-retry"), 1_000)).toBe("Active")
+    emitEvent(events, {
       id: "evt_retry_scheduled",
       created: 0,
       type: "session.retry.scheduled",
@@ -1565,6 +1582,7 @@ test("tracks session status from active sessions and execution events", async ()
       return assistant?.type === "assistant" && assistant.retry?.attempt === 2
     })
     await wait(() => rows.some((row) => row.type === "assistant-footer" && row.messageID === "message-retry"))
+    expect(attemptStatus(true, data.session.message.list("session-retry"), 1_500)).toBe("Retrying · attempt 2")
     emitEvent(events, {
       id: "evt_retry_next_step",
       created: 2_000,
@@ -1584,6 +1602,7 @@ test("tracks session status from active sessions and execution events", async ()
     })
     await wait(() => !rows.some((row) => row.type === "assistant-footer" && row.messageID === "message-retry"))
     expect(data.session.message.list("session-retry").filter((message) => message.type === "assistant")).toHaveLength(1)
+    expect(attemptStatus(true, data.session.message.list("session-retry"), 5_000)).toBe("Generating · 3s this attempt")
     emitEvent(events, {
       id: "evt_retry_scheduled_again",
       created: 2_000,
@@ -1610,6 +1629,7 @@ test("tracks session status from active sessions and execution events", async ()
     })
     await wait(() => data.session.status("session-retry") === "idle")
     expect(data.session.message.get("session-retry", "message-retry")).not.toHaveProperty("retry")
+    expect(attemptStatus(data.session.status("session-retry") === "running", data.session.message.list("session-retry"), 7_000)).toBeUndefined()
 
     emitEvent(events, {
       id: "evt_manual_compaction_admitted",
@@ -2995,14 +3015,15 @@ test("settles pending tools when a live failure arrives", async () => {
   }
 })
 
-test("renders admitted prompts immediately and tracks them until promoted", async () => {
+test.each(["user", "synthetic"] as const)("renders admitted %s immediately and tracks it until delivered", async (type) => {
   const events = createEventStream()
   const sessionID = "session-1"
   const messageID = "msg_user_1"
   const calls = createFetch((url) => {
+    if (url.pathname === `/api/session/${sessionID}/inbox`) return json({ data: [] })
     if (url.pathname === `/api/session/${sessionID}/message`)
       return json({
-        data: [{ id: messageID, type: "user", text: "hello", time: { created: 0 } }],
+        data: [{ id: messageID, type, text: "hello", time: { created: 0 } }],
         cursor: {},
       })
   }, events)
@@ -3042,19 +3063,19 @@ test("renders admitted prompts immediately and tracks them until promoted", asyn
       data: {
         sessionID,
         inboxID: messageID,
-        item: { type: "user", payload: { text: "hello" }, delivery: "steer" },
+        item: { type, payload: { text: "hello" }, delivery: "steer" },
       },
     })
     await wait(() => sync.session.message.list(sessionID)?.length === 1)
     const admitted = sync.session.message.list(sessionID)?.[0]
-    expect(admitted).toMatchObject({ id: messageID, ...Expected.user("hello") })
+    expect(admitted).toMatchObject({ id: messageID, ...(type === "user" ? Expected.user("hello") : { type, text: "hello" }) })
     expect(admitted?.metadata).toBeUndefined()
     expect(sync.session.pending.list(sessionID)).toEqual([
       {
         id: messageID,
         sessionID,
         time: { created: 0 },
-        type: "user",
+        type,
         payload: { text: "hello" },
         delivery: "steer",
       },
@@ -3079,8 +3100,8 @@ test("renders admitted prompts immediately and tracks them until promoted", asyn
     expect(received.slice(-2)).toEqual(["session.inbox.enqueued", "session.inbox.delivered"])
     unsubscribe()
     const message = sync.session.message.list(sessionID)?.[0]
-    expect(message?.type).toBe("user")
-    if (message?.type !== "user") return
+    expect(message?.type).toBe(type)
+    if (message?.type !== "user" && message?.type !== "synthetic") return
     expect(message).toMatchObject({ id: messageID, text: "hello" })
     expect(message.metadata).toBeUndefined()
     expect(sync.session.pending.list(sessionID)).toEqual([])
@@ -3090,6 +3111,12 @@ test("renders admitted prompts immediately and tracks them until promoted", asyn
     expect(sync.session.message.get(sessionID, messageID)).toBe(message)
     expect(sync.session.message.get(sessionID, "missing")).toBeUndefined()
     expect(received).toHaveLength(3)
+    // Fresh snapshots after delivery must neither resurrect pending membership nor duplicate the report.
+    sync.session.pending.invalidate(sessionID)
+    await sync.session.pending.sync(sessionID)
+    await sync.session.message.sync(sessionID)
+    expect(sync.session.pending.list(sessionID)).toEqual([])
+    expect(sync.session.message.list(sessionID).map((item) => item.id)).toEqual([messageID])
   } finally {
     app.renderer.destroy()
   }
@@ -3430,13 +3457,13 @@ test("admits prompts optimistically and reconciles with the durable echo", async
   }
 })
 
-test("hydrates durable pending prompts into the visible transcript", async () => {
+test.each(["user", "synthetic"] as const)("hydrates durable pending %s into the visible transcript", async (type) => {
   const sessionID = "session-1"
   const item = {
     id: "msg_pending_1",
     sessionID,
     time: { created: 5 },
-    type: "user" as const,
+    type,
     payload: { text: "waiting" },
     delivery: "steer" as const,
   }
@@ -3472,7 +3499,7 @@ test("hydrates durable pending prompts into the visible transcript", async () =>
     await mounted
     await sync.session.pending.sync(sessionID)
     expect(sync.session.message.list(sessionID)).toEqual([
-      { id: item.id, ...Expected.user("waiting"), time: { created: 5 } },
+      { id: item.id, ...(type === "user" ? Expected.user("waiting") : { type: "synthetic", text: "waiting" }), time: { created: 5 } },
     ])
 
     await sync.session.message.sync(sessionID)
@@ -3482,7 +3509,7 @@ test("hydrates durable pending prompts into the visible transcript", async () =>
   }
 })
 
-test("keeps the row when the response lands before the echo", async () => {
+test("keeps the acknowledged row when the response lands before the echo", async () => {
   const events = createEventStream()
   const sessionID = "session-1"
   const messageID = "msg_early_1"
@@ -3496,8 +3523,8 @@ test("keeps the row when the response lands before the echo", async () => {
   }
   const calls = createFetch((url) => {
     if (url.pathname === `/api/session/${sessionID}/prompt`) return json({ data: admission })
-    // The server's listings still miss the admission (projection lag).
-    if (url.pathname === `/api/session/${sessionID}/inbox`) return json({ data: [] })
+    // Admission is durable before POST returns; an authoritative inbox read sees it even without its SSE echo.
+    if (url.pathname === `/api/session/${sessionID}/inbox`) return json({ data: [admission] })
     if (url.pathname === `/api/session/${sessionID}/message`) return json({ data: [], cursor: {} })
   }, events)
   let sync!: ReturnType<typeof useData>
@@ -3528,8 +3555,8 @@ test("keeps the row when the response lands before the echo", async () => {
     await mounted
     await sync.session.prompt({ sessionID, id: messageID, text: "hello" })
 
-    // POST resolved but the echo has not arrived: racing pending and message
-    // re-fetches still cannot wipe the row.
+    // POST resolved but the echo has not arrived: authoritative pending and message
+    // re-fetches still retain the acknowledged row. Empty inbox reads after POST instead mean consumption.
     await sync.session.pending.sync(sessionID)
     sync.session.pending.invalidate(sessionID)
     await sync.session.pending.sync(sessionID)

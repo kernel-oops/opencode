@@ -5,7 +5,7 @@ import type { Model } from "@opencode/schema/model"
 import type { RelativePath } from "@opencode/schema/schema"
 import type { Snapshot } from "@opencode/schema/snapshot"
 import type { TokenUsage } from "@opencode/schema/token-usage"
-import { Effect, Fiber, Iterable } from "effect"
+import { Effect, Fiber, Iterable, Schema } from "effect"
 import { isReadonlyArrayNonEmpty } from "effect/Array"
 import { Bus } from "../../bus.js"
 import { SessionEvent } from "../event.js"
@@ -16,6 +16,7 @@ import { Money } from "@opencode/schema/money"
 import { contentFilterError } from "../to-session-error.js"
 import type { Tool } from "../../tool.js"
 import { stringify } from "../../tool/runtime.js"
+import { SessionUsage } from "../usage.js"
 
 type Input = {
   readonly sessionID: SessionSchema.ID
@@ -68,6 +69,8 @@ export interface StepRecord {
     readonly finish: Extract<LLMEvent, { type: "step-finish" }>["reason"]["normalized"]
     readonly rawFinish?: string
     readonly native?: SessionMessage.Native
+    readonly tokens: TokenUsage.Info
+    readonly usageObserved: boolean
     readonly usage: Extract<LLMEvent, { type: "step-finish" }>["usage"]
   }
   readonly needsContinuation: boolean
@@ -143,6 +146,12 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     })
   })
   const native = (metadata: ProviderMetadata | undefined) => metadata?.[input.providerMetadataKey]
+  // A provider that runs its own tools can attach display metadata (a child session id, say) under the
+  // reserved `opencode` namespace; the runner never executes those tools, so this is its only route.
+  const hostedMetadata = (metadata: ProviderMetadata | undefined) => {
+    const value = metadata?.opencode?.metadata
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Tool.Metadata) : undefined
+  }
   const fragments = (
     name: string,
     ended: (id: string, value: string, ordinal: number, native?: SessionMessage.Native) => Effect.Effect<void>,
@@ -410,6 +419,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   })
 
   const publishStepFailure = Effect.fnUntraced(function* (details?: {
+    readonly nativeAmbiguous?: boolean
     readonly cost?: Money.USD
     readonly tokens?: TokenUsage.Info
     readonly snapshot?: Snapshot.ID
@@ -423,8 +433,15 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       error: stepFailure,
       finish: stepSettlement?.finish === "content-filter" ? stepSettlement.finish : undefined,
       rawFinish: stepSettlement?.rawFinish,
-      native: stepSettlement?.native,
+      native: details?.nativeAmbiguous ? { ...stepSettlement?.native, nativeAmbiguous: true } : stepSettlement?.native,
       ...details,
+    })
+  })
+
+  const observeProvider = Effect.fnUntraced(function* (observation: Record<string, unknown>) {
+    const state = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Json))(observation)
+    yield* bus.publish(SessionEvent.Step.Observed, {
+      sessionID: input.sessionID, assistantMessageID: yield* startAssistant(), native: state,
     })
   })
 
@@ -523,13 +540,14 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         }
         tool.settled = true
         const executed = event.providerExecuted === true || tool.providerExecuted
+        const metadata = hostedMetadata(event.providerMetadata)
         if (event.result.type === "error") {
           yield* bus.publish(SessionEvent.Tool.Failed, {
             sessionID: input.sessionID,
             assistantMessageID,
             id: event.id,
             error: { type: "tool.execution", message: stringify(event.result.value) },
-            ...failureSnapshot(tool),
+            ...failureSnapshot(tool, metadata),
             executed,
             native: native(event.providerMetadata),
           })
@@ -540,6 +558,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           assistantMessageID,
           id: event.id,
           content: hostedContent(event.result),
+          ...(metadata === undefined ? {} : { metadata }),
           executed,
           native: native(event.providerMetadata),
         })
@@ -573,6 +592,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           finish: event.reason.normalized,
           rawFinish: event.reason.raw,
           native: native(event.providerMetadata),
+          tokens: SessionUsage.tokens(event.usage),
+          usageObserved: event.usage !== undefined,
           usage: event.usage,
         }
         if (event.reason.normalized === "content-filter") {
@@ -636,6 +657,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     failAssistant,
     failTool,
     publishStepFailure,
+    observeProvider,
     failUnsettledTools,
     failIncompleteTools,
     hasProviderError: () => providerFailed,

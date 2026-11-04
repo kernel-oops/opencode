@@ -1,7 +1,10 @@
 import { SessionMessage } from "@opencode/schema/session-message"
 import { SessionInbox } from "@opencode/schema/session-inbox"
+import { SessionTask } from "@opencode/schema/session-task"
 import { PromptInput } from "@opencode/schema/prompt-input"
 import { Session } from "@opencode/schema/session"
+import { SessionNativeTest } from "@opencode/schema/session-native-test"
+import { SessionContextBudget } from "@opencode/schema/session-context-budget"
 import { SessionStats } from "@opencode/schema/session-stats"
 import { InstructionEntry } from "@opencode/schema/instruction-entry"
 import { Project } from "@opencode/schema/project"
@@ -9,7 +12,7 @@ import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt } from "@opencode/sc
 import { Event } from "@opencode/schema/event"
 import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { Context, Schema, SchemaGetter, Struct } from "effect"
-import { HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSchema, OpenApi } from "effect/http-api"
+import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSchema, OpenApi } from "effect/http-api"
 import {
   ConflictError,
   LocationNotFoundError,
@@ -274,28 +277,32 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         params: { sessionID: Session.ID },
         payload: Schema.Struct({ agent: Agent.ID }),
         success: HttpApiSchema.NoContent,
-        error: SessionNotFoundError,
-      }).annotateMerge(
-        OpenApi.annotations({
-          identifier: "session.switchAgent",
-          summary: "Switch session agent",
-          description: "Switch the agent used by subsequent provider turns.",
-        }),
-      ),
+        error: [SessionNotFoundError, InvalidRequestError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.switchAgent",
+            summary: "Switch session agent",
+            description: "Switch the agent used by subsequent provider turns.",
+          }),
+        ),
     )
     .add(
       HttpApiEndpoint.post("session.switchModel", "/api/session/:sessionID/model", {
         params: { sessionID: Session.ID },
         payload: Schema.Struct({ model: Model.Ref }),
         success: HttpApiSchema.NoContent,
-        error: SessionNotFoundError,
-      }).annotateMerge(
-        OpenApi.annotations({
-          identifier: "session.switchModel",
-          summary: "Switch session model",
-          description: "Switch the model used by subsequent provider turns.",
-        }),
-      ),
+        error: [SessionNotFoundError, InvalidRequestError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.switchModel",
+            summary: "Switch session model",
+            description: "Switch the model used by subsequent provider turns.",
+          }),
+        ),
     )
     .add(
       HttpApiEndpoint.patch("session.update", "/api/session/:sessionID", {
@@ -304,20 +311,25 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
           title: Schema.String.pipe(Schema.optional),
           metadata: Session.Metadata.pipe(Schema.optional),
           permissions: Permission.Ruleset.pipe(Schema.optional),
+          contextBudget: Schema.NullOr(SessionContextBudget.Policy).pipe(Schema.optional).annotate({
+            description:
+              "Session-only estimated total-token budget. Null disables it. Setting it explicitly re-arms admission; children do not inherit it.",
+          }),
           archived: Schema.Boolean.pipe(Schema.optional).annotate({
             description:
               "Archive the session with true or restore it with false. Repeating the current state is a no-op.",
           }),
         }),
         success: HttpApiSchema.NoContent,
-        error: [SessionNotFoundError, LocationNotFoundError],
-      }).annotateMerge(
-        OpenApi.annotations({
-          identifier: "session.update",
-          summary: "Update session",
-          description: "Update mutable session properties.",
-        }),
-      ),
+        error: [SessionNotFoundError, InvalidRequestError, LocationNotFoundError],
+      })
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.update",
+            summary: "Update session",
+            description: "Update mutable session properties.",
+          }),
+        ),
     )
     .add(
       HttpApiEndpoint.post("session.move", "/api/session/:sessionID/move", {
@@ -414,6 +426,30 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
             identifier: "session.synthetic",
             summary: "Add synthetic message",
             description: "Durably admit synthetic session input and schedule execution unless resume is false.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.append", "/api/session/:sessionID/append", {
+        params: { sessionID: Session.ID },
+        payload: Schema.Struct({
+          id: SessionMessage.ID.pipe(Schema.optional),
+          text: Schema.String,
+          final: Schema.Boolean.pipe(Schema.optional),
+          agent: Agent.ID.pipe(Schema.optional),
+          model: Model.Ref.pipe(Schema.optional),
+          metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(Schema.optional),
+        }),
+        success: Schema.Struct({ data: Schema.Struct({ id: SessionMessage.ID }) }),
+        error: [MessageNotFoundError, SessionNotFoundError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.append",
+            summary: "Append visible assistant text",
+            description:
+              "Durably append a chunk of assistant-authored text to a session, without scheduling a model turn. Pass the returned id back in to extend the same message; set final to close it out.",
           }),
         ),
     )
@@ -582,6 +618,46 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
       ),
     )
     .add(
+      HttpApiEndpoint.get("session.nativeTest.get", "/api/experimental/session/:sessionID/native-test", {
+        params: { sessionID: Session.ID },
+        success: Schema.Struct({ data: SessionNativeTest.Status }),
+        error: [SessionNotFoundError, ServiceUnavailableError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.session.nativeTest.get",
+            summary: "Get native steering test lane",
+            description:
+              "Read the process-local native steering test settings, latest execution snapshot and bounded metadata-only diagnostics for one session.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.put("session.nativeTest.put", "/api/experimental/session/:sessionID/native-test", {
+        params: { sessionID: Session.ID },
+        payload: SessionNativeTest.Settings,
+        success: Schema.Struct({ data: SessionNativeTest.Status }),
+        error: [
+          SessionNotFoundError,
+          ServiceUnavailableError,
+          SessionNativeTest.LaneOccupiedError,
+          SessionNativeTest.UnsupportedError,
+        ],
+      })
+        // A closed contract: unknown body keys are rejected, never silently stripped.
+        .annotate(HttpApi.PayloadParseOptions, { onExcessProperty: "error" })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.session.nativeTest.put",
+            summary: "Set native steering test lane",
+            description:
+              "Request native steering and metadata diagnostics for this exact session's next execution only. Process-local: never inherited, persisted or kept across restart. An active execution keeps its settings; the change is reported as pending and nothing is interrupted.",
+          }),
+        ),
+    )
+    .add(
       HttpApiEndpoint.get(
         "session.instructions.entry.list",
         "/api/experimental/session/:sessionID/instructions/entries",
@@ -690,6 +766,70 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
             "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
         }),
       ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.task.status", "/api/session/:sessionID/task", {
+        params: { sessionID: Session.ID },
+        success: SessionTask.Status,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.task.status",
+            summary: "Task control status",
+            description:
+              "Whether automatic subagent completion delivery is paused for this session, whether it is executing, and the process-local subagent jobs it owns.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.task.stopResponse", "/api/session/:sessionID/task/stop-response", {
+        params: { sessionID: Session.ID },
+        success: SessionTask.StopResponseResult,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.task.stopResponse",
+            summary: "Stop response only",
+            description:
+              "Durably pause automatic subagent completion delivery, then interrupt the current response and its foreground tools. Accepted background subagents keep running; their completions are retained in the inbox until resume or the next human turn.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.task.resume", "/api/session/:sessionID/task/resume", {
+        params: { sessionID: Session.ID },
+        success: SessionTask.ResumeResult,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.task.resume",
+            summary: "Resume controller",
+            description:
+              "Release the completion-delivery pause and wake the session so retained completions are delivered.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.task.stopAll", "/api/session/:sessionID/task/stop-all", {
+        params: { sessionID: Session.ID },
+        success: SessionTask.StopAllResult,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.task.stopAll",
+            summary: "Stop all work",
+            description:
+              "Interrupt the session and cancel every subagent job it owns, recursively, permanently suppressing their completion notifications.",
+          }),
+        ),
     )
     .add(
       HttpApiEndpoint.post("session.background", "/api/session/:sessionID/background", {

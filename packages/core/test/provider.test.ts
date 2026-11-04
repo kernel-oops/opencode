@@ -44,6 +44,8 @@ describe("Provider", () => {
         cache: { ttl: "1h" },
         encoding: "gzip",
         transport: "websocket",
+        nativeInterrupt: "discard_partial_items",
+        nativeSteer: "response.steer",
       }),
     ).toEqual({
       apiKey: "secret",
@@ -57,6 +59,8 @@ describe("Provider", () => {
         timeout: 60_000,
         chunkTimeout: 30_000,
         transport: "websocket",
+        nativeInterrupt: "discard_partial_items",
+        nativeSteer: "response.steer",
         compaction: { type: "native" },
         reasoningEffort: "high",
       }),

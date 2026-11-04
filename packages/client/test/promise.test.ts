@@ -73,6 +73,7 @@ test("exposes every standard HTTP API group", () => {
     "export",
     "skill",
     "wait",
+    "nativeTest",
     "instructions",
     "log",
   ])
@@ -160,6 +161,8 @@ test("nests a method under client.experimental exactly when its route is experim
     "session.instructions.entry.put",
     "session.instructions.entry.remove",
     "session.log",
+    "session.nativeTest.get",
+    "session.nativeTest.put",
     "session.skill",
     "session.stats",
     "session.wait",
@@ -368,6 +371,37 @@ test("generate.text uses the locationless public contract", async () => {
   expect(await client.experimental.generate.text({ prompt: "ping" })).toEqual({ text: "pong" })
   expect(request?.url).toBe("http://localhost:3000/api/experimental/generate/text")
   expect(await request?.json()).toEqual({ prompt: "ping" })
+})
+
+test("generate.text returns the typed receipt without changing the request", async () => {
+  const receipt = {
+    text: "pong",
+    model: { providerID: "configured", id: "model", variant: "variant" },
+    usage: {
+      cacheReadInputTokens: 0,
+      outputTokens: 10,
+      reasoningTokens: 4,
+      providerMetadata: {
+        anthropic: {
+          iterations: [{ type: "message", input_tokens: 2, cache_creation: { ephemeral_1h_input_tokens: 3 } }],
+        },
+      },
+    },
+  }
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      expect(request.method).toBe("POST")
+      expect(request.url).toBe("http://localhost:3000/api/experimental/generate/text")
+      expect(await request.json()).toEqual({ prompt: "ping" })
+      return Response.json({ data: receipt })
+    },
+  })
+  const result = await client.generate.text({ prompt: "ping" })
+  expect(result).toEqual(receipt)
+  expect(result.usage?.reasoningTokens).toBe(4)
+  expect(result.model?.id).toBe("model")
 })
 
 test("websearch.query uses the public HTTP contract", async () => {

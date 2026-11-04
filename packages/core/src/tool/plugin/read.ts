@@ -2,15 +2,22 @@ export * as ReadTool from "./read.js"
 
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { basename, dirname, join } from "path"
+import { realpath } from "node:fs/promises"
 import { ToolFailure } from "@opencode/ai/effect"
 import { Effect, Schema } from "effect"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
+import { Permission } from "../../permission.js"
 import { SessionInstructions } from "../../session/instructions.js"
 import { AbsolutePath } from "../../schema.js"
 import { ReadToolFileSystem } from "../read-filesystem.js"
 import { Environment } from "../../environment/index.js"
+import { BoundExternal } from "../bound/external.js"
+import { BoundExternalFile } from "@opencode/util/bound/external-file"
+import { BoundProjectFile } from "@opencode/util/bound/project-file"
+import { ReviewAction } from "@opencode/util/bound/review-action"
+import { TrustedPathAlias } from "@opencode/util/bound/trusted-path-alias"
 
 export const name = "read"
 const FILENAME = "AGENTS.md"
@@ -26,14 +33,36 @@ const LocationInput = Schema.Struct({
 export const Input = LocationInput
 const Output = Schema.Union([ReadToolFileSystem.FileContent, ReadToolFileSystem.TextPage, ReadToolFileSystem.ListPage])
 
+type Read = {
+  readonly content: typeof Output.Type
+  readonly target: FileAccess.Target
+  readonly path: string
+  /** A bound read had no instruction side effects and must not discover any. */
+  readonly bound: boolean
+}
+
+/** Page pinned bytes through the ordinary reader so bound and ordinary reads share limits and shape. */
+const pageBytes = (target: FileAccess.Target, bytes: Uint8Array, page: ReadToolFileSystem.PageInput) =>
+  Effect.gen(function* () {
+    const files = Environment.makeFiles(Environment.makeMemoryDriver())
+    yield* files.write(target.absolute, bytes)
+    return yield* ReadToolFileSystem.read(files, target.absolute, target.resource, page)
+  })
+
+const pinnedFailure = (fallback: string) => (error: unknown) =>
+  new ToolFailure({ message: error instanceof Error ? error.message : fallback, error })
+
 export const Plugin = {
   id: "opencode.tool.read",
   effect: Effect.fn("ReadTool.Plugin")(function* (ctx: Context) {
     const reader = yield* ReadToolFileSystem.Service
     const access = yield* FileAccess.Service
+    const permission = yield* Permission.Service
     const sessionInstructions = yield* SessionInstructions.Service
     const fs = yield* FSUtil.Service
     const location = yield* Location.Service
+    // Descriptor pinning reads the host filesystem directly, so it only applies to the local environment.
+    const bindable = location.workspaceID === undefined && process.platform === "linux"
 
     yield* ctx.tool
       .transform((editor) =>
@@ -46,46 +75,166 @@ export const Plugin = {
           output: Output,
           execute: (input, context) => {
             return Effect.gen(function* () {
-              const read = (target: FileAccess.Target) =>
-                reader.read(target.absolute, target.resource, {
-                  offset: input.offset,
-                  limit: input.limit,
-                })
+              const page = { offset: input.offset, limit: input.limit }
+              const source = { type: "tool" as const, messageID: context.messageID, id: context.id }
+              const read = (target: FileAccess.Target) => reader.read(target.absolute, target.resource, page)
 
-              const requested = yield* access.authorizeRead(input.path, context)
-              const result = yield* read(requested).pipe(
-                Effect.map((content) => ({ content, target: requested, path: input.path })),
-                Effect.catchIf(
-                  (error) => error instanceof Environment.NotFound,
-                  () =>
+              const ordinary = Effect.fn("ReadTool.ordinary")(function* (
+                file: string,
+                metadata?: FileAccess.ReviewMetadata,
+              ) {
+                const requested = yield* access.authorizeRead(file, context, { metadata })
+                return yield* read(requested).pipe(
+                  Effect.map((content): Read => ({ content, target: requested, path: input.path, bound: false })),
+                  Effect.catchIf(
+                    (error) => error instanceof Environment.NotFound,
+                    () =>
+                      Effect.gen(function* () {
+                        const alternate = yield* alternatePath(requested.absolute).pipe(
+                          Effect.orElseSucceed(() => undefined),
+                        )
+                        if (!alternate) return yield* missing(input.path, requested.absolute)
+                        const target = yield* access.authorizeRead(alternate, context, { siblingOf: requested })
+                        const content = yield* read(target).pipe(
+                          Effect.catchIf(
+                            (error) => error instanceof Environment.NotFound,
+                            () => missing(input.path, requested.absolute),
+                          ),
+                        )
+                        if (content.type === "list-page") return yield* missing(input.path, requested.absolute)
+                        const result: Read = {
+                          content,
+                          target,
+                          path: join(dirname(input.path), basename(alternate)),
+                          bound: false,
+                        }
+                        return result
+                      }),
+                  ),
+                )
+              })
+
+              // A project text file read by exact page can be pinned behind a descriptor: no instruction files
+              // on its path, no symlinks, no cross-mount traversal, and content verified after review.
+              const pinnedProject = Effect.fn("ReadTool.pinnedProject")(function* (target: FileAccess.Target) {
+                const bound = yield* Effect.promise(() => BoundProjectFile.bind(location.directory, target.absolute))
+                if (!bound) return undefined
+                return yield* Effect.acquireUseRelease(
+                  Effect.succeed(bound),
+                  (bound) =>
                     Effect.gen(function* () {
-                      const alternate = yield* alternatePath(requested.absolute).pipe(
-                        Effect.orElseSucceed(() => undefined),
-                      )
-                      if (!alternate) return yield* missing(input.path, requested.absolute)
-                      const target = yield* access.authorizeRead(alternate, context, { siblingOf: requested })
-                      const content = yield* read(target).pipe(
-                        Effect.catchIf(
-                          (error) => error instanceof Environment.NotFound,
-                          () => missing(input.path, requested.absolute),
-                        ),
-                      )
-                      if (content.type === "list-page") return yield* missing(input.path, requested.absolute)
-                      return {
-                        content,
-                        target,
-                        path: join(dirname(input.path), basename(alternate)),
-                      }
+                      yield* permission.assert({
+                        action: name,
+                        resources: [target.resource],
+                        save: ["*"],
+                        metadata: {
+                          [ReviewAction.KEY]: ReviewAction.make({
+                            identity: name,
+                            arguments: {
+                              path: input.path,
+                              offset: input.offset,
+                              limit: input.limit,
+                              target: bound.target,
+                              mode: "pinned-project-text-v4",
+                              bindingId: bound.bindingId,
+                              instructionFilesAbsent: true,
+                              instructionWatch: "linux-inotify-v1",
+                              effects: [],
+                            },
+                            cwd: location.directory,
+                            complete: true,
+                          }),
+                        },
+                        sessionID: context.sessionID,
+                        agent: context.agent,
+                        source,
+                      })
+                      const bytes = yield* Effect.tryPromise({
+                        try: () => BoundProjectFile.read(bound),
+                        catch: pinnedFailure("Pinned project text file changed"),
+                      })
+                      const content = yield* pageBytes(target, bytes, page)
+                      yield* Effect.tryPromise({
+                        try: () => BoundProjectFile.verify(bound),
+                        catch: pinnedFailure("Pinned project text file changed"),
+                      })
+                      const result: Read = { content, target, path: input.path, bound: true }
+                      return result
                     }),
-                ),
-              )
+                  (bound) => Effect.promise(() => BoundProjectFile.close(bound)),
+                )
+              })
+
+              // An external text file is pinned behind a descriptor before the external_directory review so
+              // the reviewer sees the exact inode; the read then serves the verified pinned bytes.
+              const pinnedExternal = Effect.fn("ReadTool.pinnedExternal")(function* (initial: FileAccess.Target) {
+                const canonical = yield* Effect.promise(() => realpath(initial.absolute).catch(() => undefined))
+                const aliased =
+                  canonical !== undefined &&
+                  canonical !== initial.absolute &&
+                  (yield* Effect.promise(() => TrustedPathAlias.trusted(initial.absolute, canonical)))
+                const target = aliased ? yield* access.resolve({ path: canonical }) : initial
+                if (!target.externalDirectory) return yield* ordinary(target.absolute)
+                const kind = BoundExternal.kindOf(target)
+                return yield* Effect.acquireUseRelease(
+                  Effect.promise(() => BoundExternal.inspect(target, { kind, tool: name, bindRead: true })),
+                  (scope) =>
+                    Effect.gen(function* () {
+                      const boundRead = scope?.boundRead
+                      const action = ReviewAction.make({
+                        identity: name,
+                        arguments: boundRead
+                          ? {
+                              contract: "pinned-external-text-v1",
+                              mode: "bound",
+                              bindingId: boundRead.bindingId,
+                              invocation: input,
+                              effects: [],
+                            }
+                          : input,
+                        cwd: kind === "directory" ? target.absolute : dirname(target.absolute),
+                        complete: Boolean(boundRead),
+                      })
+                      const metadata: FileAccess.ReviewMetadata = {
+                        external: BoundExternal.metadata(scope),
+                        read: {
+                          [ReviewAction.KEY]: action,
+                          ...(scope?.readScope ? { readScope: scope.readScope } : {}),
+                          ...(scope?.readBinding ? { readBinding: scope.readBinding } : {}),
+                        },
+                      }
+                      if (!boundRead) return yield* ordinary(target.absolute, metadata)
+                      yield* access.authorizeRead(target.absolute, context, { metadata })
+                      yield* BoundExternal.verify(scope).pipe(Effect.mapError(pinnedFailure("External path changed")))
+                      const bytes = yield* Effect.tryPromise({
+                        try: () => BoundExternalFile.read(boundRead),
+                        catch: pinnedFailure("Pinned external text file changed"),
+                      })
+                      const content = yield* pageBytes(target, bytes, page)
+                      const result: Read = { content, target, path: input.path, bound: true }
+                      return result
+                    }),
+                  (scope) => Effect.promise(() => BoundExternal.release(scope)),
+                )
+              })
+
+              const initial = yield* access.resolve({ path: input.path })
+              const result = yield* Effect.gen(function* () {
+                if (!bindable) return yield* ordinary(input.path)
+                if (initial.externalDirectory) return yield* pinnedExternal(initial)
+                if (input.offset !== undefined && input.limit !== undefined) {
+                  const pinned = yield* pinnedProject(initial)
+                  if (pinned) return pinned
+                }
+                return yield* ordinary(input.path)
+              })
               // After a successful read, discover nearby AGENTS.md walking up to the Location
               // root exclusive and inject them as durable synthetic instructions. For a
               // directory listing the walk starts at the directory itself (so its own AGENTS.md
-              // is discovered); for a file it starts at the file's dirname. External reads are
-              // skipped, and discovery failures never fail the read.
+              // is discovered); for a file it starts at the file's dirname. External and bound
+              // reads are skipped, and discovery failures never fail the read.
               yield* Effect.gen(function* () {
-                if (result.target.externalDirectory !== undefined) return
+                if (result.bound || result.target.externalDirectory !== undefined) return
                 const resolved = yield* fs.resolve(result.target.absolute)
                 const root = yield* fs.resolve(location.directory)
                 // The Location and its ancestors are already supplied by initial instructions,

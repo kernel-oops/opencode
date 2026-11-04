@@ -830,6 +830,26 @@ describe("SessionProjector", () => {
         ["native", "text", "type"],
         ["executed", "id", "name", "native", "state", "time", "type"],
       ])
+      // Locally persisted acknowledgements use the same upgrade/replay seam, not a second representation.
+      yield* bus.replay({
+        id: Event.ID.make("evt_legacy_observed"), type: "session.step.observed.1", seq: 3,
+        created: 0, aggregateID: sessionID,
+        data: { sessionID, assistantMessageID: assistantID, providerState: {
+          nativeObserved: true, completedOutputItems: [{ type: "message", id: "acknowledged" }],
+        } },
+      })
+      yield* bus.replay({
+        id: Event.ID.make("evt_legacy_native_ended"), type: "session.step.native-ended.1", seq: 4,
+        created: 0, aggregateID: sessionID,
+        data: { sessionID, assistantMessageID: assistantID, protocol: "response.steer", boundary: "steered",
+          finish: "stop", providerState: { nativeSteered: true, responseId: "legacy_response" } },
+      })
+      const [retained] = yield* store.messages({ sessionID, order: "asc" })
+      expect(retained).toMatchObject({ native: {
+        nativeObserved: true, nativeSteered: true, responseId: "legacy_response",
+        completedOutputItems: [{ type: "message", id: "acknowledged" }],
+      } })
+      expect(retained).not.toHaveProperty("providerState")
     }),
   )
 
@@ -1391,8 +1411,8 @@ describe("SessionProjector", () => {
       const id = SessionMessage.ID.make("msg_media_user")
       const files = [attachment("shot.png"), attachment("copy.png")]
       const refs = [
-        { mime: "image/png", source: { type: "inline" }, name: "shot.png", uri },
-        { mime: "image/png", source: { type: "inline" }, name: "copy.png", uri },
+        { mime: "image/png", source: { type: "inline" as const }, name: "shot.png", uri },
+        { mime: "image/png", source: { type: "inline" as const }, name: "copy.png", uri },
       ]
 
       yield* inbox.admit({ id, sessionID, item: { type: "user", payload: { text: "look", files }, delivery: "steer" } })

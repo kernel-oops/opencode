@@ -62,7 +62,10 @@ export const Options = Schema.Struct({
   // false skips the system and global config dirs, ~/.claude, and ~/.agents;
   // wellknown, file, and content entries still load.
   global: Schema.optional(Schema.Boolean),
-  system: Schema.optional(Schema.Union([Schema.Boolean, Schema.String])),
+  // A frozen global snapshot may replace this original root at the next server start.
+  // Exclude only its exact global sources from ancestor discovery, not project overrides.
+  globalAlias: Schema.optional(Schema.String),
+    system: Schema.optional(Schema.Union([Schema.Boolean, Schema.String])),
   // false skips ~/.claude and project .claude dirs.
   claude: Schema.optional(Schema.Boolean),
   file: Schema.optional(Schema.String),

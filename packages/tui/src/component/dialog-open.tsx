@@ -23,13 +23,12 @@ import { withTimestampedFallback } from "@opencode/util/session-title-fallback"
 import { sessionStatusGutter } from "./dialog-session-list"
 import { Spinner } from "./spinner"
 import { projectName } from "../util/project"
+import { topLevelSessions } from "../util/session"
 
 const RECENT_LIMIT = 8
 export const DialogOpenKey = Symbol("DialogOpen")
 
-type OpenTarget =
-  | { type: "session"; sessionID: string }
-  | { type: "project"; directory: string; projectID?: string }
+type OpenTarget = { type: "session"; sessionID: string } | { type: "project"; directory: string; projectID?: string }
 
 type OpenView = { type: "projects" } | { type: "worktrees"; projectID: string }
 
@@ -158,13 +157,8 @@ export function DialogOpen(props: { sessions: SessionInfo[]; onLoad: (sessions: 
   )
   const attention = (sessionID: string) => sessionTabs.status(sessionID).attention
   const sessions = createMemo(() => {
-    const seen = new Set<string>()
     const match = matched()
-    const list = [...data.session.list(), ...props.sessions, ...(match ? [match] : [])].filter((session) => {
-      if (session.parentID || seen.has(session.id)) return false
-      seen.add(session.id)
-      return true
-    })
+    const list = topLevelSessions([...data.session.list(), ...props.sessions, ...(match ? [match] : [])], match?.id)
     const attentionByID = new Map(list.map((session) => [session.id, Boolean(attention(session.id))]))
     return list.toSorted((a, b) => {
       const attentionA = attentionByID.get(a.id) ?? false
@@ -263,8 +257,7 @@ export function DialogOpen(props: { sessions: SessionInfo[]; onLoad: (sessions: 
           } as OpenTarget,
           category: "Projects",
           gutter:
-            item.directory === current.directory ||
-            item.directory === location.current?.project.canonical
+            item.directory === current.directory || item.directory === location.current?.project.canonical
               ? () => <text fg={theme.text.formfield.selected}>●</text>
               : undefined,
         }
@@ -315,8 +308,7 @@ export function DialogOpen(props: { sessions: SessionInfo[]; onLoad: (sessions: 
           title,
           footer: footer + " ".repeat(Math.max(0, width - stringWidth(footer))),
           value: { type: "project", directory } as OpenTarget,
-          gutter:
-            directory === current.directory ? () => <text fg={theme.text.formfield.selected}>●</text> : undefined,
+          gutter: directory === current.directory ? () => <text fg={theme.text.formfield.selected}>●</text> : undefined,
         }
       })
   })

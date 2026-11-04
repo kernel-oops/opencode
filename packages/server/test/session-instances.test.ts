@@ -10,6 +10,7 @@ import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { ModelsDev } from "@opencode/core/models-dev"
 import { Permission } from "@opencode/core/permission"
 import { Plugin } from "@opencode/core/plugin"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Session } from "@opencode/core/session"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { define } from "@opencode/plugin/effect/plugin"
@@ -20,7 +21,7 @@ import { AbsolutePath } from "@opencode/schema/schema"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Global } from "@opencode/util/global"
-import { Context, Duration, Effect, Layer, LayerMap, RcMap, Schema } from "effect"
+import { Context, Deferred, Duration, Effect, Fiber, Layer, LayerMap, RcMap, Schema, Stream } from "effect"
 import { HttpEffect, HttpRouter, HttpServer } from "effect/http"
 import { LanguageModel, LLMClient } from "../../ai/src/effect"
 import { OpenAIChat } from "../../ai/src/protocols/openai-chat"
@@ -161,16 +162,21 @@ it.live(
         createEmbeddedRoutes({}, replacements).pipe(Layer.provide(HttpServer.layerServices)),
       )
       const sessions = Context.get(context, Session.Service)
+      const bus = Context.get(context, Bus.Service)
       const instances = Context.get(context, Instance.Service)
       const locations = Context.get(context, LocationServiceMap.Service)
       const handler = Context.get(context, HttpRouter.HttpRouter)
         .asHttpEffect()
         .pipe(HttpEffect.toWebHandlerWith(context))
+      const http = yield* Effect.acquireRelease(
+        Effect.sync(() => Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: (request) => handler(request) })),
+        (server) => Effect.sync(() => server.stop(true)),
+      )
       const request = (route: string, body?: unknown) =>
         Effect.promise(() =>
-          handler(
+          fetch(
             new Request(
-              `http://opencode.local${route}`,
+              new URL(route, http.url),
               body === undefined
                 ? undefined
                 : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
@@ -276,6 +282,11 @@ it.live(
         }),
       )
       for (const entry of pending) {
+        const invalid = yield* request(`/api/session/${entry.session.id}/permission/${entry.permission.id}/reply`, {
+          decision: "review_once",
+        })
+        expect(invalid.status).toBe(400)
+        expect(yield* Effect.promise<unknown>(() => invalid.json())).toMatchObject({ message: expect.any(String) })
         const forms = yield* request(`/api/session/${entry.session.id}/form`)
         expect(forms.status).toBe(200)
         expect(yield* Effect.promise<unknown>(() => forms.json())).toEqual({ data: [entry.form] })
@@ -329,6 +340,44 @@ it.live(
         }).pipe(instances.provide(entry.session))
       }
       expect(boots).toEqual([first.id, second.id])
+      const guarded = yield* Effect.forEach(configs, (config) => Effect.gen(function* () {
+        const session = yield* sessions.get(config.id)
+        return yield* Effect.gen(function* () {
+          const permission = yield* Permission.Service
+          const hooks = yield* PluginHooks.Service
+          yield* hooks.registerSourceReviewer((event) => Effect.sync(() => {
+            if (event.action !== "review-test") return
+            event.effect = "deny"
+            event.review = { kind: "model-refusal", reason: "Synthetic HTTP review refusal" }
+          }), () => true, true)
+          const asked = yield* Deferred.make<Permission.Request>()
+          yield* bus.subscribe(Permission.Event.Asked).pipe(
+            Stream.filter((event) => event.data.sessionID === session.id),
+            Stream.runForEach((event) => Deferred.succeed(asked, event.data)),
+            Effect.forkScoped({ startImmediately: true }),
+          )
+          const fiber = yield* permission.assert({
+            sessionID: session.id, action: "review-test", resources: ["/synthetic"],
+            metadata: { action: { identity: "review-test", complete: true, cwd: directory.path, arguments: { target: "/synthetic" } } },
+            source: { type: "tool", messageID: "msg_fixture", id: "call_fixture" },
+          }).pipe(Effect.forkScoped)
+          return { session, fiber, request: yield* Deferred.await(asked) }
+        }).pipe(instances.provide(session))
+      }))
+      for (const item of guarded) {
+        expect(item.request.review?.kind).toBe("model-refusal")
+        const route = `/api/session/${item.session.id}/permission/${item.request.id}/reply`
+        expect((yield* request(route, { decision: "once" })).status).toBe(400)
+        expect((yield* request(route, { decision: "always" })).status).toBe(400)
+        const foreign = item.session.id === first.id ? second.id : first.id
+        expect((yield* request(`/api/session/${foreign}/permission/${item.request.id}/reply`, { decision: "review_once" })).status).toBe(404)
+        // Ordinary prompt admission retains literal text; it has no permission-control interpretation.
+        yield* sessions.prompt({ sessionID: item.session.id, text: `I approve ${item.request.id}`, resume: false })
+        expect((yield* request(`/api/session/${item.session.id}/permission/${item.request.id}`)).status).toBe(200)
+        expect((yield* request(route, { decision: "review_once" })).status).toBe(204)
+        yield* Fiber.join(item.fiber)
+        expect((yield* request(route, { decision: "review_once" })).status).toBe(404)
+      }
       expect(Array.from(yield* RcMap.keys(locations.rcMap))).toEqual([])
     }),
   15_000,

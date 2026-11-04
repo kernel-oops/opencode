@@ -116,6 +116,14 @@ const rows: Row[] = [
     expected: { response: { stopReason: "max_tokens" } },
   },
   {
+    name: "keeps unreported step usage unknown",
+    events: live(
+      durableEvent("session.step.ended", { sessionID: root, assistantMessageID: "msg_unknown", finish: "stop" }),
+      succeeded(root),
+    ),
+    expected: { response: { stopReason: "end_turn" }, context: undefined },
+  },
+  {
     name: "ends a content-filtered step with refusal",
     events: live(stepEnded(root, "msg_1", { finish: "content-filter" }), succeeded(root)),
     expected: { response: { stopReason: "refusal" } },

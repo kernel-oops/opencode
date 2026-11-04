@@ -30,7 +30,21 @@ interface Failures extends Record<keyof Domains, unknown> {
 }
 
 type Callback<Event, Error> = (event: Event) => Effect.Effect<void, Error>
-type Entry = { readonly callback: Function; readonly options?: ModelHookOptions }
+type Entry = {
+  readonly callback: Function
+  readonly options?: ModelHookOptions
+  readonly sourceReviewer?: () => boolean
+  readonly modelReviewer?: boolean
+}
+
+const reviewMarker = (event: PermissionHooks["evaluate"]) => event.review
+
+/** Invocation-local, private callback identity; no public event marker can construct this receipt. */
+export interface ModelReceipt {
+  readonly valid: () => boolean
+  readonly includes: (entry: object) => boolean
+  readonly reason: string
+}
 
 const eventProviderID = (event: unknown) => {
   if (typeof event !== "object" || event === null || !("model" in event)) return undefined
@@ -56,6 +70,21 @@ export interface Interface {
     name: Name,
     event: Domains[Domain][Name],
   ) => Effect.Effect<Domains[Domain][Name], Failures[Domain][Name]>
+  /** Core-only registration and invocation; not exposed through the public hook API. */
+  readonly registerSourceReviewer: (
+    callback: Callback<PermissionHooks["evaluate"], never>,
+    current?: () => boolean,
+    modelReviewer?: boolean,
+  ) => Effect.Effect<State.Registration, never, Scope.Scope>
+  readonly reviewSource: (
+    event: PermissionHooks["evaluate"],
+  ) => Effect.Effect<{ event: PermissionHooks["evaluate"]; valid: () => boolean }>
+  readonly revision: () => number
+  readonly reviewPermission: (
+    event: PermissionHooks["evaluate"],
+    sourceOnly?: boolean,
+    approval?: ModelReceipt,
+  ) => Effect.Effect<{ event: PermissionHooks["evaluate"]; valid: () => boolean; review?: ModelReceipt }>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/PluginHooks") {}
@@ -64,26 +93,37 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const callbacks = new Map<string, Entry[]>()
+    let revision = 0
     const key = (domain: keyof Domains, name: PropertyKey) => `${domain}.${String(name)}`
 
-    const register: Interface["register"] = Effect.fn("PluginHooks.register")(
-      function* (domain, name, callback, options) {
-        const scope = yield* Scope.Scope
-        const id = key(domain, name)
-        let active = true
-        const entry = { callback, options }
-        callbacks.set(id, [...(callbacks.get(id) ?? []), entry])
-        const dispose = Effect.sync(() => {
-          if (!active) return
-          active = false
-          const next = (callbacks.get(id) ?? []).filter((item) => item !== entry)
-          if (next.length === 0) callbacks.delete(id)
-          else callbacks.set(id, next)
-        })
-        yield* Scope.addFinalizer(scope, dispose)
-        return { dispose }
-      },
-    )
+    const register = Effect.fn("PluginHooks.register")(function* <
+      Domain extends keyof Domains,
+      Name extends keyof Domains[Domain] & keyof Failures[Domain],
+    >(
+      domain: Domain,
+      name: Name,
+      callback: Callback<Domains[Domain][Name], Failures[Domain][Name]>,
+      options?: ModelHookOptions,
+      sourceReviewer?: () => boolean,
+      modelReviewer?: boolean,
+    ) {
+      const scope = yield* Scope.Scope
+      const id = key(domain, name)
+      let active = true
+      const entry = { callback, options, sourceReviewer, modelReviewer }
+      callbacks.set(id, [...(callbacks.get(id) ?? []), entry])
+      revision++
+      const dispose = Effect.sync(() => {
+        if (!active) return
+        active = false
+        revision++
+        const next = (callbacks.get(id) ?? []).filter((item) => item !== entry)
+        if (next.length === 0) callbacks.delete(id)
+        else callbacks.set(id, next)
+      })
+      yield* Scope.addFinalizer(scope, dispose)
+      return { dispose }
+    })
 
     const trigger: Interface["trigger"] = Effect.fnUntraced(function* (domain, name, event) {
       for (const entry of callbacks.get(key(domain, name)) ?? []) {
@@ -101,7 +141,74 @@ const layer = Layer.effect(
         ),
       )
 
-    return Service.of({ has, register, trigger })
+    const registerSourceReviewer: Interface["registerSourceReviewer"] = (callback, current = () => true, modelReviewer = false) =>
+      register("permission", "evaluate", callback, undefined, current, modelReviewer)
+    const reviewPermission: Interface["reviewPermission"] = Effect.fnUntraced(function* (event, sourceOnly = false, approval) {
+      const selected = (callbacks.get(key("permission", "evaluate")) ?? []).filter(
+        (entry) => !sourceOnly || entry.sourceReviewer?.(),
+      )
+      const models: Entry[] = []
+      let hardDenied = event.effect === "deny"
+      let reason = ""
+      const initial = JSON.stringify([event.sessionID, event.agent, event.action, event.resources, event.metadata, event.source])
+      for (const entry of selected) {
+        delete event.review
+        if (approval?.includes(entry) && approval.valid()) continue
+        const prior = event.effect
+        yield* entry.callback(event) as Effect.Effect<void>
+        const marker = reviewMarker(event)
+        const unchanged = initial === JSON.stringify([event.sessionID, event.agent, event.action, event.resources, event.metadata, event.source])
+        if (event.effect === "deny") {
+          if (!hardDenied && prior !== "deny" && entry.modelReviewer && entry.sourceReviewer?.() && unchanged && marker?.kind === "model-refusal") {
+            models.push(entry)
+            reason = marker.reason
+            event.effect = prior
+          } else hardDenied = true
+        }
+        if (hardDenied) event.effect = "deny"
+      }
+      delete event.review
+      if (models.length > 0) event.effect = "deny"
+      const valid = () => selected.length > 0 && selected.every(
+        (entry) => (callbacks.get(key("permission", "evaluate")) ?? []).includes(entry) && (!entry.sourceReviewer || entry.sourceReviewer()),
+      )
+      return {
+        event,
+        valid,
+        ...(!hardDenied && models.length > 0 ? { review: {
+          valid: () => valid() && models.every((entry) => entry.sourceReviewer?.()),
+          includes: (entry: object) => models.some((model) => model === entry),
+          reason,
+        } } : {}),
+      }
+    })
+    const reviewSource: Interface["reviewSource"] = Effect.fnUntraced(function* (event) {
+      const selected = (callbacks.get(key("permission", "evaluate")) ?? []).filter((entry) => entry.sourceReviewer?.())
+      let denied = false
+      for (const entry of selected) {
+        yield* entry.callback(event) as Effect.Effect<void>
+        denied ||= event.effect === "deny"
+        if (denied) event.effect = "deny"
+      }
+      // Invocation-local receipt: the exact registrations must still be alive after every await.
+      return {
+        event,
+        valid: () =>
+          selected.length > 0 &&
+          selected.every(
+            (entry) => entry.sourceReviewer?.() && (callbacks.get(key("permission", "evaluate")) ?? []).includes(entry),
+          ),
+      }
+    })
+    return Service.of({
+      has,
+      register: (domain, name, callback, options) => register(domain, name, callback, options),
+      trigger,
+      registerSourceReviewer,
+      reviewSource,
+      reviewPermission,
+      revision: () => revision,
+    })
   }),
 )
 

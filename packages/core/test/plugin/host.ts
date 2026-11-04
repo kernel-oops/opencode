@@ -177,6 +177,17 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused websearch.reload"),
     },
     session: {
+      reviewRoot: overrides.session?.reviewRoot ?? (() => Effect.succeed({ complete: false })),
+      reviewEvidence:
+        overrides.session?.reviewEvidence ??
+        (() => Effect.succeed({ ok: false as const, error: "not_found" as const, limitations: [] })),
+      stateCheckpoint: overrides.session?.stateCheckpoint ?? {
+        snapshot: () => Effect.die("unused session.stateCheckpoint.snapshot"),
+        read: () => Effect.die("unused session.stateCheckpoint.read"),
+        update: () => Effect.die("unused session.stateCheckpoint.update"),
+        compact: () => Effect.die("unused session.stateCheckpoint.compact"),
+        maintain: () => Effect.die("unused session.stateCheckpoint.maintain"),
+      },
       hook: overrides.session?.hook ?? (() => Effect.die("unused session.hook")),
       list: overrides.session?.list ?? (() => Effect.die("unused session.list")),
       create: overrides.session?.create ?? (() => Effect.die("unused session.create")),
@@ -191,6 +202,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       update: overrides.session?.update ?? (() => Effect.die("unused session.update")),
       move: overrides.session?.move ?? (() => Effect.die("unused session.move")),
       synthetic: overrides.session?.synthetic ?? (() => Effect.die("unused session.synthetic")),
+      append: overrides.session?.append ?? (() => Effect.die("unused session.append")),
       interrupt: overrides.session?.interrupt ?? (() => Effect.die("unused session.interrupt")),
       wait: overrides.session?.wait ?? (() => Effect.die("unused session.wait")),
       context: overrides.session?.context ?? (() => Effect.die("unused session.context")),

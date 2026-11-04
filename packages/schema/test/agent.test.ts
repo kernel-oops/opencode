@@ -8,3 +8,9 @@ test("Agent.Color preserves configured colors at the public boundary", () => {
   expect(encode("info")).toBe("info")
   expect(encode("custom-color")).toBe("custom-color")
 })
+
+test("default agents require explicit permission for independent ownership", () => {
+  expect(Agent.Info.default(Agent.ID.make("fixture")).permissions).toContainEqual({
+    action: "new_session", resource: "*", effect: "ask",
+  })
+})

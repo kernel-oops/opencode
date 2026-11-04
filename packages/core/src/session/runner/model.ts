@@ -34,10 +34,14 @@ export type Error = ModelNotSelectedError | ModelUnavailableError | ModelResolve
 export type Resolved = ModelResolver.Resolved
 
 export interface Interface {
-  /** Availability is sampled lazily for each explicitly selected model resolution. */
+  /**
+   * Availability is sampled lazily for each explicitly selected model resolution. `options` carries the
+   * primary execution's native test policy; auxiliary resolutions omit it.
+   */
   readonly resolve: (
     session: SessionSchema.Info,
     available: () => Effect.Effect<ReadonlyArray<Model.Info>>,
+    options?: ModelResolver.Options,
   ) => Effect.Effect<Resolved, Error>
 }
 
@@ -74,7 +78,7 @@ const layer = Layer.effect(
     const resolver = yield* ModelResolver.Service
     const agents = yield* Agent.Service
     return Service.of({
-      resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session, available) {
+      resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session, available, options) {
         // Location plugins populate and filter the catalog asynchronously during layer startup.
         if (!session.model) {
           const agent = (yield* agents.select(session.agent)).info?.model
@@ -82,8 +86,8 @@ const layer = Layer.effect(
             agent &&
             (yield* available()).find((model) => model.providerID === agent.providerID && model.id === agent.id)
           const resolved = preferred
-            ? yield* resolver.resolveModel(preferred, agent.variant)
-            : yield* resolver.resolve()
+            ? yield* resolver.resolveModel(preferred, agent.variant, options)
+            : yield* resolver.resolve(undefined, options)
           if (resolved) return resolved
           return yield* new ModelNotSelectedError({ sessionID: session.id })
         }
@@ -95,7 +99,7 @@ const layer = Layer.effect(
             providerID: session.model.providerID,
             modelID: session.model.id,
           })
-        return yield* resolver.resolveModel(selected, session.model.variant)
+        return yield* resolver.resolveModel(selected, session.model.variant, options)
       }),
     })
   }),

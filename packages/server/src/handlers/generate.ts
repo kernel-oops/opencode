@@ -11,7 +11,6 @@ import {
 } from "@opencode/protocol/errors"
 import type { DecisionRequest, ImageRequest } from "@opencode/schema/generate"
 import { Global } from "@opencode/util/global"
-import { Model } from "@opencode/schema/model"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/http-api"
 import { Api } from "../api"
@@ -23,10 +22,10 @@ export const GenerateHandler = HttpApiBuilder.group(Api, "server.generate", (han
     const locations = yield* LocationServiceMap.Service
     const services = locations.get(Location.Ref.make({ directory: AbsolutePath.make(global.config) }))
     const text = Effect.fn("server.generate.text")(
-      function* (request: { readonly payload: { readonly prompt: string; readonly model?: Model.Ref } }) {
+      function* (request: { readonly payload: Generate.TextInput }) {
         yield* awaitPlugins
         const generate = yield* Generate.Service
-        return { data: { text: yield* generate.text(request.payload).pipe(Effect.mapError(generateError)) } }
+        return { data: yield* generate.result(request.payload).pipe(Effect.mapError(generateError)) }
       },
       Effect.provide(services),
       locationErrors,

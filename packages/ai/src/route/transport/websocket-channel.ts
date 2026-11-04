@@ -29,18 +29,30 @@ export interface WebSocketChannelExchange {
 
 export interface WebSocketChannelDriver {
   readonly create: (checkpoint: ChannelCheckpoint | undefined) => Effect.Effect<ChannelCreate, AIError>
+  readonly steer?: (text: string) => Effect.Effect<string | undefined, AIError>
   readonly observe: (create: ChannelCreate, frame: string) => Effect.Effect<ChannelObservation, AIError>
 }
 
 export interface ChannelCreate {
   readonly message: string
-  readonly mode: "full" | "incremental"
+  readonly mode: "full" | "incremental" | "automatic"
 }
 
 export type ChannelObservation =
   | { readonly type: "frame"; readonly frame: string }
-  | { readonly type: "completed"; readonly frame: string; readonly checkpoint?: ChannelCheckpoint }
-  | { readonly type: "incomplete"; readonly frame: string }
+  | { readonly type: "ignore" }
+  | {
+      readonly type: "completed"
+      readonly frame: string
+      readonly checkpoint?: ChannelCheckpoint
+      readonly continuation?: string
+    }
+  | {
+      readonly type: "incomplete"
+      readonly frame: string
+      readonly checkpoint?: ChannelCheckpoint
+      readonly continuation?: string
+    }
   | { readonly type: "provider-failure"; readonly error: AIError }
   | { readonly type: "rejected"; readonly error: AIError; readonly recovery: "retry-full" }
   | { readonly type: "rejected"; readonly error: AIError; readonly recovery: "rotate-and-retry-full" }
@@ -48,4 +60,5 @@ export type ChannelObservation =
 export interface ChannelCheckpoint {
   readonly protocol: string
   readonly value: unknown
+  readonly pendingInput?: boolean
 }

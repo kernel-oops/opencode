@@ -237,6 +237,7 @@ export const Assistant = Schema.Struct({
   tokens: TokenUsage.Info.pipe(optional),
   error: SessionError.Error.pipe(optional),
   retry: AssistantRetry.pipe(optional),
+  interruption: Schema.Literals(["steer"]).pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     /** When the provider response body ended, before tool settlement. */
@@ -261,6 +262,20 @@ export const CompactionRunning = Schema.Struct({
   summary: Schema.String,
 }).annotate({ identifier: "Session.Message.Compaction.Running" })
 
+/**
+ * Core's binding of a compaction to a reviewed controller-state revision: machine provenance that the compaction is
+ * core's checkpoint of exactly that full state, not a grant. Only core sets it; text alone never binds.
+ */
+export interface CheckpointBinding extends Schema.Schema.Type<typeof CheckpointBinding> {}
+export const CheckpointBinding = Schema.Struct({
+  version: Schema.Literal(1),
+  sessionID: Schema.String,
+  revision: Schema.Number,
+  stateHash: Schema.String,
+  /** Requested by operator maintenance: the session returns to idle after it instead of resuming model turns. */
+  maintenance: Schema.Literal(true).pipe(optional),
+}).annotate({ identifier: "Session.Message.CheckpointBinding" })
+
 export interface CompactionCompleted extends Schema.Schema.Type<typeof CompactionCompleted> {}
 export const CompactionCompleted = Schema.Struct({
   ...CompactionBase,
@@ -270,6 +285,8 @@ export const CompactionCompleted = Schema.Struct({
   /** A provider compaction stores its replacement window in `native.messages`, replayed instead of `summary`. */
   native: Native.pipe(optional),
   summary: Schema.String,
+  /** Present only on core's controller-state checkpoint, whose `summary` is then its versioned envelope. */
+  checkpoint: CheckpointBinding.pipe(optional),
   ...CompactionUsage,
 }).annotate({ identifier: "Session.Message.Compaction.Completed" })
 

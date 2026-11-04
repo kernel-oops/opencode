@@ -11,6 +11,7 @@ const generate = makeLocationNode({
   layer: Layer.succeed(
     Generate.Service,
     Generate.Service.of({
+      result: () => Effect.succeed({ text: 42 as unknown as string }),
       text: () => Effect.succeed(42 as unknown as string),
       image: () => Effect.die("unused"),
       decisions: () => Effect.die("unused"),

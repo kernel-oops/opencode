@@ -21,6 +21,7 @@ import { SessionHistory } from "./history.js"
 import { InstructionEntry } from "./instruction-entry.js"
 import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
+import { SessionNativeTest } from "./native-test.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
@@ -88,8 +89,10 @@ const layer = Layer.effect(
     const skillInstructions = yield* SkillInstructions.Service
     const store = yield* SessionStore.Service
     const registry = yield* Tool.Service
+    const nativeTest = yield* SessionNativeTest.Service
 
-    const resolveModel = (session: SessionSchema.Info) => models.resolve(session, model.available)
+    const available = model.available
+    const resolveModel = (session: SessionSchema.Info) => models.resolve(session, available)
 
     const selectTitle = Effect.fn("SessionContext.selectTitle")(function* (session: SessionSchema.Info) {
       const agent = yield* agents.get(Agent.ID.make("title"))
@@ -166,7 +169,14 @@ const layer = Layer.effect(
     })
 
     const load = Effect.fn("SessionContext.load")(function* (selection: Selection) {
-      const model = yield* resolveModel(selection.session)
+      // Only the primary execution reads its immutable native test snapshot; auxiliary resolutions never do.
+      const policy = nativeTest.policy(selection.session.id)
+      const model = yield* models.resolve(
+        selection.session,
+        available,
+        policy.nativeSteer === false ? undefined : { nativeSteer: policy.nativeSteer },
+      )
+      if (model.nativeTest) nativeTest.resolved(selection.session.id, model.transport ?? "http", model.nativeTest)
       const history = yield* SessionHistory.entriesForRunner(
         db,
         selection.session.id,
@@ -218,6 +228,7 @@ export const node = makeLocationNode({
     ReferenceInstructions.node,
     SessionRunnerModel.node,
     SessionModelRequest.node,
+    SessionNativeTest.node,
     SessionStore.node,
     SkillInstructions.node,
     Tool.node,

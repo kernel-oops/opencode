@@ -345,6 +345,9 @@ export const protocol = Protocol.make({
     event: OpenResponses.protocol.stream.event,
     initial: (request) => OpenResponses.initial(request, adapter),
     step,
+    interrupted: OpenResponses.interrupted,
+    steered: { is: (event) => event.type === "response.incomplete" && event.response?.incomplete_details?.reason === "steered", finish: OpenResponses.steered },
+    observation: OpenResponses.observation,
     terminal: OpenResponses.terminal,
   },
   supportsEffortUpdates,
@@ -355,12 +358,15 @@ const auth = Auth.none
 
 export const httpTransport = HttpTransport.sseJson.with<OpenAIResponsesBody>()
 export const channelTransport = OpenResponsesChannel.transport<OpenAIResponsesBody>
-export const transport = channelTransport({
+const channelOptions = {
   id: ADAPTER,
   name: NAME,
   rotateAfterMs: WEBSOCKET_ROTATE_AFTER_MS,
-  headers: (headers) => Headers.set(headers, "openai-beta", headers["openai-beta"] ?? WEBSOCKET_PROTOCOL_HEADER),
-})
+  headers: (headers: Headers.Headers) => Headers.set(headers, "openai-beta", headers["openai-beta"] ?? WEBSOCKET_PROTOCOL_HEADER),
+}
+export const transport = channelTransport(channelOptions)
+/** Explicit per-session selection; the ordinary route remains incapable. */
+export const nativeSteerTransport = channelTransport({ ...channelOptions, nativeSteer: true })
 
 export const route = Route.make({
   compact: {

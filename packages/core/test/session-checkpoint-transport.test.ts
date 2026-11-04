@@ -8,11 +8,12 @@ import { Session } from "@opencode/schema/session"
 import { Effect, Layer, Schema } from "effect"
 import { FetchHttpClient } from "effect/http"
 import { testEffect } from "./lib/effect"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { makeWebSocketServer } from "./lib/websocket-server"
 
 const runtime = Layer.mergeAll(
   LLMClient.layer.pipe(Layer.provide(RequestExecutor.layer), Layer.provide(FetchHttpClient.layer)),
-  SessionModelTransport.layer.pipe(Layer.provide(WebSocketConstructor.layer)),
+  SessionModelTransport.layer.pipe(Layer.provide(WebSocketConstructor.layer), Layer.provide(SessionNativeTest.layer)),
 )
 const it = testEffect(runtime)
 const sessionID = Session.ID.make("ses_checkpoint_transport")

@@ -15,6 +15,8 @@ const renames: Record<string, readonly [string, string]> = {
   "session.tool.called": ["state", "native"],
   "session.step.ended": ["providerState", "native"],
   "session.step.failed": ["providerState", "native"],
+  "session.step.observed": ["providerState", "native"],
+  "session.step.native-ended": ["providerState", "native"],
   "session.tool.success": ["resultState", "native"],
   "session.tool.failed": ["resultState", "native"],
 }

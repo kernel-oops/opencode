@@ -12,13 +12,14 @@ import { Locale } from "../../../util/locale"
 import { Keymap } from "../../../context/keymap"
 import { useComposerTab } from "./context"
 import { withTimestampedFallback } from "@opencode/util/session-title-fallback"
-import { sessionFamily } from "../../../util/session"
+import { sessionFamily, shortModelLabel } from "../../../util/session"
 
 interface SubagentEntry {
   sessionID: string
   agent: string
   title: string
   status: string
+  model: string | undefined
   current: boolean
   prefix: string
 }
@@ -42,26 +43,26 @@ export function SubagentsTab(props: { sessionID: string }) {
     const current = session()
     if (!current) return []
 
-    const result = sessionFamily<SessionInfo>(data.session.list(), current.id).map(
-      ({ session, prefix }): SubagentEntry => {
-        const title = withTimestampedFallback(session)
-        const agentMatch = title.match(/@(\w+) subagent/)
-        return {
-          sessionID: session.id,
-          agent: session.agent
-            ? Locale.titlecase(session.agent)
-            : agentMatch
-              ? Locale.titlecase(agentMatch[1])
-              : "Subagent",
-          title: agentMatch ? title.replace(agentMatch[0], "").trim() || title : title,
-          status: data.session.status(session.id),
-          current: session.id === route.sessionID,
-          prefix,
-        }
-      },
-    )
-
-    return result.filter((entry) => (filter.active ? entry.status === "running" : entry.status !== "running"))
+    const status = (session: SessionInfo) => data.session.status(session.id)
+    return sessionFamily<SessionInfo>(data.session.list(), current.id, (session) =>
+      filter.active ? status(session) === "running" : status(session) !== "running",
+    ).map(({ session, prefix }): SubagentEntry => {
+      const title = withTimestampedFallback(session)
+      const agentMatch = title.match(/@(\w+) subagent/)
+      return {
+        sessionID: session.id,
+        agent: session.agent
+          ? Locale.titlecase(session.agent)
+          : agentMatch
+            ? Locale.titlecase(agentMatch[1])
+            : "Subagent",
+        title: agentMatch ? title.replace(agentMatch[0], "").trim() || title : title,
+        status: status(session),
+        model: shortModelLabel(session.model),
+        current: session.id === route.sessionID,
+        prefix,
+      }
+    })
   })
 
   let selectedSessionID = ""
@@ -243,6 +244,16 @@ export function SubagentsTab(props: { sessionID: string }) {
                       {entry.agent}: {entry.title}
                     </text>
                   </box>
+                  <Show when={entry.model}>
+                    <text
+                      fg={active() ? theme.text.action.primary.focused : theme.text.muted}
+                      wrapMode="none"
+                      flexShrink={0}
+                    >
+                      {entry.model}
+                      {status() ? "  " : ""}
+                    </text>
+                  </Show>
                   <Show when={status()}>
                     <text fg={active() ? theme.text.action.primary.focused : theme.text.muted} wrapMode="none">
                       {status()}

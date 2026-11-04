@@ -1847,6 +1847,20 @@
                       }
                     ]
                   },
+                  "contextBudget": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.ContextBudget"
+                      },
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Session-only estimated total-token budget. Null disables it. Setting it explicitly re-arms admission; children do not inherit it."
+                  },
                   "archived": {
                     "anyOf": [
                       {
@@ -2005,11 +2019,18 @@
             }
           },
           "404": {
-            "description": "SessionNotFoundError",
+            "description": "SessionNotFoundError | LocationNotFoundError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
                 }
               }
             }
@@ -2076,11 +2097,18 @@
             }
           },
           "404": {
-            "description": "SessionNotFoundError",
+            "description": "SessionNotFoundError | LocationNotFoundError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
                 }
               }
             }
@@ -2683,6 +2711,158 @@
                     "anyOf": [
                       {
                         "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
+    "/api/session/{sessionID}/append": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.append",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "$ref": "#/components/schemas/Session.Message.ID"
+                        }
+                      },
+                      "required": ["id"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "MessageNotFoundError | SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MessageNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Durably append a chunk of assistant-authored text to a session, without scheduling a model turn. Pass the returned id back in to extend the same message; set final to close it out.",
+        "summary": "Append visible assistant text",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Message.ID"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "final": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "agent": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Agent.ID"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "model": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Model.Ref"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "metadata": {
+                    "anyOf": [
+                      {
+                        "type": "object"
                       },
                       {
                         "type": "null"
@@ -3677,6 +3857,201 @@
         }
       }
     },
+    "/api/experimental/session/{sessionID}/native-test": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "experimental.session.nativeTest.get",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SessionNativeTest.Status"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Read the process-local native steering test settings, latest execution snapshot and bounded metadata-only diagnostics for one session.",
+        "summary": "Get native steering test lane"
+      },
+      "put": {
+        "tags": ["session"],
+        "operationId": "experimental.session.nativeTest.put",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/SessionNativeTest.Status"
+                    }
+                  },
+                  "required": ["data"],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "SessionNativeTestUnsupportedError | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNativeTestUnsupportedErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "SessionNativeTestLaneOccupiedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNativeTestLaneOccupiedErrorEncoded"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "ServiceUnavailableError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableErrorEncoded"
+                }
+              }
+            }
+          }
+        },
+        "description": "Request native steering and metadata diagnostics for this exact session's next execution only. Process-local: never inherited, persisted or kept across restart. An active execution keeps its settings; the change is reported as pending and nothing is interrupted.",
+        "summary": "Set native steering test lane",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionNativeTest.Settings"
+              }
+            }
+          },
+          "required": true
+        }
+      }
+    },
     "/api/experimental/session/{sessionID}/instructions/entries": {
       "get": {
         "tags": ["session"],
@@ -4238,6 +4613,278 @@
         },
         "description": "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
         "summary": "Interrupt session execution"
+      }
+    },
+    "/api/session/{sessionID}/task": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "v2.session.task.status",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionTask.Status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTask.Status"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Whether automatic subagent completion delivery is paused for this session, whether it is executing, and the process-local subagent jobs it owns.",
+        "summary": "Task control status"
+      }
+    },
+    "/api/session/{sessionID}/task/stop-response": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "v2.session.task.stopResponse",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionTask.StopResponseResult",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTask.StopResponseResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Durably pause automatic subagent completion delivery, then interrupt the current response and its foreground tools. Accepted background subagents keep running; their completions are retained in the inbox until resume or the next human turn.",
+        "summary": "Stop response only"
+      }
+    },
+    "/api/session/{sessionID}/task/resume": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "v2.session.task.resume",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionTask.ResumeResult",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTask.ResumeResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Release the completion-delivery pause and wake the session so retained completions are delivered.",
+        "summary": "Resume controller"
+      }
+    },
+    "/api/session/{sessionID}/task/stop-all": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "v2.session.task.stopAll",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "required": true
+          }
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "SessionTask.StopAllResult",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTask.StopAllResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UnauthorizedError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SessionNotFoundError | LocationNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "description": "Interrupt the session and cancel every subagent job it owns, recursively, permanently suppressing their completion notifications.",
+        "summary": "Stop all work"
       }
     },
     "/api/session/{sessionID}/background": {
@@ -5475,6 +6122,16 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "responseSchema": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Generate.ResponseSchema"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   }
                 },
                 "required": ["prompt"],
@@ -5590,6 +6247,16 @@
                     "anyOf": [
                       {
                         "$ref": "#/components/schemas/Model.Ref"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "responseSchema": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Generate.ResponseSchema"
                       },
                       {
                         "type": "null"
@@ -10632,6 +11299,8 @@
                     "session.renamed",
                     "session.metadata.updated",
                     "session.permissions",
+                    "session.context-budget.configured",
+                    "session.context-budget.changed",
                     "session.viewed",
                     "session.archived",
                     "session.unarchived",
@@ -10643,6 +11312,13 @@
                     "session.inbox.cancelled",
                     "session.inbox.delivery.changed",
                     "session.execution.started",
+                    "session.native-control.requested",
+                    "session.native-control.accepted",
+                    "session.native-control.continuation-requested",
+                    "session.native-control.committed",
+                    "session.native-control.rejected",
+                    "session.native-control.settled",
+                    "session.native-control.unresolved",
                     "session.execution.succeeded",
                     "session.execution.failed",
                     "session.execution.interrupted",
@@ -10653,7 +11329,10 @@
                     "session.shell.ended",
                     "session.step.started",
                     "session.step.streamed",
+                    "session.step.observed",
+                    "session.step.interrupted",
                     "session.step.ended",
+                    "session.step.native-ended",
                     "session.step.failed",
                     "session.text.started",
                     "session.text.delta",
@@ -10741,6 +11420,8 @@
                           "session.renamed",
                           "session.metadata.updated",
                           "session.permissions",
+                          "session.context-budget.configured",
+                          "session.context-budget.changed",
                           "session.viewed",
                           "session.archived",
                           "session.unarchived",
@@ -10752,6 +11433,13 @@
                           "session.inbox.cancelled",
                           "session.inbox.delivery.changed",
                           "session.execution.started",
+                          "session.native-control.requested",
+                          "session.native-control.accepted",
+                          "session.native-control.continuation-requested",
+                          "session.native-control.committed",
+                          "session.native-control.rejected",
+                          "session.native-control.settled",
+                          "session.native-control.unresolved",
                           "session.execution.succeeded",
                           "session.execution.failed",
                           "session.execution.interrupted",
@@ -10762,7 +11450,10 @@
                           "session.shell.ended",
                           "session.step.started",
                           "session.step.streamed",
+                          "session.step.observed",
+                          "session.step.interrupted",
                           "session.step.ended",
+                          "session.step.native-ended",
                           "session.step.failed",
                           "session.text.started",
                           "session.text.delta",
@@ -16912,6 +17603,26 @@
         "required": ["template"],
         "additionalProperties": false
       },
+      "Config.Compaction.ModelEncoded": {
+        "type": "object",
+        "properties": {
+          "keep": {
+            "type": "object",
+            "properties": {
+              "tokens": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "strict": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
       "Config.Compaction.Percent": {
         "type": "string",
         "pattern": "^([1-9]\\d?(\\.\\d+)?)%$"
@@ -17239,6 +17950,9 @@
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 9007199254740991
+                  },
+                  "strict": {
+                    "type": "boolean"
                   }
                 },
                 "additionalProperties": false
@@ -17254,6 +17968,12 @@
                     "maximum": 9007199254740991
                   }
                 ]
+              },
+              "models": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/Config.Compaction.ModelEncoded"
+                }
               }
             },
             "additionalProperties": false
@@ -17439,6 +18159,18 @@
                   },
                   "required": ["action", "resource", "effect"],
                   "additionalProperties": false
+                }
+              },
+              "task_continuation_agents": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "task_continuation_eligible": {
+                "type": "array",
+                "items": {
+                  "type": "string"
                 }
               }
             },
@@ -17832,6 +18564,13 @@
           },
           "transport": {
             "$ref": "#/components/schemas/Provider.Transport"
+          },
+          "nativeInterrupt": {
+            "type": "string"
+          },
+          "nativeSteer": {
+            "type": "string",
+            "enum": ["response.steer"]
           },
           "encoding": {
             "$ref": "#/components/schemas/Provider.Encoding"
@@ -19098,7 +19837,7 @@
             "$ref": "#/components/schemas/Money.USD"
           },
           "tokens": {
-            "$ref": "#/components/schemas/Generate.Usage"
+            "$ref": "#/components/schemas/Generate.MediaUsage"
           },
           "native": {
             "$ref": "#/components/schemas/Generate.Native"
@@ -19239,7 +19978,7 @@
             "$ref": "#/components/schemas/Money.USD"
           },
           "tokens": {
-            "$ref": "#/components/schemas/Generate.Usage"
+            "$ref": "#/components/schemas/Generate.MediaUsage"
           },
           "native": {
             "$ref": "#/components/schemas/Generate.Native"
@@ -19247,6 +19986,19 @@
         },
         "required": ["images"],
         "additionalProperties": false
+      },
+      "Generate.MediaUsage": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "number"
+          },
+          "output": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Token counts, when the provider reports them"
       },
       "Generate.Native": {
         "type": "object",
@@ -19289,6 +20041,39 @@
         "required": ["type", "name", "instructions"],
         "additionalProperties": false,
         "description": "The probability that a statement is true"
+      },
+      "Generate.ResponseSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "schema": {
+            "type": "object"
+          }
+        },
+        "required": ["name", "schema"],
+        "additionalProperties": false
+      },
+      "Generate.Result": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "responseSchemaName": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Generate.Usage"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
       },
       "Generate.ScoreAnswer": {
         "type": "object",
@@ -19375,15 +20160,51 @@
       "Generate.Usage": {
         "type": "object",
         "properties": {
-          "input": {
-            "type": "number"
+          "contextTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
           },
-          "output": {
-            "type": "number"
+          "inputTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "outputTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "nonCachedInputTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cacheReadInputTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cacheWriteInputTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "reasoningTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "totalTokens": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "providerMetadata": {
+            "type": "object"
           }
         },
-        "additionalProperties": false,
-        "description": "Token counts, when the provider reports them"
+        "additionalProperties": false
       },
       "GenerateDecisionsResponse": {
         "type": "object",
@@ -19409,14 +20230,7 @@
         "type": "object",
         "properties": {
           "data": {
-            "type": "object",
-            "properties": {
-              "text": {
-                "type": "string"
-              }
-            },
-            "required": ["text"],
-            "additionalProperties": false
+            "$ref": "#/components/schemas/Generate.Result"
           }
         },
         "required": ["data"],
@@ -20936,7 +21750,7 @@
       },
       "Permission.Reply": {
         "type": "string",
-        "enum": ["once", "always", "reject"]
+        "enum": ["once", "always", "reject", "review_once"]
       },
       "Permission.Request": {
         "type": "object",
@@ -20970,6 +21784,20 @@
           },
           "message": {
             "type": "string"
+          },
+          "review": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["model-refusal"]
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": ["kind", "reason"],
+            "additionalProperties": false
           }
         },
         "required": ["id", "sessionID", "action", "resources"],
@@ -22014,6 +22842,13 @@
           "transport": {
             "$ref": "#/components/schemas/Provider.Transport"
           },
+          "nativeInterrupt": {
+            "type": "string"
+          },
+          "nativeSteer": {
+            "type": "string",
+            "enum": ["response.steer"]
+          },
           "encoding": {
             "$ref": "#/components/schemas/Provider.Encoding"
           }
@@ -22850,6 +23685,106 @@
         "required": ["_tag", "message"],
         "additionalProperties": false
       },
+      "Session.ContextBudget": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "exclusiveMinimum": 0
+          },
+          "maximum": {
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "exclusiveMinimum": 0
+          }
+        },
+        "required": ["target", "maximum"],
+        "additionalProperties": false
+      },
+      "Session.ContextBudgetBlocked": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "inputMargin": {
+            "type": "number"
+          },
+          "estimated": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "raw": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "replayGenerated": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "input": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "output": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "inputMaximum": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "contextMaximum": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "maximum": {
+            "type": "integer",
+            "maximum": 9007199254740991,
+            "exclusiveMinimum": 0
+          },
+          "selection": {
+            "type": "string"
+          }
+        },
+        "required": ["reason", "maximum", "selection"],
+        "additionalProperties": false
+      },
+      "Session.ContextBudgetState": {
+        "type": "object",
+        "properties": {
+          "attempted": {
+            "type": "object",
+            "properties": {
+              "binding": {
+                "type": "string"
+              },
+              "estimated": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["binding", "estimated"],
+            "additionalProperties": false
+          },
+          "blocked": {
+            "$ref": "#/components/schemas/Session.ContextBudgetBlocked"
+          }
+        },
+        "additionalProperties": false
+      },
       "Session.ForkBoundary": {
         "anyOf": [
           {
@@ -22920,9 +23855,13 @@
         "additionalProperties": false
       },
       "Session.Inbox.CompactionPayload": {
-        "not": {
-          "type": "null"
-        }
+        "type": "object",
+        "properties": {
+          "checkpoint": {
+            "$ref": "#/components/schemas/Session.Message.CheckpointBinding"
+          }
+        },
+        "additionalProperties": false
       },
       "Session.Inbox.Delivery": {
         "type": "string",
@@ -23184,6 +24123,12 @@
           "permissions": {
             "$ref": "#/components/schemas/Permission.Ruleset"
           },
+          "contextBudget": {
+            "$ref": "#/components/schemas/Session.ContextBudget"
+          },
+          "contextBudgetState": {
+            "$ref": "#/components/schemas/Session.ContextBudgetState"
+          },
           "revert": {
             "$ref": "#/components/schemas/Session.Revert"
           },
@@ -23317,6 +24262,14 @@
           },
           "retry": {
             "$ref": "#/components/schemas/Session.Message.Assistant.Retry"
+          },
+          "interruption": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["steer"]
+              }
+            ]
           }
         },
         "required": ["id", "time", "type", "agent", "model", "content"],
@@ -23442,6 +24395,38 @@
         "required": ["type", "id", "name", "state", "time"],
         "additionalProperties": false
       },
+      "Session.Message.CheckpointBinding": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "number",
+            "enum": [1]
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          },
+          "stateHash": {
+            "type": "string"
+          },
+          "maintenance": {
+            "type": "boolean",
+            "enum": [true]
+          }
+        },
+        "required": ["version", "sessionID", "revision", "stateHash"],
+        "additionalProperties": false
+      },
       "Session.Message.Compaction": {
         "anyOf": [
           {
@@ -23494,6 +24479,9 @@
           },
           "summary": {
             "type": "string"
+          },
+          "checkpoint": {
+            "$ref": "#/components/schemas/Session.Message.CheckpointBinding"
           },
           "cost": {
             "$ref": "#/components/schemas/Money.USD"
@@ -24230,6 +25218,296 @@
         "required": ["data", "cursor"],
         "additionalProperties": false
       },
+      "SessionNativeTest.Category": {
+        "type": "string",
+        "enum": [
+          "affinity",
+          "age",
+          "completed",
+          "interrupted",
+          "steered",
+          "incomplete",
+          "provider-failure",
+          "rejected",
+          "ready",
+          "required-input",
+          "lease-lost",
+          "successor-timeout",
+          "unbound-successor",
+          "unexpected-frame",
+          "transport-or-decoder-failure",
+          "receipt",
+          "parent-idle",
+          "drain",
+          "stream-failures",
+          "message-too-large",
+          "connect-failure",
+          "not-sent",
+          "peer-close",
+          "transport"
+        ]
+      },
+      "SessionNativeTest.Debug": {
+        "anyOf": [
+          {
+            "type": "boolean",
+            "enum": [false]
+          },
+          {
+            "type": "string",
+            "enum": ["metadata"]
+          }
+        ]
+      },
+      "SessionNativeTest.Execution": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/SessionNativeTest.Settings"
+          },
+          "transport": {
+            "type": "string",
+            "enum": ["http", "websocket"]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SessionNativeTest.Reason"
+          }
+        },
+        "required": ["id", "active", "settings"],
+        "additionalProperties": false
+      },
+      "SessionNativeTest.Kind": {
+        "type": "string",
+        "enum": [
+          "execution-started",
+          "execution-finished",
+          "channel-retired",
+          "connect",
+          "connect-failed",
+          "reuse",
+          "rotate",
+          "send",
+          "send-not-sent",
+          "send-ambiguous",
+          "fallback",
+          "parent-created",
+          "steer-sent",
+          "steer-send-unknown",
+          "steer-accepted",
+          "progress",
+          "terminal",
+          "lease",
+          "handoff",
+          "successor-created",
+          "adopt",
+          "timer-armed",
+          "timer-expired",
+          "timer-cancelled",
+          "closed",
+          "poisoned"
+        ]
+      },
+      "SessionNativeTest.NativeSteer": {
+        "anyOf": [
+          {
+            "type": "boolean",
+            "enum": [false]
+          },
+          {
+            "type": "string",
+            "enum": ["response.steer"]
+          }
+        ]
+      },
+      "SessionNativeTest.Reason": {
+        "type": "string",
+        "enum": [
+          "not-requested",
+          "allowed",
+          "active",
+          "allowance-missing",
+          "protocol-unsupported",
+          "native-interrupt-conflict",
+          "model-unavailable"
+        ]
+      },
+      "SessionNativeTest.Record": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "execution": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "exchange": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SessionNativeTest.Kind"
+          },
+          "category": {
+            "$ref": "#/components/schemas/SessionNativeTest.Category"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "budgetMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "elapsedMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "closeCode": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": ["seq", "at", "execution", "exchange", "kind"],
+        "additionalProperties": false
+      },
+      "SessionNativeTest.Settings": {
+        "type": "object",
+        "properties": {
+          "nativeSteer": {
+            "$ref": "#/components/schemas/SessionNativeTest.NativeSteer"
+          },
+          "debug": {
+            "$ref": "#/components/schemas/SessionNativeTest.Debug"
+          }
+        },
+        "required": ["nativeSteer", "debug"],
+        "additionalProperties": false
+      },
+      "SessionNativeTest.Status": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "serverRun": {
+            "type": "string"
+          },
+          "requested": {
+            "$ref": "#/components/schemas/SessionNativeTest.Settings"
+          },
+          "effective": {
+            "$ref": "#/components/schemas/SessionNativeTest.Settings"
+          },
+          "pending": {
+            "type": "boolean"
+          },
+          "supported": {
+            "type": "boolean"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SessionNativeTest.Reason"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/SessionNativeTest.Execution"
+          },
+          "unresolvedFence": {
+            "type": "boolean"
+          },
+          "diagnostics": {
+            "type": "object",
+            "properties": {
+              "records": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SessionNativeTest.Record"
+                }
+              },
+              "dropped": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "coalesced": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "progress": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["records", "dropped", "coalesced", "progress"],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "sessionID",
+          "serverRun",
+          "requested",
+          "effective",
+          "pending",
+          "supported",
+          "reason",
+          "unresolvedFence",
+          "diagnostics"
+        ],
+        "additionalProperties": false
+      },
+      "SessionNativeTestLaneOccupiedErrorEncoded": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["SessionNativeTestLaneOccupiedError"]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "SessionNativeTestUnsupportedErrorEncoded": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["SessionNativeTestUnsupportedError"]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SessionNativeTest.Reason"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "reason", "message"],
+        "additionalProperties": false
+      },
       "SessionNotFoundErrorEncoded": {
         "type": "object",
         "properties": {
@@ -24475,6 +25753,89 @@
             "additionalProperties": false
           }
         ]
+      },
+      "SessionTask.Background": {
+        "type": "object",
+        "properties": {
+          "sessionID": {
+            "$ref": "#/components/schemas/Session.ID"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["running", "completed", "error", "cancelled"]
+          }
+        },
+        "required": ["sessionID", "agent", "description", "status"],
+        "additionalProperties": false
+      },
+      "SessionTask.ResumeResult": {
+        "type": "object",
+        "properties": {
+          "resumed": {
+            "type": "boolean",
+            "description": "Whether a pause was released."
+          }
+        },
+        "required": ["resumed"],
+        "additionalProperties": false
+      },
+      "SessionTask.Status": {
+        "type": "object",
+        "properties": {
+          "paused": {
+            "type": "boolean",
+            "description": "Automatic subagent completion delivery is paused; completions are retained in the inbox."
+          },
+          "active": {
+            "type": "boolean",
+            "description": "The Session has an execution owned by this process."
+          },
+          "background": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionTask.Background"
+            },
+            "description": "Process-local subagent jobs owned by this Session."
+          }
+        },
+        "required": ["paused", "active", "background"],
+        "additionalProperties": false
+      },
+      "SessionTask.StopAllResult": {
+        "type": "object",
+        "properties": {
+          "interrupted": {
+            "type": "boolean"
+          },
+          "cancelled": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Session.ID"
+            },
+            "description": "Child Sessions whose jobs were cancelled and suppressed."
+          }
+        },
+        "required": ["interrupted", "cancelled"],
+        "additionalProperties": false
+      },
+      "SessionTask.StopResponseResult": {
+        "type": "object",
+        "properties": {
+          "interrupted": {
+            "type": "boolean"
+          },
+          "paused": {
+            "type": "boolean"
+          }
+        },
+        "required": ["interrupted", "paused"],
+        "additionalProperties": false
       },
       "SessionTransfer.Data": {
         "type": "object",

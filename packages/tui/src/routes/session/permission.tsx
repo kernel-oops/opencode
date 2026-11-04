@@ -1,5 +1,5 @@
 import { createStore } from "solid-js/store"
-import { createMemo, For, Match, Show, Switch } from "solid-js"
+import { createEffect, createMemo, For, Match, on, Show, Switch } from "solid-js"
 import { Portal, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import type { TextareaRenderable } from "@opentui/core"
 import { useTheme, useThemes } from "../../context/theme"
@@ -21,6 +21,7 @@ import { usePathFormatter } from "../../context/path-format"
 import { SimulationSemantics } from "../../simulation/semantics"
 import { PatchDiff } from "../../component/patch-diff"
 import { useToast } from "../../ui/toast"
+import { ReviewApproval } from "@opencode/util/bound/review-approval"
 
 type PermissionStage = "permission" | "reject"
 
@@ -146,7 +147,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   const theme = useTheme()
 
   function reply(value: PermissionReply, message?: string) {
-    void data.session.permission
+    return data.session.permission
       .reply({ sessionID: props.request.sessionID, requestID: props.request.id, decision: value, message })
       .catch((error: unknown) => toast.error(error))
   }
@@ -164,6 +165,9 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
             setStore("stage", "permission")
           }}
         />
+      </Match>
+      <Match when={store.stage === "permission" && props.request.review}>
+        <ManualReviewPrompt request={props.request} onReply={reply} />
       </Match>
       <Match when={store.stage === "permission"}>
         {(() => {
@@ -293,6 +297,146 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
 export function permissionSemanticLabel(action: string, title?: string) {
   return `Permission required: ${title ?? action}`
+}
+
+// Keyboard stops in Tab order. Focus starts on "reject" so a stray Enter can never approve.
+const REVIEW_FOCUS = ["reject", "approve", "input"] as const
+
+function ManualReviewPrompt(props: { request: PermissionRequest; onReply: (value: PermissionReply) => Promise<void> }) {
+  const enabled = useInteractivity()
+  const theme = useTheme()
+  const toast = useToast()
+  const [state, setState] = createStore({
+    responding: false,
+    focus: "reject" as (typeof REVIEW_FOCUS)[number],
+  })
+  let input: TextareaRenderable | undefined
+  const respond = (value: PermissionReply) => {
+    setState("responding", true)
+    void props.onReply(value).finally(() => setState("responding", false))
+  }
+  const approve = (typed: boolean) => {
+    if (!enabled() || state.responding) return
+    if (typed && ReviewApproval.requestID(input?.plainText ?? "") !== props.request.id) {
+      toast.show({ message: "Enter the exact approval phrase for this pending request", variant: "error" })
+      return
+    }
+    respond("review_once")
+  }
+  const reject = () => {
+    if (!enabled() || state.responding) return
+    respond("reject")
+  }
+  const cycle = (step: number) =>
+    setState(
+      "focus",
+      REVIEW_FOCUS[(REVIEW_FOCUS.indexOf(state.focus) + step + REVIEW_FOCUS.length) % REVIEW_FOCUS.length],
+    )
+  // A different pending request must never inherit a selected Approve or a typed phrase.
+  createEffect(
+    on(
+      () => props.request.id,
+      () => {
+        setState("focus", "reject")
+        input?.setText("")
+      },
+      { defer: true },
+    ),
+  )
+  Keymap.createLayer(() => ({
+    mode: "base",
+    commands: [
+      { bind: "tab", title: "Next review control", group: "Permission", run: () => cycle(1) },
+      { bind: "shift+tab", title: "Previous review control", group: "Permission", run: () => cycle(-1) },
+      {
+        bind: "return",
+        title: state.focus === "input" ? "Approve this review ID once" : "Confirm selected review action",
+        group: "Permission",
+        run: () => {
+          if (state.focus === "input") return approve(true)
+          if (state.focus === "approve") return approve(false)
+          reject()
+        },
+      },
+      { bind: "escape", title: "Reject permission", group: "Permission", run: reject },
+      // Arrow keys belong to the phrase field's caret while it has focus.
+      ...(state.focus === "input"
+        ? []
+        : [
+            {
+              bind: "left,right,up,down,h,l",
+              title: "Switch review action",
+              group: "Permission",
+              run: () => setState("focus", state.focus === "approve" ? "reject" : "approve"),
+            },
+          ]),
+    ],
+  }))
+  const action = (option: "reject" | "approve", label: string, semantic: string, run: () => void) => (
+    <box
+      ref={SimulationSemantics.bind(() => ({
+        instance: props.request.id,
+        role: "button",
+        label: semantic,
+        focused: state.focus === option,
+        selected: state.focus === option,
+        disabled: !enabled() || state.responding,
+      }))}
+      paddingLeft={1}
+      paddingRight={1}
+      flexShrink={0}
+      backgroundColor={
+        state.focus === option ? theme.background.action.primary.focused : theme.background.action.primary.base
+      }
+      onMouseUp={run}
+    >
+      <text fg={state.focus === option ? theme.text.action.primary.focused : theme.text.action.primary.base}>
+        {label}
+      </text>
+    </box>
+  )
+  return (
+    <box flexDirection="column" gap={1} padding={1} backgroundColor={theme.background.raised.base}>
+      <text fg={theme.text.base}>{`${props.request.id} · session ${props.request.sessionID} · tool ${props.request.action}`}</text>
+      <text fg={theme.text.muted}>{props.request.review?.reason}</text>
+      <scrollbox height={8}>
+        <text fg={theme.text.base}>
+          {ReviewApproval.display({ resources: props.request.resources, action: props.request.metadata?.action })}
+        </text>
+      </scrollbox>
+      <box flexDirection="row" gap={1} onMouseDown={() => setState("focus", "input")}>
+        <text fg={state.focus === "input" ? theme.text.base : theme.text.muted} flexShrink={0}>
+          {state.focus === "input" ? "›" : " "}
+        </text>
+        <textarea
+          ref={(value: TextareaRenderable) => {
+            input = value
+            SimulationSemantics.bind(() => ({
+              instance: props.request.id,
+              role: "textbox",
+              label: "Approval phrase",
+              focused: value.focused,
+              disabled: !enabled() || state.responding,
+            }))(value)
+          }}
+          height={1}
+          flexGrow={1}
+          focused={enabled() && !state.responding && state.focus === "input"}
+          placeholder={`I approve ${props.request.id}`}
+        />
+      </box>
+      <box flexDirection="row" gap={1} flexWrap="wrap">
+        {action("reject", "Don't approve", `Don't approve ${props.request.id}`, reject)}
+        {action("approve", "Approve once", `Approve ${props.request.id} once`, () => approve(false))}
+      </box>
+      <text fg={theme.text.muted}>
+        {state.focus === "input"
+          ? "type the phrase · enter approve · tab next · esc reject"
+          : "⇆ select · enter confirm · tab next · esc reject"}
+      </text>
+      <text fg={theme.text.muted}>Scroll the action above to inspect it in full</text>
+    </box>
+  )
 }
 
 function RejectPrompt(props: {

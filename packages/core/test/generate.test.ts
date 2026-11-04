@@ -1,6 +1,10 @@
 import { describe, expect } from "bun:test"
 import {
   AIError,
+  InvalidProviderOutputError,
+  LLMResponse,
+  LLMRequest,
+  Usage,
   AuthenticationError,
   HttpContext,
   InvalidRequestError,
@@ -12,7 +16,7 @@ import {
   TransportError,
 } from "@opencode/ai/effect"
 import { RequestExecutor } from "@opencode/ai/route"
-import { OpenAIChat } from "@opencode/ai/protocols"
+import { AnthropicMessages, OpenAIChat, OpenAIResponses } from "@opencode/ai/protocols"
 import { TestLLM } from "@opencode/ai/testing"
 import { AISDK } from "@opencode/core/aisdk"
 import { Credential } from "@opencode/core/credential"
@@ -26,7 +30,7 @@ import { Provider } from "@opencode/core/provider"
 import { Variant } from "@opencode/core/variant"
 import { Money } from "@opencode/schema/money"
 import { Npm } from "@opencode/util/npm"
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Effect, Exit, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { HttpClient, HttpClientResponse } from "effect/http"
 import { testEffect } from "./lib/effect"
@@ -87,6 +91,250 @@ const it = testEffect(Generate.layer.pipe(Layer.provide(Layer.mergeAll(resolver,
 const resolverIt = testEffect(resolver)
 const retryIt = testEffect(
   Generate.layer.pipe(Layer.provideMerge(Layer.mergeAll(resolver, TestLLM.testLayer(), generateDeps))),
+)
+
+const responseSchema = { name: "permission_test_v1", schema: { type: "object", additionalProperties: false } }
+for (const protocol of [OpenAIResponses.route, AnthropicMessages.route, OpenAIChat.route]) {
+  for (const finish of ["stop", "length", "content-filter", "unknown", "tool-calls", "error"] as const) {
+    testEffect(Layer.empty).effect(`native schema ${protocol.id} ${finish}`, () =>
+      Effect.gen(function* () {
+        const model = LanguageModel.make({ id: "api-model", provider: "alias", route: protocol })
+        const requests: LLMRequest[] = []
+        const base = LLMResponse.fromEvents(TestLLM.text('{"outcome":"allow"}', "schema"))!
+        const fake = Layer.mock(LLMClient.Service, {
+          generate: (request) =>
+            Effect.sync(() => {
+              requests.push(request)
+              return new LLMResponse({ ...base, finishReason: { normalized: finish } })
+            }),
+        })
+        const resolution = Layer.mock(ModelResolver.Service, {
+          resolve: () =>
+            Effect.succeed({
+              model,
+              ref: reference,
+              capabilities: selected.capabilities,
+              cost: selected.cost,
+              limit: selected.limit,
+            }),
+        })
+        const exit = yield* Effect.gen(function* () {
+          const generate = yield* Generate.Service
+          return yield* generate.result({ prompt: "Unchanged prompt", responseSchema })
+        }).pipe(Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(fake, resolution, generateDeps)))), Effect.exit)
+        if (protocol === OpenAIChat.route) {
+          expect(Exit.isFailure(exit)).toBe(true)
+          expect(requests).toHaveLength(0)
+          return
+        }
+        expect(requests).toHaveLength(1)
+        const request = requests[0]!
+        expect(request.model).toBe(model)
+        expect(request.http?.headers?.["x-opencode-session"]).toStartWith("ses_")
+        expect(request.http?.body).toEqual(
+          protocol === OpenAIResponses.route
+            ? { text: { format: { type: "json_schema", ...responseSchema, strict: true } } }
+            : { output_config: { format: { type: "json_schema", schema: responseSchema.schema } } },
+        )
+        expect(Exit.isSuccess(exit)).toBe(finish === "stop")
+        if (Exit.isSuccess(exit)) expect(exit.value.responseSchemaName).toBe(responseSchema.name)
+        expect(model.route).toBe(protocol)
+      }),
+    )
+  }
+}
+
+// Only injected services are used: no credentials, database or provider calls.
+for (const usage of [
+  undefined,
+  new Usage({ cacheReadInputTokens: 7 }),
+  new Usage({ inputTokens: 0, outputTokens: 0, reasoningTokens: 0 }),
+  new Usage({
+    contextTokens: -1,
+    inputTokens: 1.5,
+    outputTokens: NaN,
+    totalTokens: Infinity,
+    nonCachedInputTokens: -Infinity,
+    cacheReadInputTokens: 0,
+  }),
+  new Usage({ inputTokens: -1, outputTokens: Infinity }),
+  new Usage({
+    inputTokens: 0,
+    providerMetadata: {
+      cohere: { tokens: { input_tokens: 0, output_tokens: null }, billed_units: { input_tokens: 2 }, cached_tokens: 0 },
+      google: {
+        total_input_tokens: 0,
+        total_cached_tokens: null,
+        total_output_tokens: 3,
+        total_thought_tokens: 0,
+        total_tokens: 3,
+        raw_prompt_token: null,
+      },
+      mistral: { num_cached_tokens: 0, prompt_token_details: { cached_tokens: null }, prompt_tokens_details: null },
+      openai: {
+        cache_write_tokens: 0,
+        prompt_cache_hit_tokens: null,
+        cache_created_input_tokens: 2,
+        input_tokens_details: { cache_write_tokens: 0 },
+      },
+    },
+  }),
+  new Usage({ providerMetadata: { openai: { prompt_tokens: -1, completion_tokens: 1.5, total_tokens: Infinity } } }),
+  new Usage({
+    inputTokens: 30,
+    outputTokens: 10,
+    reasoningTokens: 4,
+    providerMetadata: {
+      anthropic: {
+        input_tokens: 100,
+        cache_read_input_tokens: null,
+        service_tier: "standard",
+        output_tokens: 100,
+        cache_creation: { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 3 },
+        iterations: [
+          {
+            type: "message",
+            input_tokens: 5,
+            cache_read_input_tokens: 7,
+            cache_creation_input_tokens: 5,
+            cache_creation: { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 3 },
+            output_tokens: 10,
+            output_tokens_details: { thinking_tokens: 4 },
+          },
+        ],
+        apiKey: "secret",
+        signature: "secret",
+        reasoning: "secret",
+        response: { authorization: "secret" },
+      },
+    },
+  }),
+]) {
+  testEffect(Layer.empty).effect(`structured generation preserves actual usage ${JSON.stringify(usage)}`, () =>
+    Effect.gen(function* () {
+      const calls: number[] = []
+      const response = LLMResponse.fromEvents(TestLLM.text("OK", "receipt"))!
+      const fake = Layer.mock(LLMClient.Service, {
+        generate: () =>
+          Effect.sync(() => {
+            calls.push(1)
+            return new LLMResponse({ ...response, usage })
+          }),
+      })
+      const model = Layer.mock(ModelResolver.Service, {
+        resolve: () =>
+          Effect.succeed({
+            model: runtime,
+            ref: Ref.parse("test-provider/configured#variant"),
+            capabilities: selected.capabilities,
+            cost: selected.cost,
+            limit: selected.limit,
+          }),
+      })
+      const result = yield* Effect.gen(function* () {
+        const generate = yield* Generate.Service
+        return yield* generate.result({ prompt: "receipt" })
+      }).pipe(Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(fake, model, generateDeps)))))
+      expect(calls).toHaveLength(1)
+      expect(result.text).toBe("OK")
+      expect(result.model).toEqual(Ref.parse("test-provider/configured#variant"))
+      if (!usage) {
+        expect(Object.hasOwn(result, "usage")).toBe(false)
+        return
+      }
+      const { providerMetadata, ...counts } = usage
+      const valid = Object.fromEntries(
+        Object.entries(counts).filter(
+          ([, value]) => typeof value === "number" && Number.isInteger(value) && value >= 0,
+        ),
+      )
+      if (!providerMetadata) {
+        expect(result.usage).toEqual(Object.keys(valid).length ? valid : undefined)
+        return
+      }
+      expect(result.usage).toMatchObject(valid)
+      if (!providerMetadata.anthropic) {
+        const expected =
+          providerMetadata.openai?.total_tokens === Infinity
+            ? { openai: { prompt_tokens: -1, completion_tokens: 1.5 } }
+            : providerMetadata
+        expect(result.usage?.providerMetadata).toEqual(
+          Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Json))(expected),
+        )
+        return
+      }
+      const { apiKey, signature, reasoning, response: rawResponse, ...raw } = providerMetadata.anthropic!
+      expect(result.usage?.providerMetadata).toEqual(
+        Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Json))({ anthropic: raw }),
+      )
+      expect(JSON.stringify(result)).not.toContain("secret")
+      expect(result.usage?.inputTokens).toBe(30)
+      expect(result.usage?.outputTokens).toBe(10)
+      expect(result.usage?.reasoningTokens).toBe(4)
+    }),
+  )
+}
+
+testEffect(Layer.empty).effect("generation interruption propagates without retry or fallback", () =>
+  Effect.gen(function* () {
+    const calls: number[] = []
+    const fake = Layer.mock(LLMClient.Service, {
+      generate: () => Effect.sync(() => calls.push(1)).pipe(Effect.andThen(Effect.interrupt)),
+    })
+    const model = Layer.mock(ModelResolver.Service, {
+      resolve: () =>
+        Effect.succeed({
+          model: runtime,
+          ref: Ref.parse("test-provider/configured"),
+          capabilities: selected.capabilities,
+          cost: selected.cost,
+          limit: selected.limit,
+        }),
+    })
+    const exit = yield* Effect.gen(function* () {
+      const generate = yield* Generate.Service
+      return yield* generate.result({ prompt: "receipt" })
+    }).pipe(Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(fake, model, generateDeps)))), Effect.exit)
+    expect(Exit.isFailure(exit)).toBe(true)
+    expect(calls).toHaveLength(1)
+  }),
+)
+
+testEffect(Layer.empty).effect("truncated generation retains its error mapping without retry or a receipt", () =>
+  Effect.gen(function* () {
+    const calls: number[] = []
+    const fake = Layer.mock(LLMClient.Service, {
+      generate: () =>
+        Effect.sync(() => calls.push(1)).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new AIError({
+                reason: new InvalidProviderOutputError({
+                  message: "Incomplete stream",
+                  classification: "incomplete-stream",
+                }),
+              }),
+            ),
+          ),
+        ),
+    })
+    const model = Layer.mock(ModelResolver.Service, {
+      resolve: () =>
+        Effect.succeed({
+          model: runtime,
+          ref: Ref.parse("test-provider/configured"),
+          capabilities: selected.capabilities,
+          cost: selected.cost,
+          limit: selected.limit,
+        }),
+    })
+    const result = yield* Effect.gen(function* () {
+      const generate = yield* Generate.Service
+      return yield* generate.result({ prompt: "receipt" }).pipe(Effect.flip)
+    }).pipe(Effect.provide(Generate.layer.pipe(Layer.provide(Layer.mergeAll(fake, model, generateDeps)))))
+    expect(result).toEqual(new Generate.ProviderRequestError({ message: "Incomplete stream", providerID: "test-provider", reason: "provider" }))
+    expect(calls).toHaveLength(1)
+  }),
 )
 
 it.effect("loads dynamic AI SDK models", () =>

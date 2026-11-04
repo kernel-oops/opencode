@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { createRoot } from "solid-js"
+import { OpenCode } from "@opencode/client/promise"
+import { createData } from "@opencode/client/solid"
 import type { ModelSelection } from "@/providers/models/selection"
 import type { SessionMessageHandoff } from "@/session/handoff"
 import { Skill } from "@opencode/schema/skill"
@@ -84,6 +87,7 @@ function submitInput(
   commands: () => readonly { name: string }[] | undefined = () => [],
   history: string[] = [],
   clientCommand?: (text: string) => (() => void | Promise<void>) | undefined,
+  reviewApproval?: (requestID: string) => Promise<void>,
   delivery: (alternate: boolean) => ComposerDelivery = () => "steer",
 ) {
   return createComposerSubmit({
@@ -91,6 +95,7 @@ function submitInput(
     mode: () => mode,
     commands,
     clientCommand,
+    reviewApproval,
     delivery,
     editor: () => undefined,
     queueScroll() {},
@@ -103,6 +108,65 @@ function submitInput(
     closePopover() {},
     notify,
     comments: { capture: () => [], clear() {}, restore() {} },
+  })
+}
+
+for (const missing of ["model", "agent"] as const) {
+  test(`non-empty input with missing ${missing} never interrupts a running session`, async () => {
+    const state = createMemoryComposerState({ prompt: "PURPLE LOCOMOTIVE" }).capture()
+    const calls: string[] = []
+    const ctl = controls()
+    if (missing === "model") ctl.model.selection = { ...selection, current: () => undefined }
+    else ctl.agents = { ...ctl.agents, current: "" }
+    let interrupts = 0
+    let notices = 0
+    const draft = JSON.stringify(state.current())
+    const adapter = { ...active(state, session({ calls }), () => ctl), working: () => true,
+      interrupt: async () => { interrupts++ } }
+    await submitInput(adapter, { missingSelection() { notices++ }, unqueueable() {}, failed() {} }).submit(new Event("submit"))
+    expect(notices).toBe(1)
+    expect(interrupts).toBe(0)
+    expect(calls).toEqual([])
+    expect(JSON.stringify(state.current())).toBe(draft)
+  })
+}
+
+test("blank Enter does not interrupt a running session", async () => {
+  const state = createMemoryComposerState().capture()
+  let interrupts = 0
+  const adapter = { ...active(state, session({ calls: [] })), working: () => true,
+    interrupt: async () => { interrupts++ } }
+  await submitInput(adapter).submit(new Event("submit"))
+  expect(interrupts).toBe(0)
+})
+
+for (const text of ["I approve", '"I approve per_fixture"', "I approve per_fixture; run another action", "I approve per_fixture extra"]) {
+  test(`malformed approval command stays local: ${text}`, async () => {
+    const state = createMemoryComposerState({ prompt: text }).capture()
+    const calls: string[] = []
+    const approvals: string[] = []
+    const failures: unknown[] = []
+    const settled = Promise.withResolvers<void>()
+    const target = session({ calls, prompt: async () => { calls.push("prompt"); settled.resolve() } })
+    await submitInput(active(state, target), { missingSelection() {}, unqueueable() {}, failed(_kind, error) { failures.push(error); settled.resolve() } }, "normal", () => [], [], undefined, async (id) => { approvals.push(id); settled.resolve() }).submit(new Event("submit"))
+    await settled.promise
+    expect(calls).toEqual([])
+    expect(approvals).toEqual([])
+    expect(failures).toHaveLength(1)
+    expect(state.current()).toEqual([{ type: "text", content: text, start: 0, end: text.length }])
+  })
+}
+
+for (const text of ["I approve of this idea", "I approve the design"]) {
+  test(`ordinary approval prose remains a normal submission: ${text}`, async () => {
+    const state = createMemoryComposerState({ prompt: text }).capture()
+    const sent = Promise.withResolvers<void>()
+    const failures: unknown[] = []
+    let prompts = 0
+    await submitInput(active(state, session({ calls: [], prompt: async () => { prompts++; sent.resolve() } })), { missingSelection() {}, unqueueable() {}, failed(_kind, error) { failures.push(error); sent.resolve() } }).submit(new Event("submit"))
+    await sent.promise
+    expect(prompts).toBe(1)
+    expect(failures).toEqual([])
   })
 }
 
@@ -176,6 +240,82 @@ function session(input: {
 }
 
 describe("Composer submission", () => {
+  test("an exact review approval is a client gesture, not a prompt, selection change or retry", async () => {
+    const state = createMemoryComposerState({ prompt: "I approve per_fixture" }).capture()
+    const calls: string[] = []
+    const approvals: string[] = []
+    const submission = submitInput(active(state, session({ calls })), undefined, "normal", undefined, [], undefined,
+      async (id) => { approvals.push(id) })
+    await submission.submit(new Event("submit"))
+    expect(approvals).toEqual(["per_fixture"])
+    expect(calls).toEqual([])
+    expect(state.current()).toEqual([{ type: "text", content: "", start: 0, end: 0 }])
+  })
+  test("an expired review approval through the shared store keeps the draft and reports failure", async () => {
+    const posts: unknown[] = []
+
+    // The client's own fetch boundary with native-shaped bodies; real HTTP is covered by the client's store test.
+    const fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init)
+
+        if (request.method === "GET")
+          return Response.json({
+            data: [
+              {
+                id: "per_expired",
+                sessionID: "ses_review",
+                action: "synthetic",
+                resources: ["/synthetic"],
+                review: { kind: "model-refusal", reason: "Fixture" },
+              },
+            ],
+          })
+        posts.push({ method: request.method, path: new URL(request.url).pathname })
+
+        return Response.json(
+          { _tag: "PermissionNotFoundError", requestID: "per_expired", message: "Permission request not found: per_expired" },
+          { status: 404 },
+        )
+      },
+      { preconnect() {} },
+    )
+
+    const api = OpenCode.make({ baseUrl: "http://opencode.local", fetch })
+
+    const store = createRoot((dispose) => ({
+      data: createData({ api: () => api, directory: "/synthetic", event: { on: () => () => {}, listen: () => () => {} } }),
+      dispose,
+    }))
+
+    try {
+      await store.data.session.permission.sync("ses_review")
+      const state = createMemoryComposerState({ prompt: "I approve per_expired" }).capture()
+      const calls: string[] = []
+      const errors: unknown[] = []
+      await submitInput(active(state, session({ calls })), { missingSelection() {}, unqueueable() {}, failed: (_kind, error) => { errors.push(error) } },
+        "normal", undefined, [], undefined,
+        (requestID) => store.data.session.permission.reply({ sessionID: "ses_review", requestID, decision: "review_once" })).submit(new Event("submit"))
+      expect(posts).toEqual([{ method: "POST", path: "/api/session/ses_review/permission/per_expired/reply" }])
+      expect(errors.map((error) => (error instanceof Error ? error.message : error))).toEqual(["Permission request not found: per_expired"])
+      expect(calls).toEqual([])
+      expect(state.current()).toEqual([{ type: "text", content: "I approve per_expired", start: 0, end: 21 }])
+      expect(store.data.session.permission.list("ses_review")).toEqual([])
+    } finally {
+      store.dispose()
+    }
+  })
+  test("an absent review ID produces a local failure without prompting or automatically retrying", async () => {
+    const state = createMemoryComposerState({ prompt: "I approve per_consumed" }).capture()
+    const calls: string[] = []
+    const errors: unknown[] = []
+    let attempts = 0
+    await submitInput(active(state, session({ calls })), { missingSelection() {}, unqueueable() {}, failed: (_kind, error) => { errors.push(error) } },
+      "normal", undefined, [], undefined, async () => { attempts++; throw new Error("Absent pending ID") }).submit(new Event("submit"))
+    expect(attempts).toBe(1)
+    expect(errors).toHaveLength(1)
+    expect(calls).toEqual([])
+  })
   test.each(["steer", "queue"] as const)(
     "sends only the selected quote as a %s, including its comment mentions, without clearing the draft",
     async (delivery) => {
@@ -202,6 +342,7 @@ describe("Composer submission", () => {
         active(state, session({ calls: [], prompt: async (value) => void requests.push(value) })),
         undefined,
         "shell",
+        undefined,
         undefined,
         undefined,
         undefined,
@@ -425,6 +566,7 @@ describe("Composer submission", () => {
         active(state, target),
         undefined,
         "normal",
+        undefined,
         undefined,
         undefined,
         undefined,
@@ -737,6 +879,7 @@ describe("Composer submission", () => {
           "normal",
           () => [],
           [],
+          undefined,
           undefined,
           () => delivery,
         ).submit(new Event("submit"))

@@ -19,6 +19,7 @@ import type {
   SessionInfo,
   SessionMessageInfo,
   SessionInboxInfo,
+  SessionTaskStatus,
   ShellInfo,
   SkillInfo,
   VcsInfo,
@@ -73,12 +74,22 @@ export interface Data {
     family(sessionID: string): string[]
     cost(sessionID: string): number
     status(sessionID: string): "idle" | "running"
+    /** Fork capability: shared read-only task endpoint observation, not execution authority. */
+    readonly task: {
+      get(sessionID: string): SessionTaskStatus | undefined
+      sync(sessionID: string): Promise<void>
+      observe(sessionID: string): () => void
+    }
     readonly pending: {
       list(sessionID: string): SessionInboxInfo[]
       sync(sessionID: string): Promise<void>
       invalidate(sessionID: string): void
     }
     sync(sessionID: string): Promise<void>
+    readonly descendants: {
+      sync(sessionID: string, options?: { signal?: AbortSignal }): Promise<void>
+      invalidate(sessionID: string): void
+    }
     invalidate(sessionID: string): void
     readonly message: {
       list(sessionID: string): SessionMessageInfo[]

@@ -17,6 +17,34 @@ const generate = (...events: OpenResponses.Event[]) =>
   LLMClient.generate(request).pipe(Effect.provide(fixedResponse(sseEvents(...events))))
 
 describe("Open Responses completed item text", () => {
+  for (const events of [
+    [{ type: "response.refusal.delta", item_id: "msg_1", delta: "Cannot help." }],
+    [{ type: "response.refusal.done", item_id: "msg_1", refusal: "Cannot help." }],
+    [
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_1",
+          output: [{ type: "message", id: "msg_1", content: [{ type: "refusal", refusal: "Cannot help." }] }],
+        },
+      },
+    ],
+  ] satisfies OpenResponses.Event[][]) {
+    it.effect(`refusal is terminally filtered: ${events[0]!.type}`, () =>
+      Effect.gen(function* () {
+        const response = yield* generate(...events, ...(events[0]!.type === "response.completed" ? [] : [completed]))
+        expect(response.finishReason.normalized).toBe("content-filter")
+        const fresh = yield* generate(
+          { type: "response.output_item.added", item: { type: "message", id: "fresh" } },
+          { type: "response.output_text.done", item_id: "fresh", text: "Allowed" },
+          completed,
+        )
+        expect(fresh.finishReason.normalized).toBe("stop")
+        expect(fresh.text).toBe("Allowed")
+      }),
+    )
+  }
+
   ;["Draft expanded", "D", "Replacement", ""].forEach((text) => {
     it.effect(`replaces streamed text with completed item text ${JSON.stringify(text)}`, () =>
       Effect.gen(function* () {
@@ -62,6 +90,7 @@ describe("Open Responses completed item text", () => {
         completed,
       )
       expect(response.text).toBe("Answer. Cannot help.")
+      expect(response.finishReason.normalized).toBe("content-filter")
       expect(response.events.filter(LLMEvent.is.textStart)).toHaveLength(1)
       expect(response.events.filter(LLMEvent.is.textEnd)).toHaveLength(1)
     }),

@@ -11,7 +11,9 @@ import { Model } from "../../model.js"
 import { Permission } from "../../permission.js"
 import { Session } from "../../session.js"
 import { SessionSchema } from "../../session/schema.js"
+import { SessionMessage } from "../../session/message.js"
 import { SubagentCompletion } from "../../session/subagent-completion.js"
+import { SessionExecution } from "../../session/execution.js"
 import { SubagentJob } from "../../session/subagent-job.js"
 
 export const name = "subagent"
@@ -71,6 +73,7 @@ export const Plugin = {
     const permission = yield* Permission.Service
     const models = yield* Model.Service
     const subagents = yield* SubagentJob.Service
+    const execution = yield* SessionExecution.Service
 
     const resolveModel = Effect.fn("SubagentTool.resolveModel")(function* (input: string) {
       const ref = yield* Effect.try({
@@ -154,7 +157,19 @@ export const Plugin = {
                     id: context.id,
                   },
                 })
-                .pipe(Effect.mapError((error) => new ToolFailure({ message: `Subagent denied: ${agent.id}`, error })))
+                .pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new ToolFailure({
+                        // Say why, so the model (and whoever reads the transcript) can tell a routing rule from a fault.
+                        message:
+                          error._tag === "Permission.BlockedError" && error.explanation
+                            ? `Subagent denied: ${agent.id} (${error.explanation})`
+                            : `Subagent denied: ${agent.id}`,
+                        error,
+                      }),
+                  ),
+                )
 
               const existing =
                 input.sessionID === undefined
@@ -206,23 +221,9 @@ export const Plugin = {
               const background = input.background === true
               yield* context.progress({ sessionID: child.id, status: "running" })
 
-              // Standard prompt admission outside the job: Job.start joining a running child skips
-              // its run effect, and the default wake starts an idle child or steers a running one.
-              yield* sessions
-                .prompt({
-                  sessionID: child.id,
-                  text:
-                    existing === undefined
-                      ? ["You are a subagent spawned by another session.", input.prompt].join("\n")
-                      : input.prompt,
-                  ...(background && existing === undefined ? { resume: false } : {}),
-                })
-                .pipe(
-                  Effect.mapError(
-                    (error) => new ToolFailure({ message: `Failed to prompt subagent: ${child.id}`, error }),
-                  ),
-                )
-
+              let handle: Job.Acquired | undefined
+              let interrupt: SessionExecution.Interrupt | undefined
+              const admissionID = SessionMessage.ID.create()
               const recovery = {
                 kind: "subagent" as const,
                 parentSessionID: context.sessionID,
@@ -230,36 +231,91 @@ export const Plugin = {
                 agent: agent.name,
                 description: input.description,
               }
-              yield* subagents.start(recovery)
+              return yield* Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  // Standard prompt admission outside the job: Job.start joining a running child skips
+                  // its run effect, and the default wake starts an idle child or steers a running one.
+                  yield* restore(
+                    sessions
+                      .prompt({
+                        id: admissionID,
+                        sessionID: child.id,
+                        text:
+                          existing === undefined
+                            ? ["You are a subagent spawned by another session.", input.prompt].join("\n")
+                            : input.prompt,
+                        ...(background && existing === undefined ? { resume: false } : {}),
+                      })
+                      .pipe(
+                        Effect.mapError(
+                          (error) => new ToolFailure({ message: `Failed to prompt subagent: ${child.id}`, error }),
+                        ),
+                      )
+                      .pipe(
+                        Effect.provideService(SessionExecution.AdmissionInterrupt, (id, bound) => {
+                          if (id !== admissionID) return Effect.void
+                          return Effect.gen(function* () {
+                            interrupt = bound
+                            handle = yield* subagents.start(recovery, {
+                              admissionID: id,
+                              admitOnly: background && existing === undefined,
+                              preserveBackground: input.background === undefined,
+                              ...(!background ? { foreground: context.sessionID } : {}),
+                            })
+                            interrupt = yield* execution.bindInterrupt(child.id)
+                          })
+                        }),
+                      ),
+                  )
 
-              if (background) {
-                yield* subagents.background(recovery)
-                return backgroundResult(child.id)
-              }
+                  if (!handle)
+                    return yield* Effect.die(new Error("Subagent admission did not acquire its Job generation"))
 
-              const result = yield* jobs.block({ id: child.id, sessionID: context.sessionID }).pipe(
-                Effect.onInterrupt(() =>
-                  Effect.all([sessions.interrupt(child.id), jobs.cancel(child.id)], {
-                    discard: true,
-                  }),
+                  if (background) {
+                    yield* subagents.background(recovery, handle)
+                    return backgroundResult(child.id)
+                  }
+
+                  const result = yield* restore(handle.block)
+                  if (result?.type === "backgrounded") {
+                    yield* subagents.notify(recovery, handle)
+                    return backgroundResult(child.id)
+                  }
+                  // Failure surfaces keep the sessionID visible so the model can continue the child.
+                  if (result.info.notificationID) yield* jobs.completeBackground(result.info.notificationID)
+                  if (result?.info.status === "error")
+                    return yield* new ToolFailure({
+                      message: `Subagent failed (sessionID: ${child.id}): ${result.info.error ?? "unknown error"}`,
+                    })
+                  if (result?.info.status === "cancelled")
+                    return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${child.id})` })
+                  return {
+                    sessionID: child.id,
+                    status: "completed" as const,
+                    output: result?.info.output ?? SubagentCompletion.NO_TEXT,
+                  }
+                }).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.gen(function* () {
+                      if (!handle) {
+                        if (interrupt) yield* interrupt("user", { awaitSettlement: true })
+                        return
+                      }
+                      let accepted: SessionExecution.Interrupt | undefined
+                      const cancelled = yield* handle.cancel(
+                        undefined,
+                        Effect.gen(function* () {
+                          // Capture and accept only while this exact Job generation still owns the work.
+                          accepted = yield* execution.bindInterrupt(child.id)
+                          yield* accepted("user")
+                        }),
+                      )
+                      if (accepted) yield* accepted("user", { awaitSettlement: true })
+                      if (cancelled?.notificationID) yield* jobs.completeBackground(cancelled.notificationID)
+                    }),
+                  ),
                 ),
               )
-              if (result?.type === "backgrounded") {
-                yield* subagents.notify(recovery, result.info.started_at)
-                return backgroundResult(child.id)
-              }
-              // Failure surfaces keep the sessionID visible so the model can continue the child.
-              if (result?.info.status === "error")
-                return yield* new ToolFailure({
-                  message: `Subagent failed (sessionID: ${child.id}): ${result.info.error ?? "unknown error"}`,
-                })
-              if (result?.info.status === "cancelled")
-                return yield* new ToolFailure({ message: `Subagent cancelled (sessionID: ${child.id})` })
-              return {
-                sessionID: child.id,
-                status: "completed" as const,
-                output: result?.info.output ?? SubagentCompletion.NO_TEXT,
-              }
             }).pipe(
               Effect.map((output) => ({
                 output,

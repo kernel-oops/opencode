@@ -21,6 +21,8 @@ import { Model } from "../model.js"
 import { Mcp } from "../mcp/index.js"
 import { Session } from "../session.js"
 import { InstructionEntry } from "../session/instruction-entry.js"
+import { SessionReviewEvidence } from "../session/review-evidence.js"
+import { SessionStateCheckpoint } from "../session/state-checkpoint.js"
 import { PersistentPty } from "../persistent-pty.js"
 import { Provider } from "../provider.js"
 import { Reference } from "../reference.js"
@@ -38,6 +40,8 @@ import { Permission } from "../permission.js"
 import { PluginHooks } from "./hooks.js"
 import type { Interface } from "../plugin.js"
 import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Database } from "../database/database.js"
+import { SessionDelegation } from "../session/delegation.js"
 
 const mutable = <T>(value: T) => value as DeepMutable<T>
 type RpcEvent = Event.Payload & {
@@ -49,12 +53,17 @@ const isRpcType = (type: string): type is RpcEvent["type"] => type.startsWith("r
 const isRpcEvent = (event: Event.Payload): event is RpcEvent => isRpcType(event.type)
 const isPublicEvent = (event: Event.Payload): event is EventManifest.ServerEvent | RpcEvent =>
   EventManifest.isServer(event) || isRpcEvent(event)
-/** A lookup during activation waits at most this long, so a plugin cannot wait indefinitely for its own load. */
+
+/**
+ * How long a lookup that misses during a plugin activation waits for it to settle before failing as before. Bounded
+ * so a plugin that looks up a missing agent while it is itself being loaded or unloaded is delayed, not wedged.
+ */
 const ACTIVATION_WAIT = "15 seconds"
 
 export const make = Effect.fn("PluginHost.make")(function* (
   plugin: Pick<Interface, "list"> &
     Partial<Pick<Interface, "awaitActivation">> & {
+      /** True while a plugin activation (a reload) is in progress, when registries may be partly rebuilt. */
       readonly activating?: () => boolean
     },
   pluginID: string = "test",
@@ -83,6 +92,8 @@ export const make = Effect.fn("PluginHost.make")(function* (
   const hooks = yield* PluginHooks.Service
   const sessions = yield* Session.Service
   const instructionEntries = yield* InstructionEntry.Service
+  const db = (yield* Database.Service).db
+  const reviewEvidence = SessionReviewEvidence.sources(db, sessions)
   const persistentPty = yield* PersistentPty.Service
   const locations = yield* LocationServiceMap.Service
   const worktrees = yield* Worktree.Service
@@ -143,6 +154,9 @@ export const make = Effect.fn("PluginHost.make")(function* (
               })),
             )
           : response(agents.get(input.agentID))
+        // A reload unloads every plugin after the first changed one, including the config plugin that registers the
+        // configured agents, and then loads them again. A lookup made meanwhile (a tool call running during the
+        // reload) would miss an agent that exists before and after it, so wait for the activation and look again.
         const settled = plugin.awaitActivation
         const output =
           remote || settled === undefined
@@ -334,7 +348,13 @@ export const make = Effect.fn("PluginHost.make")(function* (
       },
     },
     generate: {
-      text: generateText,
+      text: (input) =>
+        generate.result(input).pipe(
+          Effect.map((result) => ({
+            text: result.text,
+            ...(result.responseSchemaName !== undefined ? { responseSchemaName: result.responseSchemaName } : {}),
+          })),
+        ),
     },
     integration: {
       list: () => response(integration.list()),
@@ -487,7 +507,9 @@ export const make = Effect.fn("PluginHost.make")(function* (
             ),
           ),
       reply: (input) =>
-        permission
+        input.decision === "review_once"
+          ? Effect.fail(new Error("Model-review approval is available only through the native client control route."))
+          : permission
           .get(input.requestID)
           .pipe(
             Effect.flatMap((request) =>
@@ -502,6 +524,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
           Effect.catchTags({
             "Permission.BlockedError": (error) => Effect.fail(new Tool.Error({ message: error.message, error })),
             "Permission.CorrectedError": (error) => Effect.fail(new Tool.Error({ message: error.feedback, error })),
+            "Permission.ReviewStaleError": (error) => Effect.fail(new Tool.Error({ message: error.message, error })),
             "Session.NotFoundError": (error) =>
               Effect.fail(new Tool.Error({ message: `Session not found: ${error.sessionID}`, error })),
           }),
@@ -607,6 +630,15 @@ export const make = Effect.fn("PluginHost.make")(function* (
         ),
     },
     session: {
+      reviewRoot: (input) => SessionDelegation.reviewRoot(db, input.sessionID),
+      reviewEvidence: (input) => SessionReviewEvidence.review(reviewEvidence, input),
+      stateCheckpoint: {
+        snapshot: (input) => SessionStateCheckpoint.snapshot(db, input),
+        read: (input) => SessionStateCheckpoint.read(db, input),
+        update: (input) => SessionStateCheckpoint.update(db, input),
+        compact: (input) => SessionStateCheckpoint.compact(db, sessions.compact, input),
+        maintain: (input) => SessionStateCheckpoint.maintainFor(db, sessions, input),
+      },
       hook: (name, callback, options) => hooks.register("session", name, callback, options),
       list: sessions.list,
       create: (input) =>
@@ -632,7 +664,8 @@ export const make = Effect.fn("PluginHost.make")(function* (
       prompt: sessions.prompt,
       generate: (input) => sessions.generate(input).pipe(Effect.map((text) => ({ text }))),
       command: (input) => sessions.command({ ...input, command: input.name }),
-      compact: sessions.compact,
+      // Public fields only: the internal checkpoint binding is reachable through `stateCheckpoint.compact` alone.
+      compact: (input) => sessions.compact({ sessionID: input.sessionID, id: input.id, delivery: input.delivery }),
       update: Effect.fn(function* (input) {
         yield* sessions.get(input.sessionID)
         if (input.title !== undefined) yield* sessions.rename({ sessionID: input.sessionID, title: input.title })
@@ -640,10 +673,13 @@ export const make = Effect.fn("PluginHost.make")(function* (
           yield* sessions.setMetadata({ sessionID: input.sessionID, metadata: input.metadata })
         if (input.permissions !== undefined)
           yield* sessions.setPermissions({ sessionID: input.sessionID, permissions: input.permissions })
+        if (input.contextBudget !== undefined)
+          yield* sessions.setContextBudget({ sessionID: input.sessionID, contextBudget: input.contextBudget })
       }),
       move: sessions.move,
       synthetic: ((input: Parameters<typeof sessions.synthetic>[0] | (Parameters<typeof sessions.assistantSynthetic>[0] & { role: "assistant" })) =>
         "role" in input && input.role === "assistant" ? sessions.assistantSynthetic(input) : sessions.synthetic(input)) as Plugin.Context["session"]["synthetic"],
+      append: sessions.append,
       interrupt: (input) =>
         sessions
           .interrupt(input.sessionID, { resume: input.resume })
@@ -674,6 +710,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
 })
 
 export const requirements = LayerNode.group([
+  Database.node,
   App.node,
   Agent.node,
   Artifact.node,

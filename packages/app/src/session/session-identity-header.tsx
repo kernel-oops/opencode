@@ -1,3 +1,4 @@
+import { AppExtensions } from "@/extensions/registry"
 import type { SessionInfo } from "@opencode/client/promise"
 import type { MountedSession, SessionScreen } from "@opencode/plugin/gui"
 import { Icon } from "@opencode/ui/icon"
@@ -539,7 +540,7 @@ export function useOpenSessionRoute() {
   }
 }
 
-export function SessionIdentityHeader(props: { sessionID: string; session?: SessionInfo }) {
+export function SessionIdentityHeader(props: { sessionID: string; session?: SessionInfo; children?: JSX.Element }) {
   const server = useServer()
   const tabs = useTabs()
   const language = useLanguage()
@@ -635,19 +636,27 @@ export function SessionIdentityHeader(props: { sessionID: string; session?: Sess
             </>
           }
         >
-          <SessionWorkingIndicator sessionID={props.sessionID} />
-          <Show when={title()}>
-            {(value) => (
-              <h1
-                data-slot={parentID() ? "session-title-child" : undefined}
-                dir="auto"
-                class="w-fit truncate rounded-[6px] px-1 py-1.5 text-[13px] font-[530] leading-4 tracking-[-0.04px] text-v2-text-text-base"
-                classList={{ "max-w-[45%] shrink-0": !!parentID() }}
-              >
-                {value()}
-              </h1>
-            )}
-          </Show>
+              <Show when={parentID() && props.children}>{props.children}</Show>
+              <Show when={!parentID() || !props.children}>
+                <SessionWorkingIndicator sessionID={props.sessionID} />
+              </Show>
+              <Show when={(!parentID() || !props.children) && title()}>
+                {(value) => (
+                  <h1
+                    data-slot={parentID() ? "session-title-child" : undefined}
+                    dir="auto"
+                    class="w-fit truncate rounded-[6px] px-1 py-1 text-[13px] font-[530] leading-4 tracking-[-0.04px] text-v2-text-text-base"
+                    classList={{ "max-w-[45%] shrink-0": !!parentID() }}
+                  >
+                    {value()}
+                  </h1>
+                )}
+              </Show>
+              <Show when={!parentID()}>{props.children}</Show>
+          {/* Items features add to the session header (src/features/*), at its end. */}
+          <For each={AppExtensions.sessionHeaderItems()}>
+            {(item) => item.render({ sessionID: () => props.sessionID })}
+          </For>
         </SessionHeaderLayout>
       </SessionTitleHeader>
     </Show>

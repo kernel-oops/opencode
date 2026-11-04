@@ -316,6 +316,11 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
       appendFooter(event.data.assistantMessageID)
       if (turnTokens()) rebuild()
     }),
+    data.on("session.step.interrupted", (event) => {
+      if (event.data.sessionID !== sessionID()) return
+      appendFooter(event.data.assistantMessageID)
+      if (turnTokens()) rebuild()
+    }),
   ]
   onCleanup(() => subscriptions.forEach((unsubscribe) => unsubscribe()))
 

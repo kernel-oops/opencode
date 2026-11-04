@@ -10,6 +10,20 @@ import type { SessionMessage } from "@opencode/schema/session-message"
 import type { TokenUsage } from "@opencode/schema/token-usage"
 import type { Effect, JsonSchema, Types } from "effect"
 import type { ModelHooks } from "./registration.js"
+import type { ReviewEvidenceRequest, ReviewEvidenceResult } from "../review-evidence.js"
+import type {
+  CheckpointBinding,
+  CompactInput,
+  MaintainInput,
+  MaintainResult,
+  CompactResult,
+  Call,
+  ReadInput,
+  ReadResult,
+  SnapshotResult,
+  UpdateInput,
+  UpdateResult,
+} from "../controller-state.js"
 
 export interface SessionPrompt {
   readonly sessionID: Session.ID
@@ -50,6 +64,11 @@ export interface SessionCompactionResult {
 export interface SessionCompaction extends SessionContext {
   /** Set to use this compaction and skip the model request. */
   result?: SessionCompactionResult
+  /**
+   * Present only for an opted-in controller-state checkpoint. Core accepts nothing but `result.summary` equal to
+   * `checkpoint.rendered`, without native output; anything else blocks the checkpoint rather than summarising.
+   */
+  readonly checkpoint?: CheckpointBinding
 }
 
 export interface SessionGenerate extends SessionContext {}
@@ -212,6 +231,7 @@ export type SessionDomain = Pick<
   | "generate"
   | "command"
   | "compact"
+  | "append"
   | "interrupt"
   | "update"
   | "move"
@@ -227,5 +247,23 @@ export type SessionDomain = Pick<
       final?: boolean
       metadata?: Record<string, unknown>
     }) => Effect.Effect<{ id: SessionMessage.ID }, Effect.Error<ReturnType<SessionApi<unknown>["synthetic"]>>>)
-    readonly hook: ModelHooks<SessionHooks>
+  /** Core lineage proof for permission evidence; not an HTTP endpoint or an approval capability. */
+  readonly reviewRoot: (input: {
+    sessionID: Session.ID
+  }) => Effect.Effect<{ complete: boolean; sessionID?: Session.ID }>
+  readonly hook: ModelHooks<SessionHooks>
+  /** Bounded read-only history evidence for the fixed permission subject; not an approval capability. */
+  readonly reviewEvidence: (input: {
+    sessionID: Session.ID
+    request: ReviewEvidenceRequest
+  }) => Effect.Effect<ReviewEvidenceResult>
+  /** Self-bound controller-state checkpoint for a live tool call; reviewed evidence, never permission. */
+  readonly stateCheckpoint: {
+    readonly snapshot: (input: Call) => Effect.Effect<SnapshotResult>
+    readonly read: (input: ReadInput) => Effect.Effect<ReadResult>
+    readonly update: (input: UpdateInput) => Effect.Effect<UpdateResult>
+    readonly compact: (input: CompactInput) => Effect.Effect<CompactResult>
+    /** Operator maintenance while the budget blocks the model, bound to an exact native shell intent. */
+    readonly maintain: (input: MaintainInput) => Effect.Effect<MaintainResult>
   }
+}

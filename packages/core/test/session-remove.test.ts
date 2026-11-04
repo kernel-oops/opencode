@@ -29,8 +29,11 @@ const transport = Layer.effect(
     transportScopes.add(scope)
     yield* Effect.addFinalizer(() => Effect.sync(() => transportScopes.delete(scope)))
     return SessionModelTransport.Service.of({
+      steer: () => Effect.succeed(false),
+      hasPendingInput: () => false,
       bind: () => ({ execute: () => Effect.die("Unexpected WebSocket execution") }),
       close: (sessionID) => Effect.sync(() => closed.push(sessionID)),
+      retire: () => Effect.void,
       closeAll: Effect.void,
     })
   }),

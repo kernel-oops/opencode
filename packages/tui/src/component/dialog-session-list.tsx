@@ -23,6 +23,7 @@ import { useConfig, useNewDesigns } from "../config"
 import { withTimestampedFallback } from "@opencode/util/session-title-fallback"
 import { projectName } from "../util/project"
 import { useLocation } from "../context/location"
+import { sessionActive } from "../util/session"
 
 export function DialogSessionList() {
   const dialog = useDialog()
@@ -174,9 +175,7 @@ export function DialogSessionList() {
         gutter: sessionStatusGutter(
           theme,
           attention,
-          !attention &&
-            (data.session.status(session.id) === "running" ||
-              data.session.family(session.id).some((id) => data.session.status(id) === "running")),
+          !attention && sessionActive(data, session.id),
           slot === undefined ? undefined : () => <text fg={theme.hue.accent[200]}>{slot}</text>,
         ),
       }

@@ -12,6 +12,7 @@ import {
   ProviderConfigurationError,
 } from "@opencode/ai/effect"
 import { Auth, mergeHttpOptions } from "@opencode/ai/route"
+import { OpenAIResponses } from "@opencode/ai/protocols"
 import { Context, Effect, Layer, Schema, Struct } from "effect"
 import { AISDK } from "./aisdk.js"
 import { Credential } from "./credential.js"
@@ -20,6 +21,8 @@ import { Capabilities, ID, Info, Model, Ref, VariantID } from "./model.js"
 import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
+import { isDeepStrictEqual } from "node:util"
+import type { SessionNativeTest } from "@opencode/schema/session-native-test"
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
   "SessionRunnerModel.VariantUnavailableError",
@@ -135,6 +138,13 @@ export interface Resolved {
   readonly transport?: Provider.Transport
   /** Milliseconds without streamed data before a WebSocket exchange fails; `false` disables the limit. */
   readonly chunkTimeout?: number | false
+  /** Outcome of an exact-session native test request; present only when one was requested. */
+  readonly nativeTest?: SessionNativeTest.Reason
+}
+
+/** Internal per-execution policy for one session's primary requests; never a provider or model setting. */
+export interface Options {
+  readonly nativeSteer?: "response.steer"
 }
 
 export type MediaError =
@@ -146,12 +156,16 @@ export type MediaError =
   | Integration.AuthorizationError
 
 export interface Interface {
-  readonly resolve: (requested?: Ref) => Effect.Effect<Resolved | undefined, Error>
-  readonly resolveModel: (model: Info, variant?: VariantID) => Effect.Effect<Resolved, Error>
-  /** An enabled image model by ref, or undefined when no image model has that ref. */
   readonly resolveImage: (ref: Ref) => Effect.Effect<ImageModel | undefined, MediaError>
-  /** An enabled decision model by ref, or undefined when no decision model has that ref. */
   readonly resolveDecision: (ref: Ref) => Effect.Effect<DecisionModel | undefined, MediaError>
+  readonly resolve: (requested?: Ref, options?: Options) => Effect.Effect<Resolved | undefined, Error>
+  readonly resolveModel: (model: Info, variant?: VariantID, options?: Options) => Effect.Effect<Resolved, Error>
+  /**
+   * Offline preflight for a native test request: the same explicit/default selection as execution, the
+   * provider allowance and the constructed route's protocol, without credentials, provider calls or
+   * package installation. Execution revalidates all of it.
+   */
+  readonly nativeSteerSupport: (requested?: Ref) => Effect.Effect<Exclude<SessionNativeTest.Reason, "not-requested" | "active">>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ModelResolver") {}
@@ -186,6 +200,46 @@ export const withVariant = (
       : model,
   )
 }
+
+/** Compare configured definitions, without loading providers or resolving credentials. */
+export const effortTransition = Effect.fn("ModelResolver.effortTransition")(function* (
+  model: Info,
+  previous: VariantID | undefined,
+  requested: VariantID | undefined,
+) {
+  const before = yield* withVariant(model, previous)
+  const after = yield* withVariant(model, requested)
+  const paths = [
+    ["settings", "reasoningEffort"],
+    ["settings", "effort"],
+    ["settings", "reasoning", "effort"],
+    ["body", "reasoning_effort"],
+    ["body", "reasoning", "effort"],
+  ]
+  const left = structuredClone(before) as Record<string, unknown>
+  const right = structuredClone(after) as Record<string, unknown>
+  for (const path of paths) {
+    const parent = (value: Record<string, unknown>) =>
+      path.slice(0, -1).reduce<Record<string, unknown> | undefined>((current, key) => {
+        const next = current?.[key]
+        return next !== null && typeof next === "object" && !Array.isArray(next)
+          ? (next as Record<string, unknown>)
+          : undefined
+      }, value)
+    const a = parent(left)
+    const b = parent(right)
+    const key = path[path.length - 1]!
+    if (
+      !isDeepStrictEqual(a?.[key], b?.[key]) &&
+      b?.[key] !== undefined &&
+      (typeof b[key] !== "string" || !["none", "minimal", "low", "medium", "high"].includes(b[key]))
+    )
+      return false
+    if (a) delete a[key]
+    if (b) delete b[key]
+  }
+  return isDeepStrictEqual(left, right)
+})
 
 export interface Dependencies {
   readonly loadPackage?: (specifier: string) => Effect.Effect<Provider.ProviderPackage, Provider.LoadError>
@@ -463,7 +517,7 @@ export const layer = Layer.effect(
       }
       return { provider, credential, runtimeInfo }
     })
-    const load = Effect.fn("ModelResolver.resolveModel")(function* (selected: Info, variant?: VariantID) {
+    const load = Effect.fn("ModelResolver.resolveModel")(function* (selected: Info, variant?: VariantID, options?: Options) {
       const { provider, credential, runtimeInfo } = yield* prepare(selected, variant)
       const model = yield* fromCatalogModel(runtimeInfo, credential, dependencies)
       const runtime =
@@ -473,8 +527,19 @@ export const layer = Layer.effect(
         usesAPIKeyAuth(runtimeInfo.package)
           ? LanguageModel.update(model, { route: model.route.with({ auth: Auth.none }) })
           : model
+      // Read the provider-owned contracts, never merged model/credential metadata or request headers.
+      // Neither asserts that any public backend currently supports the contract.
+      // The provider's `nativeSteer` literal is only the operator allowance. It never activates native
+      // steering by itself: only an exact session's execution policy can, and then only on OpenAI Responses.
+      const allowance = provider?.settings?.nativeSteer === "response.steer"
+      const responses = runtime.route.protocol === OpenAIResponses.protocol.id
+      const requested = options?.nativeSteer === "response.steer"
+      const nativeSteer = requested && allowance && responses && /^gpt-6(?:[.-]|$)/.test(runtime.id)
       return {
-        model: runtime,
+        // A fresh route for the selected session only; shared catalog, provider and runtime objects stay unchanged.
+        model: nativeSteer
+            ? LanguageModel.update(runtime, { route: runtime.route.with({ transport: OpenAIResponses.nativeSteerTransport }) })
+            : runtime,
         ref: Ref.make({
           id: selected.id,
           providerID: selected.providerID,
@@ -485,9 +550,13 @@ export const layer = Layer.effect(
         limit: selected.limit,
         compaction: runtimeInfo.settings?.compaction,
         cache: runtimeInfo.settings?.cache,
-        transport: provider?.settings?.transport,
+        // The selected test session may use its WebSocket lane even while the provider default stays HTTP.
+        transport: nativeSteer ? "websocket" : provider?.settings?.transport,
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
-      }
+        ...(requested
+          ? { nativeTest: nativeSteer ? "active" : allowance ? "protocol-unsupported" : "allowance-missing" }
+          : {}),
+      } satisfies Resolved
     })
     const loadMedia = Effect.fnUntraced(function* <Runtime>(
       ref: Ref,
@@ -501,30 +570,54 @@ export const layer = Layer.effect(
       const { credential, runtimeInfo } = yield* prepare(info, ref.variant)
       return yield* fromCatalogMedia(runtimeInfo, is, credential, dependencies)
     })
+    const selectDefault = models
+      .default()
+      .pipe(
+        Effect.flatMap((model) =>
+          model && hasPackage(model)
+            ? Effect.succeed(model)
+            : Effect.map(models.available(), (models) =>
+                models.find((model) => hasPackage(model) && Model.supportsText(model)),
+              ),
+        ),
+      )
     return Service.of({
-      resolve: Effect.fn("ModelResolver.resolve")(function* (requested) {
-        const selected = requested
-          ? yield* models.get(requested.providerID, requested.id)
-          : yield* models
-              .default()
-              .pipe(
-                Effect.flatMap((model) =>
-                  model && hasPackage(model)
-                    ? Effect.succeed(model)
-                    : Effect.map(models.available(), (models) =>
-                        models.find((model) => hasPackage(model) && Model.supportsText(model)),
-                      ),
-                ),
-              )
+      resolve: Effect.fn("ModelResolver.resolve")(function* (requested, options) {
+        const selected = requested ? yield* models.get(requested.providerID, requested.id) : yield* selectDefault
         if (!selected) return undefined
-        return yield* load(selected, requested?.variant)
+        return yield* load(selected, requested?.variant, options)
       }),
       resolveModel: load,
-      resolveImage: Effect.fn("ModelResolver.resolveImage")(function* (ref) {
-        return yield* loadMedia(ref, "image", isImageModel)
-      }),
-      resolveDecision: Effect.fn("ModelResolver.resolveDecision")(function* (ref) {
-        return yield* loadMedia(ref, "decision", isDecisionModel)
+      resolveImage: (ref) => loadMedia(ref, "image", isImageModel),
+      resolveDecision: (ref) => loadMedia(ref, "decision", isDecisionModel),
+      nativeSteerSupport: Effect.fn("ModelResolver.nativeSteerSupport")(function* (requested) {
+        // Mirrors SessionRunnerModel: explicit selections come from the available catalog.
+        const selected = requested
+          ? (yield* models.available()).find((model) => model.providerID === requested.providerID && model.id === requested.id)
+          : yield* selectDefault
+        if (!selected) return "model-unavailable" as const
+        const provider = yield* providers.get(selected.providerID)
+        if (provider?.settings?.nativeSteer !== "response.steer") return "allowance-missing" as const
+        if (!/^gpt-6(?:[.-]|$)/.test(selected.modelID)) return "protocol-unsupported" as const
+        // Construct the route only from built-in packages already in the binary: no credentials, no
+        // provider call and no package installation. Anything else cannot be established offline.
+        const route = yield* withVariant(selected, requested?.variant).pipe(
+          Effect.flatMap((variant) =>
+            fromCatalogModel(
+              { ...variant, settings: Provider.mergeOverlay(provider.settings, Provider.modelSettings(variant.settings)) },
+              undefined,
+              {
+                loadPackage: (specifier) =>
+                  specifier.startsWith("@opencode/ai/")
+                    ? Provider.loadPackage(specifier)
+                    : Effect.fail(new Provider.LoadError({ package: specifier, cause: new globalThis.Error("not built in") })),
+              },
+            ),
+          ),
+          Effect.option,
+        )
+        if (route._tag === "None") return "model-unavailable" as const
+        return route.value.route.protocol === OpenAIResponses.protocol.id ? ("allowed" as const) : ("protocol-unsupported" as const)
       }),
     })
   }),

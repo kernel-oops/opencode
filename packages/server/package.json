@@ -37,12 +37,14 @@
     "effect": "catalog:"
   },
   "devDependencies": {
+    "@opencode/ai": "workspace:*",
     "@opencode/pty": "0.4.0",
     "@opencode/client": "workspace:*",
     "@opencode/plugin": "workspace:*",
     "@tsconfig/bun": "catalog:",
     "@types/bun": "catalog:",
     "@typescript/native": "catalog:",
-    "fast-check": "catalog:"
+    "fast-check": "catalog:",
+    "drizzle-orm": "catalog:"
   }
 }

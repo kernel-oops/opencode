@@ -129,6 +129,7 @@ export function createPermissionAutoApprover(input: { sdk: ServerSDK; data: Data
   // A request from a session this client has not loaded needs that session's
   // project before a per-project choice can apply to it.
   function consider(permission: PermissionRequest) {
+    if (permission.review) return
     if (covers(undefined) || input.data.session.get(permission.sessionID)) return approve(permission)
     void input.sdk.api.session
       .get({ sessionID: permission.sessionID })
@@ -141,6 +142,7 @@ export function createPermissionAutoApprover(input: { sdk: ServerSDK; data: Data
     projectID = input.data.session.get(permission.sessionID)?.projectID,
     attempt = 0,
   ) {
+    if (permission.review) return
     // covers() guards the retry timer path: the user may disable the setting
     // between a failed reply and its scheduled retry.
     if (state.disposed || !covers(projectID) || state.responded.has(permission.id)) return

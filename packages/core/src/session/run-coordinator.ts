@@ -5,6 +5,8 @@ import type { Promotable } from "./inbox.js"
 
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E, Reason = never> {
+  /** Bind acceptance and settlement to the current owner, never a later successor. */
+  readonly bindInterrupt: (key: Key) => Effect.Effect<(reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.Effect<boolean>>
   /** Snapshots keys with an execution owned by this coordinator. */
   readonly active: Effect.Effect<ReadonlySet<Key>>
   /** Checks ownership for one key, including cleanup and terminal settlement. */
@@ -19,7 +21,7 @@ export interface Coordinator<Key, E, Reason = never> {
    * finalizers and settled hook on its own time. Returns whether an active execution was
    * interrupted.
    */
-  readonly interrupt: (key: Key, reason?: Reason) => Effect.Effect<boolean>
+  readonly interrupt: (key: Key, reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.Effect<boolean>
   /** Resolves once no execution is active for the key. Returns immediately when already idle and never starts work. */
   readonly awaitIdle: (key: Key) => Effect.Effect<void>
 }
@@ -53,6 +55,8 @@ type Execution<E, Reason> = {
  * ```
  */
 export const make = <Key, E, Reason = never>(options: {
+  /** Durable execution policy may refuse a new busy period without discarding recorded work. */
+  readonly canStart?: (key: Key) => Effect.Effect<boolean>
   readonly drain: (key: Key, force: boolean, scope: Promotable) => Effect.Effect<void, E>
   /** Runs once when a process-local busy period begins, before its first drain. */
   readonly started?: (key: Key) => Effect.Effect<void>
@@ -98,7 +102,7 @@ export const make = <Key, E, Reason = never>(options: {
               execution.owner = undefined
             }).pipe(Effect.andThen(options.settled?.(key, exit, execution.interruptionReason) ?? Effect.void)),
           ),
-          Effect.onExit((exit) => Effect.sync(() => settle(key, execution, exit))),
+          Effect.onExit((exit) => settle(key, execution, exit)),
           Effect.exit,
           Effect.asVoid,
         ),
@@ -108,11 +112,14 @@ export const make = <Key, E, Reason = never>(options: {
 
     // A doorbell that survives the execution loop (rung after the loop decided to end, or
     // during failure or interruption cleanup) starts a fresh execution for the remaining work.
-    const settle = (key: Key, execution: Execution<E, Reason>, exit: Exit.Exit<void, E>) => {
-      if (execution.pendingWake) start(key, false, execution.pendingWake)
-      else executions.delete(key)
-      Deferred.doneUnsafe(execution.done, exit)
-    }
+    const settle = (key: Key, execution: Execution<E, Reason>, exit: Exit.Exit<void, E>) =>
+      Effect.gen(function* () {
+        const accepted = execution.pendingWake === undefined ? false : yield* (options.canStart?.(key) ?? Effect.succeed(true))
+        // Keep ownership until this durable check finishes; late wakes still coalesce here.
+        if (accepted && execution.pendingWake) start(key, false, execution.pendingWake)
+        else executions.delete(key)
+        Deferred.doneUnsafe(execution.done, exit)
+      })
 
     const isActive = (key: Key) => Effect.sync(() => executions.has(key))
 
@@ -125,18 +132,24 @@ export const make = <Key, E, Reason = never>(options: {
             return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(run(key)))
           return Deferred.await(execution.done)
         }
-        return Deferred.await(start(key, true, "input").done)
+        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(Effect.flatMap((accepted) =>
+          accepted ? Effect.suspend(() => executions.has(key) ? run(key) : Deferred.await(start(key, true, "input").done)) : Effect.void))
       })
 
-    const wake = (key: Key, scope: Promotable = "input") =>
-      Effect.sync(() => {
+    const wake = (key: Key, scope: Promotable = "input"): Effect.Effect<void> =>
+      Effect.suspend(() => {
         const execution = executions.get(key)
         if (execution !== undefined) {
           // Coalesced wakes keep the widest scope: "input" subsumes "steer".
           execution.pendingWake = execution.pendingWake === "input" ? "input" : scope
-          return
+          return Effect.void
         }
-        start(key, false, scope)
+        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(Effect.flatMap((accepted) =>
+          accepted ? Effect.suspend(() => {
+            if (executions.has(key)) return wake(key, scope)
+            start(key, false, scope)
+            return Effect.void
+          }) : Effect.void))
       })
 
     const interrupt = (key: Key, reason?: Reason): Effect.Effect<boolean> =>
@@ -170,5 +183,22 @@ export const make = <Key, E, Reason = never>(options: {
         return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(awaitIdle(key)))
       })
 
-    return { active: Effect.sync(() => new Set(executions.keys())), isActive, run, wake, interrupt, awaitIdle }
+    const bindInterrupt = (key: Key) => Effect.sync(() => {
+      const execution = executions.get(key)
+      return (reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.suspend(() => {
+        if (executions.get(key) !== execution) return Effect.succeed(false)
+        return interrupt(key, reason).pipe(Effect.tap(() =>
+          options?.awaitSettlement && execution ? Deferred.await(execution.done).pipe(Effect.ignoreCause) : Effect.void))
+      })
+    })
+    return {
+      bindInterrupt,
+      active: Effect.sync(() => new Set(executions.keys())),
+      isActive,
+      run,
+      wake,
+      interrupt: (key, reason, options) =>
+        bindInterrupt(key).pipe(Effect.flatMap((bound) => bound(reason, options))),
+      awaitIdle,
+    }
   })

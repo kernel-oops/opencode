@@ -534,7 +534,7 @@ export namespace Timeline {
           .map((entry) => ({ messageID: message.id, messageIndex, partID: entry.id, content: entry.content })),
       )
 
-      const interruptedAt = messages.findIndex((message) => isInterrupted(message.error))
+      const interruptedAt = messages.findIndex((message) => message.interruption !== undefined || isInterrupted(message.error))
       const before = interruptedAt < 0 ? refs : refs.filter((ref) => ref.messageIndex <= interruptedAt)
       const after = interruptedAt < 0 ? [] : refs.filter((ref) => ref.messageIndex > interruptedAt)
 

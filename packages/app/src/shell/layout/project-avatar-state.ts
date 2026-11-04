@@ -3,6 +3,7 @@ import type { SessionInfo } from "@opencode/client/promise"
 import { useGlobal, useServerCtx } from "@/runtime/server/runtime"
 import { sessionPermissionRequest, sessionFormRequest } from "@/session/requests/session-request-tree"
 import { ServerConnection } from "@/runtime/server/registry"
+import { AppExtensions } from "@/extensions/registry"
 import { projectSettingsKey, useSettings } from "@/settings/model"
 
 type ServerData = ReturnType<ReturnType<typeof useGlobal>["ensureServerCtx"]>["data"]
@@ -26,7 +27,7 @@ export function useSessionTabAvatarState(
 
     const project = projectSettingsKey(ctx.sdk.scope, ctx.data.session.get(sessionId())?.projectID)
 
-    return sessionRequests(ctx.data, sessionId(), !!root?.(), settings.permissions.autoApproves(project))
+    return sessionRequests(ctx.data, sessionId(), root?.() ?? false, settings.permissions.autoApproves(project))
   })
 
   const needsAttention = createMemo(() => requests().permission || requests().form)
@@ -41,13 +42,17 @@ export function useSessionTabAvatarState(
     if (!data) return false
 
     if (needsAttention()) return false
+    // Keep both pending inbox work and custom background-provider work visible as busy.
+    const busy = (id: string) =>
+      sessionBusy(data, id) ||
+      AppExtensions.isBusy(id, data)
 
     if (root?.())
       return data.session
         .list()
-        .some((session) => data.session.root(session.id) === sessionId() && sessionBusy(data, session.id))
+        .some((session) => data.session.root(session.id) === sessionId() && busy(session.id))
 
-    return sessionBusy(data, sessionId())
+    return busy(sessionId())
   })
 
   return { unread, loading, attention: needsAttention }
@@ -64,7 +69,7 @@ export function sessionRequests(data: ServerData, sessionId: string, root: boole
     : data.session.list()
 
   return {
-    permission: !autoApprove && !!sessionPermissionRequest(sessions, data.session.permission.list, sessionId),
+    permission: !!sessionPermissionRequest(sessions, data.session.permission.list, sessionId, (request) => !autoApprove || !!request.review),
     form: !!sessionFormRequest(sessions, data.session.form.list, sessionId),
   }
 }

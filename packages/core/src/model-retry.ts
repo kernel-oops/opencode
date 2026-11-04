@@ -66,6 +66,10 @@ export const retry = <A, R>(effect: Effect.Effect<A, AIError, R>) =>
     while (true) {
       const result = yield* Effect.result(effect)
       if (result._tag === "Success") return result.success
+      // A truncated response is an uncertain partial attempt, not a fresh request failure.
+      // Preserve its error without silently regenerating or manufacturing a usage receipt.
+      if (result.failure.reason._tag === "InvalidProviderOutput" && result.failure.reason.classification === "incomplete-stream")
+        return yield* result.failure
       const decision = yield* decide({ cause: result.failure, retry: isRetryable(result.failure) })
       if (!decision?.retry) return yield* result.failure
       yield* Effect.sleep(Duration.millis(decision.delay))

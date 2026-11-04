@@ -41,12 +41,13 @@ const executionLayer = Layer.effect(
   SessionExecution.Service,
   Effect.gen(function* () {
     const control = yield* ExecutionControl
-    const coordinator = yield* SessionRunCoordinator.make<Session.ID, never>({
+    const coordinator = yield* SessionRunCoordinator.make<Session.ID, never, "user" | "inactivity">({
       drain: () => Deferred.succeed(control.started, undefined).pipe(Effect.andThen(Deferred.await(control.release))),
     })
     return SessionExecution.Service.of({
       active: coordinator.active,
       isActive: coordinator.isActive,
+      bindInterrupt: coordinator.bindInterrupt,
       resume: coordinator.run,
       interrupt: (sessionID) => coordinator.interrupt(sessionID),
       awaitIdle: coordinator.awaitIdle,

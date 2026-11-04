@@ -26,9 +26,10 @@ const textContract = {
   payload: Schema.Struct({
     prompt: Schema.String,
     model: Model.Ref.pipe(Schema.optional),
+    responseSchema: Generate.ResponseSchema.pipe(Schema.optional),
   }),
   success: Schema.Struct({
-    data: Schema.Struct({ text: Schema.String }),
+    data: Generate.Result,
   }).annotate({ identifier: "GenerateTextResponse" }),
   error: errors,
 }

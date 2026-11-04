@@ -62,6 +62,8 @@ const session = (
   tokens_cache_write: 99,
   revert: null,
   permission: null,
+  context_budget: null,
+  context_budget_state: null,
   agent: null,
   model: null,
   time_created: 1,

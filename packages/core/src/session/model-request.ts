@@ -27,7 +27,9 @@ import type { Content } from "@opencode/schema/tool"
 import { Cause, Context, Effect, Layer, Result, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { Hash } from "@opencode/util/hash"
 import { App } from "../app.js"
+import { Bus } from "../bus.js"
 import { Instructions } from "../instructions/index.js"
 import { Permission } from "../permission.js"
 import { PluginHooks } from "../plugin/hooks.js"
@@ -37,9 +39,15 @@ import { SessionAffinity } from "./affinity.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
+import { SessionStore } from "./store.js"
 import { SessionSystemPrompt } from "./system-prompt.js"
 import { toLLMMessages } from "./runner/to-llm-message.js"
 import type { SessionMessage } from "./message.js"
+import { SessionContextBudget } from "./context-budget.js"
+import { SessionEvent } from "./event.js"
+import type { SessionBudgetReasoning } from "./context-budget-reasoning.js"
+import type { AIError } from "@opencode/ai/effect"
+import type { CheckpointBinding } from "@opencode/plugin/controller-state"
 
 const IMAGE_BYTES_TRIGGER = 25 * 1024 * 1024 // 25 MiB
 const IMAGE_BYTES_TARGET = 15 * 1024 * 1024 // 15 MiB
@@ -51,7 +59,7 @@ const OUTPUT_TOKEN_FALLBACK = 32_000
 // No reply needs more, however much the model allows.
 const OUTPUT_TOKEN_MAX = 256_000
 // Prompt text is estimated at about 4 characters per token, which can run low on dense text such as code.
-const ESTIMATE_ERROR = 0.15
+const ESTIMATE_ERROR = SessionContextBudget.INPUT_MARGIN
 // Share of the window a turn leaves unused when its output limit is fitted to the room left. Providers count a few
 // tokens more than we do (chat template, tool schemas), and strict ones reject input plus output past the window.
 // Compaction sizes its summary against its own reserve instead.
@@ -66,6 +74,9 @@ export interface Prepared<Event = SessionRequest> {
   readonly event: Event
   readonly request: LLMRequest
   readonly options: StreamOptions
+  readonly budget?: SessionContextBudget.Assessment
+  /** Compaction may reshape a prepared transcript; admission always sees the exact request being sent. */
+  readonly admit?: (request: LLMRequest) => Effect.Effect<void, AIError>
   readonly retry: (event: PluginHooks.Domains["session"]["retry"]) => Effect.Effect<void>
   /** Runs a tool call against the tools this request advertised. */
   readonly executeTool: (
@@ -85,6 +96,10 @@ export interface Input {
   readonly webSocket?: "session"
   /** Prompt size, measured by the provider or estimated. The default output limit leaves room for it. */
   readonly inputTokens?: { readonly measured: number; readonly estimated: number }
+  readonly budgetBinding?: string
+  readonly reasoning?: ReadonlyArray<SessionBudgetReasoning.Evidence>
+  /** Compaction only: the reviewed controller-state checkpoint the hook must echo. */
+  readonly checkpoint?: CheckpointBinding
 }
 
 /** The default output limit: the catalog limit, fitted to the room the prompt leaves in the context window. */
@@ -185,6 +200,77 @@ const replaceMedia = (
       : new Message({ ...message, content })
   })
 
+/**
+ * The server already created this response from the parent's settings: inherit the parent's prepared
+ * request and change only its projected history. No preparation hook, title or send workflow runs.
+ */
+/**
+ * Process-local identity of everything a prepared request was bound to: the resolved model (catalogue
+ * ref, limits, capabilities, route endpoint, defaults and settings), the agent policy and the tool
+ * snapshot. Values are compared only as a digest within this process and never persisted or logged.
+ * The route transport is compared by reference because it is code, not data.
+ */
+export interface Binding {
+  readonly digest: string
+  readonly transport: unknown
+}
+
+const bindingValue = (value: unknown, path: WeakSet<object>): unknown => {
+  if (typeof value === "function" || typeof value === "symbol") return undefined
+  if (typeof value === "bigint") return value.toString()
+  if (value === null || typeof value !== "object") return value
+  if (path.has(value)) return "[cycle]"
+  path.add(value)
+  const result = Array.isArray(value)
+    ? value.map((item) => bindingValue(item, path) ?? null)
+    : Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .flatMap((key) => {
+            const next = bindingValue((value as Record<string, unknown>)[key], path)
+            return next === undefined ? [] : [[key, next]]
+          }),
+      )
+  path.delete(value)
+  return result
+}
+
+export const binding = (input: {
+  readonly agent: { readonly id: Agent.ID; readonly info: unknown }
+  readonly model: SessionRunnerModel.Resolved
+  readonly tools: Tool.Snapshot
+}): Binding => {
+  const { model: language, ...resolved } = input.model
+  const { route, ...model } = language
+  return {
+    digest: Hash.sha256(
+      JSON.stringify(
+        bindingValue(
+          {
+            agent: input.agent.id,
+            policy: input.agent.info,
+            resolved,
+            model,
+            // Route data only; its body codec and transport are code.
+            route: {
+              id: route.id,
+              provider: route.provider,
+              providerMetadataKey: route.providerMetadataKey,
+              protocol: route.protocol,
+              endpoint: route.endpoint,
+              defaults: route.defaults,
+            },
+            tools: input.tools.definitions,
+            catalog: input.tools.codeModeCatalog,
+          },
+          new WeakSet(),
+        ),
+      ),
+    ),
+    transport: route.transport,
+  }
+}
+
 export const unsupportedParts = (
   messages: LLMRequest["messages"],
   capabilities: Model.Capabilities,
@@ -238,7 +324,9 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
+    const store = yield* SessionStore.Service
     const app = yield* App.Metadata
+    const bus = yield* Bus.Service
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
     >(kind: SessionRequestKind, input: Input, shape: (draft: SessionRequest, tools: Definitions) => Effect.Effect<S>) {
@@ -287,7 +375,7 @@ export const layer = Layer.effect(
       const entries = Object.entries(shaped.options)
       const generation = Object.fromEntries(entries.filter(([k]) => GENERATION_KEYS.has(k))) as GenerationOptionsFields
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
-      const affinity = SessionAffinity.get(session)
+      const affinity = yield* SessionAffinity.get(session.id, store.get)
       const base = ai.request({
         model: model.model,
         http: {
@@ -303,7 +391,6 @@ export const layer = Layer.effect(
             "x-opencode-client": app.name,
           },
         },
-        // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
         promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
         cache: model.cache?.ttl === undefined ? undefined : { ttl: model.cache.ttl },
         system: shaped.system,
@@ -335,38 +422,105 @@ export const layer = Layer.effect(
           headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
         }),
       })
+      let sending = request
+      const admit = (candidate: LLMRequest, outbound?: string | (() => Effect.Effect<string, unknown>)) =>
+        Effect.gen(function* () {
+          sending = candidate
+          const current = yield* store.get(session.id)
+          const policy = current ? current.contextBudget : session.contextBudget
+          if (!policy) return
+          // An unreadable body is unknown counting evidence, not an empty provider request.
+          const wire = typeof outbound === "function"
+            ? yield* outbound().pipe(Effect.orElseSucceed(() => ""))
+            : outbound
+          const checked = SessionContextBudget.assess(policy, candidate, model.limit, wire, input.reasoning)
+          if (wire !== undefined)
+            yield* Effect.logDebug("session context budget admission", { sessionID: session.id, model: model.ref, raw: checked.raw, replayGenerated: checked.replayGenerated, inputMargin: SessionContextBudget.INPUT_MARGIN, output: checked.output, inputMaximum: checked.inputMaximum, contextMaximum: checked.contextMaximum, maximum: checked.maximum, total: checked.total })
+          if (
+            kind === "primary" &&
+            wire !== undefined &&
+            input.budgetBinding &&
+            SessionContextBudget.shouldCompact(checked, current?.contextBudgetState, input.budgetBinding)
+          )
+            return yield* new SessionContextBudget.TargetReached(checked)
+          if (!checked.reason) {
+            // Only a verified complete primary payload can re-arm the floor. A small pre-hook view or
+            // maintenance request must not reset a latch for a larger late-hook representation.
+            if (
+              kind === "primary" &&
+              wire !== undefined &&
+              checked.total < checked.target &&
+              current?.contextBudgetState
+            )
+              yield* bus.publish(SessionEvent.ContextBudgetChanged, { sessionID: session.id, state: null })
+            return
+          }
+          const blocked = {
+            reason: checked.reason,
+            model: model.ref,
+            inputMargin: SessionContextBudget.INPUT_MARGIN,
+            replayGenerated: checked.replayGenerated,
+            ...(Number.isSafeInteger(checked.total) && checked.total >= 0
+              ? { estimated: checked.total, raw: checked.raw, input: checked.input, output: checked.output }
+              : {}),
+            ...(Number.isFinite(checked.inputMaximum) && checked.inputMaximum >= 0
+              ? { inputMaximum: checked.inputMaximum }
+              : {}),
+            ...(checked.contextMaximum >= 0 ? { contextMaximum: checked.contextMaximum } : {}),
+            maximum: checked.maximum,
+            selection: SessionContextBudget.selection(current ?? session),
+          }
+          if (
+            current &&
+            (!current.contextBudgetState?.blocked || current.contextBudgetState.blocked.selection !== blocked.selection)
+          )
+            yield* bus.publish(SessionEvent.ContextBudgetChanged, {
+              sessionID: session.id,
+              state: { ...current.contextBudgetState, blocked },
+            })
+          return yield* SessionContextBudget.error(checked.reason)
+        })
       const hasHttpHooks =
         (yield* hooks.has("session", "http.request", model.ref.providerID)) ||
         (yield* hooks.has("session", "http.response", model.ref.providerID))
-      const http: StreamOptions["http"] = hasHttpHooks
-        ? (req, handler) =>
-            Effect.gen(function* () {
+      const http: StreamOptions["http"] = (req, handler) =>
+        Effect.gen(function* () {
+          // The policy may have been enabled since preparation. Keep the unbudgeted/no-hook
+          // path to one current-policy lookup without decoding or rebuilding its body.
+          if (!hasHttpHooks) {
+            yield* admit(sending, () => Effect.gen(function* () {
               const request = yield* HttpClientRequest.toWeb(req)
-              const before = yield* hooks.trigger("session", "http.request", { ...scope, request })
-              // A hook that kept the request object cannot have replaced its body, so the original body is sent as is.
-              // Reading it back would hold a second full copy of the request, screenshots included, for the whole call.
-              const sent =
-                before.request === request
-                  ? HttpClientRequest.setBody(HttpClientRequest.fromWeb(request), req.body)
-                  : before.request.body
-                    ? HttpClientRequest.bodyUint8Array(
-                        HttpClientRequest.fromWeb(before.request),
-                        new Uint8Array(yield* Effect.promise(() => before.request.clone().arrayBuffer())),
-                        before.request.headers.get("content-type") ?? undefined,
-                      )
-                    : HttpClientRequest.fromWeb(before.request)
-              const res = yield* handler(sent)
-              const after = yield* hooks.trigger("session", "http.response", {
-                ...scope,
-                request: before.request,
-                response: new Response(
-                  [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
-                  { status: res.status, headers: res.headers },
-                ),
-              })
-              return HttpClientResponse.fromWeb(sent, after.response)
-            })
-        : undefined
+              return yield* Effect.tryPromise(() => request.clone().text())
+            }))
+            return yield* handler(req)
+          }
+          const request = yield* HttpClientRequest.toWeb(req)
+          const before = yield* hooks.trigger("session", "http.request", {
+            ...scope,
+            request,
+          })
+          // Unchanged hooks retain the original body instead of keeping a second full media copy.
+          const sent = before.request === request
+            ? HttpClientRequest.setBody(HttpClientRequest.fromWeb(request), req.body)
+            : before.request.body
+              ? HttpClientRequest.bodyUint8Array(
+                  HttpClientRequest.fromWeb(before.request),
+                  new Uint8Array(yield* Effect.promise(() => before.request.clone().arrayBuffer())),
+                  before.request.headers.get("content-type") ?? undefined,
+                )
+              : HttpClientRequest.fromWeb(before.request)
+          yield* admit(sending, () => Effect.tryPromise(() => before.request.clone().text()))
+          const res = yield* handler(sent)
+          const after = yield* hooks.trigger("session", "http.response", {
+            ...scope,
+            request: before.request,
+            response: new Response(
+              [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
+              { status: res.status, headers: res.headers },
+            ),
+          })
+          return HttpClientResponse.fromWeb(sent, after.response)
+        })
       // HTTP hooks wrap every HTTP request, including the WebSocket fallback path. The route decides
       // which transport actually carries the request, so both hook families are always offered.
       const webSocket =
@@ -383,9 +537,11 @@ export const layer = Layer.effect(
                     })
                     .pipe(Effect.map((event) => ({ url: event.url, headers: event.headers }))),
                 send: (frame) =>
-                  hooks
-                    .trigger("session", "experimental.ws.send", { ...scope, frame })
-                    .pipe(Effect.map((event) => event.frame)),
+                  Effect.gen(function* () {
+                    const event = yield* hooks.trigger("session", "experimental.ws.send", { ...scope, frame })
+                    yield* admit(sending, event.frame)
+                    return event.frame
+                  }),
                 receive: (frame) =>
                   hooks
                     .trigger("session", "experimental.ws.receive", { ...scope, frame })
@@ -398,7 +554,13 @@ export const layer = Layer.effect(
       return {
         event: shaped,
         request,
-        options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
+        options: { http, ...(webSocket ? { webSocket } : {}) },
+        admit: (candidate: LLMRequest) => admit(candidate),
+        ...(session.contextBudget
+          ? {
+              budget: SessionContextBudget.assess(session.contextBudget, request, model.limit, undefined, input.reasoning),
+            }
+          : {}),
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot
@@ -429,7 +591,15 @@ export const layer = Layer.effect(
 
     return Service.of({
       primary: (input) => prepare("primary", input, agentHook("context", input.agent)),
-      compaction: (input) => prepare("compaction", input, agentHook("compaction", input.agent)),
+      compaction: (input) =>
+        prepare("compaction", input, (draft, tools) =>
+          hooks.trigger("session", "compaction", {
+            ...draft,
+            agent: input.agent,
+            tools,
+            ...(input.checkpoint ? { checkpoint: input.checkpoint } : {}),
+          }),
+        ),
       generate: (input) => prepare("generate", input, agentHook("generate", input.agent)),
       title: (input) => prepare("title", input, (draft) => hooks.trigger("session", "title", draft)),
     })
@@ -439,5 +609,5 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [PluginHooks.node, SessionModelTransport.node, App.node],
+  deps: [PluginHooks.node, SessionModelTransport.node, SessionStore.node, App.node, Bus.node],
 })

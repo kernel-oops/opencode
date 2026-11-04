@@ -11,6 +11,7 @@ import { SessionCompaction } from "../compaction.js"
 import { SessionContext } from "../context.js"
 import { SessionEvent } from "../event.js"
 import { SessionInbox } from "../inbox.js"
+import { SessionStateCheckpoint } from "../state-checkpoint.js"
 import { SessionBackground } from "../background.js"
 import { Job } from "../../job.js"
 import { SessionHistory } from "../history.js"
@@ -33,6 +34,8 @@ import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
+import { SessionContextBudget } from "../context-budget.js"
+import { SessionBudgetReasoning } from "../context-budget-reasoning.js"
 
 const CONTINUE_AFTER_INCOMPLETE_STREAM =
   "The previous response was interrupted. Continue from where you left off without repeating completed content."
@@ -89,13 +92,21 @@ const layer = Layer.effect(
                 })
               }
               // Location entry and idle boundaries allow queued controls, not necessarily queued prompts.
-              const pending = yield* SessionInbox.serialized(
+              const boundary = yield* SessionInbox.serialized(
                 sessionID,
                 Effect.gen(function* () {
+                  const session = yield* store.get(sessionID)
+                  const blocked = session?.contextBudgetState?.blocked
+                  // Operator maintenance holds the session idle too (see SessionStateCheckpoint.held).
+                  const controlsOnly =
+                    (session !== undefined &&
+                      blocked !== undefined &&
+                      blocked.selection === SessionContextBudget.selection(session)) ||
+                    (yield* SessionStateCheckpoint.held(db, sessionID))
                   const next = yield* SessionInbox.nextPromotable(
                     db,
                     sessionID,
-                    entering || !continuing ? "input" : "steer",
+                    controlsOnly ? "control" : entering || !continuing ? "input" : "steer",
                   )
                   if (next?.type === "compaction")
                     yield* bus.publishAll([
@@ -112,9 +123,11 @@ const layer = Layer.effect(
                         ])
                       }),
                     )
-                  return next
+                  return { pending: next, controlsOnly }
                 }),
               )
+              const pending = boundary.pending
+              if (boundary.controlsOnly && !pending) return DrainResult.Complete()
               if (!continuing && pending?.delivery !== "steer") {
                 entering = true
                 step = 1
@@ -135,6 +148,7 @@ const layer = Layer.effect(
                     return yield* compaction.compact({
                       reason: "manual",
                       inputID: pending.id,
+                      checkpoint: pending.payload.checkpoint,
                       context: {
                         session: selected.session,
                         agent: selected.agent,
@@ -175,7 +189,9 @@ const layer = Layer.effect(
                 // The Session would go idle; a plugin may admit input to keep this execution working.
                 yield* restore(
                   SessionBackground.outstanding(jobs, store, sessionID).pipe(
-                    Effect.flatMap((background) => hooks.trigger("session", "experimental.idle", { sessionID, background })),
+                    Effect.flatMap((background) =>
+                      hooks.trigger("session", "experimental.idle", { sessionID, background }),
+                    ),
                   ),
                 )
                 if (!(yield* SessionInbox.has(db, sessionID, "input"))) return DrainResult.Complete()
@@ -192,12 +208,19 @@ const layer = Layer.effect(
                   )
                   // A control admitted during context preparation owns this boundary.
                   if (promoted === undefined) return undefined
-                  if (promoted > 0 && !selected.session.parentID && SessionTitle.isUntitled(selected.session))
+                  if (
+                    promoted > 0 &&
+                    !selected.session.contextBudget &&
+                    !selected.session.parentID &&
+                    SessionTitle.isUntitled(selected.session)
+                  )
                     yield* FiberMap.run(titles, sessionID, title.generate(sessionID), {
                       onlyIfMissing: true,
                     })
                   if (promoted > 0) step = 1
-                  return { _tag: "Ready" as const, context: yield* context.load(selected) }
+                  // Fence admission before loading history or preparing request hooks.
+                  const steering = yield* SessionInbox.watch(db, sessionID)
+                  return { _tag: "Ready" as const, steering, context: yield* context.load(selected) }
                 }),
               )
               if (ready) return ready
@@ -207,9 +230,17 @@ const layer = Layer.effect(
       )
 
       while (true) {
-        const next = yield* advanceToStep()
-        if (next._tag !== "Ready") return next
-        continuing = yield* runStep(next.context, step)
+        const advanced = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const next = yield* advanceToStep()
+            if (next._tag !== "Ready") return next
+            continuing = yield* runStep(next.context, step, next.steering, () => {
+              step = 0
+            })
+            return { _tag: "Advanced" as const }
+          }),
+        )
+        if (advanced._tag !== "Advanced") return advanced
         stepped = true
         step++
         force = false
@@ -227,25 +258,105 @@ const layer = Layer.effect(
     })
 
     /** Owns logical Step policy; each attempt owns its streaming, tools, and durable settlement. */
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (first: SessionContext.Loaded, step: number) {
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (
+      first: SessionContext.Loaded,
+      step: number,
+      firstSteering: SessionInbox.SteeringGate,
+      onSteer: () => void,
+    ) {
       const sessionID = first.session.id
       let assistantMessageID = SessionMessage.ID.create()
       const retry = yield* SessionRunnerRetry.make(bus, sessionID)
       let initial: SessionContext.Loaded | undefined = first
+      let initialSteering: SessionInbox.SteeringGate | undefined = firstSteering
       let recoverOverflow = true
       let recoverContinuation = true
+      const continueOutputLimit = Effect.fn("SessionRunner.continueOutputLimit")(function* (outcome: {
+        readonly needsContinuation: boolean
+      }) {
+        // A decoded length terminal has settled ownership; apply the bounded policy without replaying input.
+        const rows = yield* db
+          .select()
+          .from(SessionMessageTable)
+          .where(
+            and(
+              eq(SessionMessageTable.session_id, sessionID),
+              inArray(SessionMessageTable.type, ["user", "assistant"]),
+            ),
+          )
+          .orderBy(desc(SessionMessageTable.seq))
+          .limit(3)
+          .all()
+          .pipe(Effect.orDie)
+        const recent = yield* Effect.forEach(rows, SessionHistory.decodeMessageRow)
+        if (
+          recent.length === 3 &&
+          recent.every((message) => message.type === "assistant" && message.finish === "length")
+        )
+          return yield* new StepFailedError({
+            error: {
+              type: "output-limit",
+              message: "Response still truncated after two output token limit continuations",
+            },
+          })
+        if (outcome.needsContinuation) return true
+        yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_OUTPUT_LIMIT })
+        assistantMessageID = SessionMessage.ID.create()
+      })
+      const supersedeRetry = SessionInbox.serialized(
+        sessionID,
+        Effect.gen(function* () {
+          const row = yield* db
+            .select()
+            .from(SessionMessageTable)
+            .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, assistantMessageID)))
+            .get()
+            .pipe(Effect.orDie)
+          if (!row || row.type !== "assistant") return
+          const message = yield* SessionHistory.decodeMessageRow(row)
+          if (
+            message.type !== "assistant" ||
+            !message.retry ||
+            message.time.completed !== undefined ||
+            message.error !== undefined
+          )
+            return
+          // A previous physical retry already started this assistant. Settle it
+          // before replacement; a never-started preparation produces no message.
+          yield* bus.publish(SessionEvent.Step.Interrupted, {
+            sessionID,
+            assistantMessageID,
+            reason: "steer",
+            ...(message.cost !== undefined && message.tokens !== undefined
+              ? { cost: message.cost, tokens: message.tokens }
+              : {}),
+          })
+        }),
+      ).pipe(Effect.uninterruptible)
       while (true) {
+        const steering = initialSteering ?? (yield* SessionInbox.watch(db, sessionID))
+        initialSteering = undefined
+        if (steering.invalidated()) {
+          yield* supersedeRetry
+          yield* modelTransport.close(sessionID)
+          return true
+        }
         // Reuse boundary preparation once; retries refresh context without delivering more input.
         const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
+        // Captured before any asynchronous compaction, hook or provider work can revise shared handles in place.
+        const binding = SessionModelRequest.binding(loaded)
         const estimate = SessionCompaction.estimatePrompt(loaded)
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded, estimate })
+        const compacted = loaded.session.contextBudget
+          ? { status: "skipped" as const }
+          : yield* compaction.compact({ reason: "auto", context: loaded, estimate })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
         if (compacted.status === "completed") {
+          yield* steering.finish
           assistantMessageID = SessionMessage.ID.create()
           continue
         }
-        yield* compaction.precompute(Effect.succeed(loaded), estimate)
+        if (!loaded.session.contextBudget) yield* compaction.precompute(Effect.succeed(loaded), estimate)
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
         const transcript = SessionModelRequest.baseTranscript({
           agent: loaded.agent.info,
@@ -268,51 +379,89 @@ const layer = Layer.effect(
             toolChoice: stepLimitReached ? "none" : undefined,
             webSocket: "session",
             inputTokens: estimate,
+            budgetBinding: binding.digest,
+            reasoning: loaded.session.contextBudget ? SessionBudgetReasoning.capture(loaded) : undefined,
           })
           .pipe(
-            // The hook event holds every message from before images are bounded, screenshots included, and is a separate
-            // copy once a plugin hook has rewritten it. The step and its tool callbacks live as long as the slowest tool,
-            // so they keep only what they use.
             Effect.map((prepared) => ({
-              request: prepared.request,
-              options: prepared.options,
-              retry: prepared.retry,
-              executeTool: prepared.executeTool,
+              ...prepared,
+              // Keep the activation barrier across continuation steps.
+              executeTool: (call: Parameters<typeof prepared.executeTool>[0]) =>
+                plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
             })),
           )
-        const outcome = yield* steps.attempt({
-          isLocationClosed: lifecycle.isClosed,
-          sessionID,
-          assistantMessageID,
-          agent: loaded.agent.id,
-          model: loaded.model,
-          prepared: {
-            ...prepared,
-            // A tool call can arrive during a reload; its permission check reads the session's agent.
-            executeTool: (call) => plugins.awaitActivation.pipe(Effect.andThen(prepared.executeTool(call))),
-          },
-          retry: (cause, error, proposed) =>
-            retry.decide({
-              cause,
-              error,
-              agent: loaded.agent.id,
-              model: loaded.model.ref,
-              hook: prepared.retry,
-              retry: proposed,
-            }),
-          recoverContinuation,
-          recoverOverflow: Effect.suspend(() =>
-            recoverOverflow
-              ? compaction
-                  .compact({ reason: "overflow", context: loaded, estimate })
-                  .pipe(Effect.map((result) => result.status === "completed"))
-              : Effect.succeed(false),
-          ),
-        })
+        if (prepared.budget && prepared.admit) {
+          const checked = prepared.budget
+          const state = loaded.session.contextBudgetState
+          if (SessionContextBudget.shouldCompact(checked, state, binding.digest)) {
+            // Persist before invoking compaction: failed, interrupted and no-progress attempts stay latched.
+            yield* bus.publish(SessionEvent.ContextBudgetChanged, {
+              sessionID,
+              state: { ...state, attempted: { binding: binding.digest, estimated: checked.total } },
+            })
+            const result = yield* compaction.compact({ reason: "budget", context: loaded })
+            if (result.status === "failed" && result.error.type === "context.budget-blocked")
+              return yield* SessionContextBudget.error(result.error.message)
+            if (result.status === "completed") {
+              yield* steering.finish
+              assistantMessageID = SessionMessage.ID.create()
+              continue
+            }
+          }
+          yield* prepared.admit(prepared.request).pipe(Effect.ensuring(steering.finish))
+        }
+        const outcome = yield* steps
+          .attempt({
+            steering,
+            isLocationClosed: lifecycle.isClosed,
+            sessionID,
+            assistantMessageID,
+            agent: loaded.agent.id,
+            model: loaded.model,
+            prepared,
+            onSteer: () => {
+              step = 0
+              onSteer()
+            },
+            retry: (cause, error, proposed) =>
+              retry.decide({
+                cause,
+                error,
+                agent: loaded.agent.id,
+                model: loaded.model.ref,
+                hook: prepared.retry,
+                retry: proposed,
+              }),
+            recoverContinuation,
+            recoverOverflow: Effect.suspend(() =>
+              recoverOverflow
+                ? compaction
+                    .compact({ reason: "overflow", context: loaded, estimate })
+                    .pipe(Effect.map((result) => result.status === "completed"))
+                : Effect.succeed(false),
+            ),
+          })
+          .pipe(Effect.ensuring(steering.finish))
         const completed = yield* SessionStep.Outcome.$match(outcome, {
+          BudgetTarget: Effect.fnUntraced(function* (outcome) {
+            const current = yield* store.get(sessionID)
+            yield* bus.publish(SessionEvent.ContextBudgetChanged, {
+              sessionID,
+              state: {
+                ...current?.contextBudgetState,
+                attempted: { binding: binding.digest, estimated: outcome.assessment.total },
+              },
+            })
+            const result = yield* compaction.compact({ reason: "budget", context: loaded })
+            if (result.status === "failed" && result.error.type === "context.budget-blocked")
+              return yield* SessionContextBudget.error(result.error.message)
+            assistantMessageID = SessionMessage.ID.create()
+          }),
+          // The inbox gate invalidated this attempt before it acquired the model stream.
+          Steered: () => Effect.succeed(true),
           Completed: Effect.fnUntraced(function* (outcome) {
             // The Session is about to go idle, which leaves the background summary time to finish.
-            if (!outcome.needsContinuation)
+            if (!outcome.needsContinuation && !loaded.session.contextBudget)
               yield* compaction.precompute(
                 store.context(sessionID).pipe(Effect.map((messages) => ({ ...loaded, messages }))),
               )
@@ -333,37 +482,7 @@ const layer = Layer.effect(
             yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_INCOMPLETE_STREAM })
             assistantMessageID = SessionMessage.ID.create()
           }),
-          OutputLimit: Effect.fn("SessionRunner.continueOutputLimit")(function* (outcome) {
-            // The current response is included. User input or any other finish breaks the streak.
-            const recent = yield* db
-              .select({
-                type: SessionMessageTable.type,
-                finish: sql<string | null>`json_extract(${SessionMessageTable.data}, '$.finish')`,
-              })
-              .from(SessionMessageTable)
-              .where(
-                and(
-                  eq(SessionMessageTable.session_id, sessionID),
-                  inArray(SessionMessageTable.type, ["user", "assistant"]),
-                ),
-              )
-              .orderBy(desc(SessionMessageTable.seq))
-              .limit(3)
-              .all()
-              .pipe(Effect.orDie)
-            const exhausted =
-              recent.length === 3 && recent.every((row) => row.type === "assistant" && row.finish === "length")
-            if (exhausted)
-              return yield* new StepFailedError({
-                error: {
-                  type: "output-limit",
-                  message: "Response still truncated after two output token limit continuations",
-                },
-              })
-            if (outcome.needsContinuation) return true
-            yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_OUTPUT_LIMIT })
-            assistantMessageID = SessionMessage.ID.create()
-          }),
+          OutputLimit: continueOutputLimit,
           Compacted: Effect.fnUntraced(function* () {
             recoverOverflow = false
             assistantMessageID = SessionMessage.ID.create()
@@ -374,7 +493,7 @@ const layer = Layer.effect(
         })
         if (completed !== undefined) return completed
       }
-    })
+    }, Effect.scoped)
 
     const settleStaleCompactions = Effect.fn("SessionRunner.settleStaleCompactions")(function* (
       sessionID: SessionSchema.ID,

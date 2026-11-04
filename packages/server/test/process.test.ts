@@ -167,6 +167,31 @@ it.live("authenticates API requests behind the frontend transform while allowing
   }),
 )
 
+it.live("refuses to start without a password unless authentication is explicitly disabled", () =>
+  Effect.gen(function* () {
+    const options = { hostname: "127.0.0.1", port: 0, database: { path: ":memory:" } }
+    const missing = yield* ServerProcess.start<never, never>(options).pipe(Effect.flip)
+    expect(missing.message).toBe("Missing server password")
+
+    const server = yield* ServerProcess.start<never, never>({ ...options, unauthenticated: true }, undefined, (api) =>
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest
+        const url = new URL(request.url, "http://localhost")
+        if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return yield* api
+        return HttpServerResponse.raw("frontend", { contentType: "text/plain" })
+      }),
+    )
+    yield* Effect.forEach(["/api/info", "/"], (pathname) =>
+      Effect.gen(function* () {
+        const response = yield* Effect.promise(() => fetch(new URL(pathname, HttpServer.formatAddress(server.address))))
+        expect(response.status).toBe(200)
+        expect(response.headers.get("www-authenticate")).toBeNull()
+        yield* Effect.promise(() => response.arrayBuffer())
+      }),
+    )
+  }),
+)
+
 it.live("pairing links sign in browsers with a cookie and API clients with a token", () =>
   Effect.gen(function* () {
     const server = yield* ServerProcess.start<never, never>({

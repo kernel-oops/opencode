@@ -1,5 +1,6 @@
 import { Tool } from "@opencode/schema/tool"
 import { Session } from "@opencode/schema/session"
+import { AsyncLocalStorage } from "node:async_hooks"
 import type { Rpc } from "@opencode/schema/rpc"
 import type { OpenCodeEvent } from "@opencode/client"
 import type { RpcCallOptions, RpcEventPayload, SelectedEvent, SubscribeOptions } from "@opencode/client/promise/api"
@@ -37,6 +38,13 @@ const AssistantSynthetic = Schema.Struct({
   final: Schema.Boolean.pipe(Schema.optional),
   metadata: Schema.Record(Schema.String, Schema.Unknown).pipe(Schema.optional),
 })
+
+type Invocation = {
+  readonly abort: AbortController
+  readonly assertions: Set<Promise<void>>
+  closed: boolean
+}
+const invocation = new AsyncLocalStorage<Invocation>()
 
 interface HostRpcCallContext {
   readonly error: (type: string, message: string, data?: unknown) => unknown
@@ -490,8 +498,27 @@ export function fromPromise(plugin: Plugin) {
             list: adaptApiMethod(PermissionEndpoints["session.permission.list"], host.permission.list),
             get: adaptApiMethod(PermissionEndpoints["session.permission.get"], host.permission.get),
             reply: adaptApiMethod(PermissionEndpoints["session.permission.reply"], host.permission.reply),
-            assert: (input) =>
-              run(Schema.decodeUnknownEffect(AssertInput)(input).pipe(Effect.flatMap(host.permission.assert))),
+            assert: (input) => {
+              const owner = invocation.getStore()
+              if (owner?.closed || owner?.abort.signal.aborted)
+                return Promise.reject(
+                  owner.abort.signal.reason ?? new DOMException("Tool invocation closed", "AbortError"),
+                )
+              const assertion = Effect.runPromiseWith(runtime)(
+                Schema.decodeUnknownEffect(AssertInput)(input).pipe(Effect.flatMap(host.permission.assert)),
+                owner ? { signal: owner.abort.signal } : undefined,
+              )
+              if (owner) {
+                const settled = assertion
+                  .then(
+                    () => {},
+                    () => {},
+                  )
+                  .finally(() => owner.assertions.delete(settled))
+                owner.assertions.add(settled)
+              }
+              return assertion
+            },
           },
           plugin: {
             list: adaptApiMethod(PluginEndpoints["plugin.list"], host.plugin.list),
@@ -628,6 +655,15 @@ export function fromPromise(plugin: Plugin) {
               ),
           },
           session: {
+            reviewRoot: (input) => run(host.session.reviewRoot(input)),
+            reviewEvidence: (input) => run(host.session.reviewEvidence(input)),
+            stateCheckpoint: {
+              snapshot: (input) => run(host.session.stateCheckpoint.snapshot(input)),
+              read: (input) => run(host.session.stateCheckpoint.read(input)),
+              update: (input) => run(host.session.stateCheckpoint.update(input)),
+              compact: (input) => run(host.session.stateCheckpoint.compact(input)),
+              maintain: (input) => run(host.session.stateCheckpoint.maintain(input)),
+            },
             hook: (name, callback, options) =>
               register(
                 host.session.hook(name, (event) => Effect.promise(() => Promise.resolve(callback(event))), options),
@@ -650,6 +686,7 @@ export function fromPromise(plugin: Plugin) {
                     Effect.flatMap((note) => host.session.synthetic(note)),
                   ))
                 : adaptApiMethod<(input: unknown) => Promise<unknown>>(SessionEndpoints["session.synthetic"], host.session.synthetic)(input)) as PromiseContext["session"]["synthetic"],
+            append: adaptApiMethod(SessionEndpoints["session.append"], host.session.append),
             interrupt: adaptApiMethod(SessionEndpoints["session.interrupt"], host.session.interrupt),
             update: adaptApiMethod(SessionEndpoints["session.update"], host.session.update),
             move: adaptApiMethod(SessionEndpoints["session.move"], host.session.move),
@@ -732,12 +769,37 @@ const toolHook: {
 }
 
 const executePromiseTool = (tool: Info, input: any, context: Tool.Context) =>
-  Effect.tryPromise({
-    try: (signal) =>
-      tool.execute(input, {
-        ...context,
-        signal,
-        progress: (update) => Effect.runPromise(context.progress(update), { signal }),
-      }),
-    catch: toolError,
+  Effect.suspend(() => {
+    const owner: Invocation = { abort: new AbortController(), assertions: new Set(), closed: false }
+    let runtimeSignal: AbortSignal | undefined
+    // EventTarget listeners inherit dispatch context, not registration context.
+    const abort = () =>
+      invocation.run(owner, () => {
+        owner.closed = true
+        owner.abort.abort(runtimeSignal?.reason)
+      })
+    return Effect.tryPromise({
+      try: (signal) => {
+        runtimeSignal = signal
+        signal.addEventListener("abort", abort, { once: true })
+        if (signal.aborted) abort()
+        return invocation.run(owner, () =>
+          tool.execute(input, {
+            ...context,
+            signal: owner.abort.signal,
+            progress: (update) => Effect.runPromise(context.progress(update), { signal }),
+          }),
+        )
+      },
+      catch: toolError,
+    }).pipe(
+      Effect.ensuring(
+        Effect.promise(async () => {
+          runtimeSignal?.removeEventListener("abort", abort)
+          abort()
+          // Await host assertion finalisers, not an uncooperative JavaScript tool body.
+          await Promise.all(owner.assertions)
+        }),
+      ),
+    )
   })

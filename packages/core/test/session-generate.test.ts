@@ -37,6 +37,7 @@ import { SessionContext } from "@opencode/core/session/context"
 import { SessionGenerate } from "@opencode/core/session/generate"
 import { InstructionState } from "@opencode/core/session/instruction-state"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionSchema } from "@opencode/core/session/schema"
@@ -86,15 +87,18 @@ const client = Layer.mock(LLMClient.Service)({
       return response
     }),
 })
+const resolutions: Array<unknown> = []
 const models = Layer.mock(SessionRunnerModel.Service)({
-  resolve: () =>
-    Effect.succeed(
+  resolve: (_session, _available, policy) =>
+    Effect.sync(() => {
+      resolutions.push(policy)
+    }).pipe(Effect.as(
       SessionRunnerModel.resolved(model, {
         capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
         cost: [],
         limit: { context: 200_000, output: 32_000 },
       }),
-    ),
+    )),
 })
 const builtins = Layer.mock(InstructionBuiltIns.Service, {
   load: () =>
@@ -148,6 +152,7 @@ const it = testEffect(
       Agent.node,
       InstructionBuiltIns.node,
       SessionContext.node,
+      SessionNativeTest.node,
       PluginHooks.node,
       llmClient,
     ]),
@@ -448,6 +453,37 @@ it.effect(
       expect(error).toBeInstanceOf(Instructions.InitializationBlocked)
       expect(requests).toEqual([])
       expect(yield* durableState(db, sessionID)).toEqual(before)
+    }),
+  { timeout: 15_000 },
+)
+
+it.effect(
+  "only primary context loading reads the session's native test snapshot; auxiliary generation stays HTTP",
+  () =>
+    Effect.gen(function* () {
+      requests.length = 0
+      options.length = 0
+      resolutions.length = 0
+      instruction = "Initial context"
+      const { db, bus, instructions, session, instances } = yield* setup
+      yield* InstructionState.prepare(db, bus, instructions, sessionID)
+      const registry = yield* SessionNativeTest.Service
+      yield* registry.request(sessionID, { nativeSteer: "response.steer", debug: false })
+      yield* registry.start(sessionID)
+      const context = yield* SessionContext.Service
+
+      yield* SessionGenerate.generate({ session, prompt: "Summarize privately" }).pipe(
+        Effect.provideService(Instance.Service, instances),
+      )
+      yield* context.selectTitle(session)
+      expect(resolutions.length).toBeGreaterThan(0)
+      expect(resolutions.every((policy) => policy === undefined)).toBe(true)
+      expect(options.every((requestOptions) => requestOptions?.webSocket === undefined)).toBe(true)
+
+      yield* context.load(yield* context.select(sessionID))
+      expect(resolutions.at(-1)).toEqual({ nativeSteer: "response.steer" })
+      yield* registry.finish(sessionID)
+      yield* registry.request(sessionID, { nativeSteer: false, debug: false })
     }),
   { timeout: 15_000 },
 )

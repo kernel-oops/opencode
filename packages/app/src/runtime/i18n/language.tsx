@@ -77,6 +77,24 @@ export function localizedListParts<Value>(locale: string, items: readonly Value[
     .map((part) => (part.type === "element" ? items[Number(part.value)] : part.value))
 }
 
+/** Counts by status of a session's background work, as the Background list's status summary reports them. */
+export type BackgroundSummaryCounts = Record<"running" | "completed" | "error" | "cancelled" | "idle", number>
+
+/** The Background list's status summary: each non-zero count's plural phrase, as a localized list. */
+export function backgroundSummaryText(
+  locale: string,
+  counts: BackgroundSummaryCounts,
+  plural: (key: `session.backgroundTab.summary.${keyof BackgroundSummaryCounts}`, count: number) => string,
+) {
+  const kinds = ["running", "completed", "error", "cancelled", "idle"] as const
+
+  const phrases = kinds.flatMap((kind) =>
+    counts[kind] > 0 ? [plural(`session.backgroundTab.summary.${kind}`, counts[kind])] : [],
+  )
+
+  return new Intl.ListFormat(locale, { type: "unit" }).format(phrases)
+}
+
 function cookie(locale: Locale) {
   return `oc_locale=${encodeURIComponent(locale)}; Path=/; Max-Age=31536000; SameSite=Lax`
 }
@@ -325,6 +343,8 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
 
     const list = (items: readonly JSX.Element[]) => localizedListParts(intl(), items)
 
+    const backgroundSummary = (counts: BackgroundSummaryCounts) => backgroundSummaryText(intl(), counts, plural)
+
     const label = (value: Locale) => DESKTOP_NATIVE_LABELS[value]
 
     createEffect(() => {
@@ -362,6 +382,7 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
       activitySummaryRich,
       rich,
       list,
+      backgroundSummary,
       setLocale(next: Locale) {
         setStore("locale", normalizeLocale(next))
       },

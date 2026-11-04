@@ -900,7 +900,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
       input.emit()
       return
     }
-    if (event.type === "session.step.ended") return
+    if (event.type === "session.step.ended" || event.type === "session.step.interrupted") return
     if (event.type === "session.step.failed") {
       setFrame(child, `error:${event.data.assistantMessageID}`, {
         kind: "error",

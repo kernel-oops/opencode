@@ -29,6 +29,15 @@ import { SessionRunnerRetry } from "@opencode/core/session/runner/retry"
 const llm = (reason: AIError["reason"]) => new AIError({ reason })
 
 describe("toSessionError", () => {
+  test("renders stale permission reviews as actionable normal tool errors", () => {
+    const stale = new Permission.ReviewStaleError({ reasons: ["pendingHumanInstruction"] })
+    expect(toSessionError(stale)).toEqual({ type: "permission.review-stale", message: stale.message })
+    expect(toSessionError(new ToolFailure({ message: stale.message, error: stale }))).toEqual({
+      type: "permission.review-stale",
+      message: stale.message,
+    })
+    expect(stale.message).toContain("Earlier operations")
+  })
   test("maps every AI error reason to the open wire type", () => {
     expect(toSessionError(llm(new RateLimitError({ message: "rate", retryAfterMs: 123 })))).toEqual({
       type: "provider.rate-limit",

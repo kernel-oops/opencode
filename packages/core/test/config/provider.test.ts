@@ -44,8 +44,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
           custom: {
             package: "@opencode/ai/providers/openai/responses",
             models: {
-              alias: { modelID: "upstream", status: "deprecated", family: "gemini-flash-lite", capabilities: { input: ["text"], output: ["text"] } },
-              active: { modelID: "upstream", family: "gemini-flash-lite", capabilities: { input: ["text"], output: ["text"] } },
+              alias: { modelID: "upstream", status: "deprecated", family: "gpt-luna", capabilities: { input: ["text"], output: ["text"] } },
+              active: { modelID: "upstream", family: "gpt-luna", capabilities: { input: ["text"], output: ["text"] } },
               disabled: { status: "deprecated", disabled: true },
             },
           },

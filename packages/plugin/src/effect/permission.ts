@@ -16,6 +16,13 @@ export interface PermissionEvaluation {
   readonly source?: Permission.Source
   effect: Permission.Effect
   message?: string
+  /** A classification marker, not authority: only the privately enrolled model reviewer can supply a receipt. */
+  review?: { readonly kind: "model-refusal"; readonly reason: string }
+  /**
+   * Set when the configured rules have already refused the request, explaining why (the deciding rule and its
+   * layer). The hook is then called for observation only, e.g. to record refusals: changes to `effect` are ignored.
+   */
+  readonly refusal?: string
 }
 
 export interface PermissionHooks {

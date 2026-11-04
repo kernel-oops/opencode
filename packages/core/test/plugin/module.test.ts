@@ -20,6 +20,14 @@ import { tempGlobalLayer } from "../fixture/global"
 import { setOrganizationPolicy } from "../fixture/policy"
 import { tmpdirScoped } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { ConfigPluginSource } from "@opencode/core/config/plugin/source"
+import { Config } from "@opencode/core/config"
+import { Location } from "@opencode/core/location"
+import { AbsolutePath } from "@opencode/core/schema"
+import { Document, Info } from "@opencode/schema/config"
+import { tempLocationLayer } from "../fixture/location"
+
 import { PluginTestLayer } from "./fixture"
 
 ensurePluginRuntime()
@@ -30,6 +38,96 @@ const it = testEffect(
     AppNodeBuilder.build(Npm.node, [Global.node.replace(tempGlobalLayer)]),
     Watcher.layer().pipe(Layer.provide(Watcher.nativeLayer)),
   ),
+)
+
+const sourceIt = testEffect(
+  AppNodeBuilder.build(LayerNode.group([Npm.node, Global.node, Config.node, ConfigPluginSource.node, Watcher.node]), [
+    Global.node.replace(tempGlobalLayer),
+    Location.node.replace(tempLocationLayer),
+    Config.node.replace(
+      Layer.effect(
+        Config.Service,
+        Effect.gen(function* () {
+          const global = yield* Global.Service
+          return Config.Service.of({
+            entries: () =>
+              Effect.succeed([
+                new Document({
+                  type: "document",
+                  path: AbsolutePath.make(path.join(global.config, "opencode.json")),
+                  info: new Info({
+                    plugins: [
+                      {
+                        package: path.join(global.config, "plugins/luna-permission-reviewer"),
+                        options: { mode: "fixture" },
+                      },
+                    ],
+                  }),
+                }),
+              ]),
+            changes: () => Stream.never,
+          })
+        }),
+      ).pipe(Layer.provide(tempGlobalLayer)),
+    ),
+  ]),
+)
+
+sourceIt.live("only the exact configured global reviewer module gains source-review provenance", () =>
+  Effect.gen(function* () {
+    const global = yield* Global.Service
+    const directory = path.join(global.config, "plugins", "luna-permission-reviewer")
+    const document = path.join(global.config, "opencode.json")
+    yield* Effect.promise(() => Bun.write(document, "{}"))
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(directory, "index.ts"),
+        'export default { id: "opencode-luna-permission-reviewer", async setup() {} }',
+      ),
+    )
+    const modules = yield* PluginModule.make()
+    const scanner = yield* ConfigPluginSource.Service
+    const scanned = yield* scanner.operations()
+    const operation = scanned.find(
+      (item): item is Extract<ConfigPluginSource.Operation, { type: "add" }> => item.type === "add",
+    )!
+    const actual = yield* modules.load(operation)
+    expect("effect" in actual && PluginModule.isSourceReviewer(actual)).toBe(true)
+    if ("effect" in actual) {
+      const revision = actual.revision
+      actual.revision = "forged"
+      expect(PluginModule.isSourceReviewer(actual)).toBe(false)
+      actual.revision = revision
+    }
+    expect("effect" in actual && PluginModule.isSourceReviewer({ ...actual })).toBe(false)
+    operation.options.mode = "forged"
+    const forgedOptions = yield* modules.load(operation)
+    expect("effect" in forgedOptions && PluginModule.isSourceReviewer(forgedOptions)).toBe(false)
+    operation.options.mode = "fixture"
+    const discovered = yield* modules.load({ ...operation, document: undefined })
+    expect("effect" in discovered && PluginModule.isSourceReviewer(discovered)).toBe(false)
+    const projectDocument = path.join(global.tmp, "opencode.json")
+    yield* Effect.promise(() => Bun.write(projectDocument, "{}"))
+    const overridden = yield* modules.load({ ...operation, document: projectDocument })
+    expect("effect" in overridden && PluginModule.isSourceReviewer(overridden)).toBe(false)
+    const copied = path.join(global.tmp, "luna-permission-reviewer")
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(copied, "index.ts"),
+        'export default { id: "opencode-luna-permission-reviewer", async setup() {} }',
+      ),
+    )
+    const copy = yield* modules.load({ ...operation, target: copied })
+    expect("effect" in copy && PluginModule.isSourceReviewer(copy)).toBe(false)
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(directory, "server.ts"),
+        'export default { id: "opencode-luna-permission-reviewer", async setup() {} }',
+      ),
+    )
+    const wrongEntrypoint = yield* modules.load(operation)
+    expect("effect" in wrongEntrypoint && PluginModule.isSourceReviewer(wrongEntrypoint)).toBe(false)
+  }),
 )
 
 it.live("watches creation of an external helper with missing parent directories", () =>

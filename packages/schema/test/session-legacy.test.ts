@@ -32,6 +32,8 @@ describe("SessionLegacy", () => {
     ["session.reasoning.ended.1", { ...ref, ordinal: 0, text: "thought", state: native }],
     ["session.tool.called.1", { ...ref, id: "call", input: {}, executed: true, state: native }],
     ["session.step.ended.1", { ...ref, finish: "stop", providerState: native, cost: 0, tokens }],
+    ["session.step.observed.1", { ...ref, providerState: native }],
+    ["session.step.native-ended.1", { ...ref, protocol: "response.steer", boundary: "completed", finish: "stop", providerState: native }],
     [
       "session.step.failed.1",
       { ...ref, error: { type: "provider.unknown", message: "failed" }, providerState: native },

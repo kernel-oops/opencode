@@ -56,6 +56,8 @@ export const SessionTable = sqliteTable(
     tokens_cache_write: integer().notNull().default(0),
     revert: text({ mode: "json" }).$type<Session.Revert | RevertV1>(),
     permission: text({ mode: "json" }).$type<Permission.Ruleset>(),
+    context_budget: text({ mode: "json" }).$type<Session.Info["contextBudget"]>(),
+    context_budget_state: text({ mode: "json" }).$type<Session.Info["contextBudgetState"]>(),
     agent: text().$type<Agent.ID>(),
     model: text({ mode: "json" }).$type<{
       id: string
@@ -136,8 +138,14 @@ export const SessionInboxTable = sqliteTable(
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     type: text().$type<SessionInbox.Info["type"]>().notNull(),
+    // Stored encoded: projection writes each payload through its schema's encoder.
     payload: text({ mode: "json" })
-      .$type<SessionStored.UserPayload | SyntheticPayload | CompactionPayload | MovePayload>()
+      .$type<
+        | typeof SessionStored.UserPayload.Encoded
+        | typeof SyntheticPayload.Encoded
+        | typeof CompactionPayload.Encoded
+        | typeof MovePayload.Encoded
+      >()
       .notNull(),
     delivery: text().$type<SessionInbox.Delivery>().notNull(),
     enqueued_seq: integer().notNull(),

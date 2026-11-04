@@ -33,6 +33,7 @@ import {
   CompactionConflictError,
   ForkEmptyError,
   InboxConflictError,
+  InvalidContextBudgetError,
   InvalidListCursorError,
   MessageDecodeError,
   MessageNotFoundError,
@@ -66,6 +67,7 @@ import type { FileDiff } from "@opencode/schema/file-diff"
 import { Job } from "./job.js"
 import type { Command } from "./command.js"
 import { SessionEnvironment } from "./session/environment.js"
+import { SessionDelegation } from "./session/delegation.js"
 import { InstructionEntry } from "./session/instruction-entry.js"
 
 // get project -> project.locations
@@ -108,6 +110,7 @@ export {
   CompactionConflictError,
   ForkEmptyError,
   InboxConflictError,
+  InvalidContextBudgetError,
   InvalidListCursorError,
   MessageDecodeError,
   MessageNotFoundError,
@@ -193,8 +196,18 @@ export interface Interface {
     after?: number
     follow?: boolean
   }) => Stream.Stream<SessionEvent.DurableEvent | EventLog.Synced, NotFoundError>
-  readonly switchAgent: (input: { sessionID: SessionSchema.ID; agent: Agent.ID }) => Effect.Effect<void, NotFoundError>
-  readonly switchModel: (input: { sessionID: SessionSchema.ID; model: Model.Ref }) => Effect.Effect<void, NotFoundError>
+  readonly switchAgent: (input: {
+    sessionID: SessionSchema.ID
+    agent: Agent.ID
+  }) => Effect.Effect<void, NotFoundError | SessionDelegation.BlockedError>
+  readonly switchModel: (input: {
+    sessionID: SessionSchema.ID
+    model: Model.Ref
+  }) => Effect.Effect<void, NotFoundError | SessionDelegation.BlockedError>
+  /** Internal native-ledger read check; does not change or restart the Session. */
+  readonly reconcileDelegatedModel: (
+    sessionID: SessionSchema.ID,
+  ) => Effect.Effect<void, NotFoundError | SessionDelegation.BlockedError>
   readonly rename: (input: { sessionID: SessionSchema.ID; title: string }) => Effect.Effect<void, NotFoundError>
   readonly archive: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly unarchive: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
@@ -206,6 +219,10 @@ export interface Interface {
     sessionID: SessionSchema.ID
     permissions: Permission.Ruleset
   }) => Effect.Effect<void, NotFoundError>
+  readonly setContextBudget: (input: {
+    sessionID: SessionSchema.ID
+    contextBudget: NonNullable<SessionSchema.Info["contextBudget"]> | null
+  }) => Effect.Effect<void, NotFoundError | InvalidContextBudgetError>
   readonly move: SessionMove.Interface["move"]
   readonly prompt: (
     input: Parameters<Session.Handle["prompt"]>[0] & { sessionID: SessionSchema.ID },
@@ -247,6 +264,9 @@ export interface Interface {
   readonly assistantSynthetic: (
     input: Parameters<Session.Handle["assistantSynthetic"]>[0] & { sessionID: SessionSchema.ID },
   ) => ReturnType<Session.Handle["assistantSynthetic"]>
+  readonly append: (
+    input: Parameters<Session.Handle["append"]>[0] & { sessionID: SessionSchema.ID },
+  ) => ReturnType<Session.Handle["append"]>
   readonly revert: {
     readonly stage: (input: {
       sessionID: SessionSchema.ID
@@ -500,11 +520,13 @@ const layer = Layer.effect(
       skill: (input) => sessions.forSession(input.sessionID).skill(input),
       switchAgent: (input) => sessions.forSession(input.sessionID).switchAgent(input),
       switchModel: (input) => sessions.forSession(input.sessionID).switchModel(input),
+      reconcileDelegatedModel: (sessionID) => sessions.forSession(sessionID).reconcileDelegatedModel(),
       rename: (input) => sessions.forSession(input.sessionID).rename(input),
       archive: (sessionID) => sessions.forSession(sessionID).archive(),
       unarchive: (sessionID) => sessions.forSession(sessionID).unarchive(),
       setMetadata: (input) => sessions.forSession(input.sessionID).setMetadata(input),
       setPermissions: (input) => sessions.forSession(input.sessionID).setPermissions(input),
+      setContextBudget: (input) => sessions.forSession(input.sessionID).setContextBudget(input),
       move: moves.move,
       compact: (input) => sessions.forSession(input.sessionID).compact(input),
       wait: (sessionID) => sessions.forSession(sessionID).wait(),
@@ -530,6 +552,7 @@ const layer = Layer.effect(
       resume: (sessionID) => sessions.forSession(sessionID).resume(),
       synthetic: (input) => sessions.forSession(input.sessionID).synthetic(input),
       assistantSynthetic: (input) => sessions.forSession(input.sessionID).assistantSynthetic(input),
+      append: (input) => sessions.forSession(input.sessionID).append(input),
       interrupt: (sessionID, options) => sessions.forSession(sessionID).interrupt(options),
       revert: {
         stage: (input) => sessions.forSession(input.sessionID).revert.stage(input),

@@ -5,6 +5,7 @@ import { ChildProcess } from "effect/process"
 import { Entry, Match } from "@opencode/schema/filesystem"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { collectStream, waitForAbort } from "@opencode/util/process"
+import { registerInheritedReadOnlyFds, type InheritedReadOnlyFd } from "@opencode/util/cross-spawn-spawner"
 import { Environment } from "./environment/index.js"
 import { NonNegativeInt, PositiveInt, RelativePath } from "./schema.js"
 import { RipgrepBinary } from "./ripgrep/binary.js"
@@ -57,6 +58,14 @@ export interface FindInput {
   readonly exclude?: readonly string[]
   readonly hidden?: boolean
   readonly follow?: boolean
+  /** Do not descend into other mounted filesystems. */
+  readonly oneFileSystem?: boolean
+  /** Fail instead of returning a truncated or partially decoded enumeration. */
+  readonly strict?: boolean
+  /** Keep the exact path bytes ripgrep printed rather than normalising separators. */
+  readonly preservePath?: boolean
+  /** Separate records with NUL so file names containing newlines survive. */
+  readonly nullSeparated?: boolean
   readonly signal?: AbortSignal
   readonly onEntry?: (entry: Entry) => Effect.Effect<void>
 }
@@ -67,6 +76,8 @@ export interface GlobInput {
   readonly limit: number
   readonly hidden?: boolean
   readonly follow?: boolean
+  /** Do not descend into other filesystems; used with a descriptor-bound search directory. */
+  readonly oneFileSystem?: boolean
   readonly signal?: AbortSignal
 }
 
@@ -78,7 +89,11 @@ export interface GrepInput {
   readonly literal?: boolean
   readonly caseSensitive?: boolean
   readonly limit: number
+  /** Do not descend into other filesystems; used with a descriptor-bound search directory. */
+  readonly oneFileSystem?: boolean
   readonly signal?: AbortSignal
+  /** Search an already-open descriptor (as `/proc/self/fd/N`) instead of reopening a pathname. */
+  readonly inheritedReadOnlyFds?: ReadonlyArray<InheritedReadOnlyFd>
 }
 
 export interface Interface {
@@ -114,20 +129,44 @@ const layer = Layer.effect(
       readonly parse: (line: string) => Effect.Effect<A | undefined, Error>
       readonly pattern?: string
       readonly onItem?: (item: A) => Effect.Effect<void>
+      readonly nullSeparated?: boolean
+      readonly strict?: boolean
+      readonly inheritedReadOnlyFds?: ReadonlyArray<InheritedReadOnlyFd>
     }) => {
       const program = Effect.scoped(
         Effect.gen(function* () {
           // Hosted environments will resolve rg through their driver image; the spawner is the execution seam.
-          const handle = yield* environment.spawner.spawn(
-            ChildProcess.make(yield* binary.filepath, input.args, { cwd: input.cwd, extendEnv: true, stdin: "ignore" }),
-          )
+          const command = ChildProcess.make(yield* binary.filepath, input.args, {
+            cwd: input.cwd,
+            extendEnv: true,
+            stdin: "ignore",
+          })
+          if (input.inheritedReadOnlyFds) registerInheritedReadOnlyFds(command, input.inheritedReadOnlyFds)
+          const handle = yield* environment.spawner.spawn(command)
           const stderrFiber = yield* collectStream(handle.stderr, ERROR_BYTES).pipe(
             Effect.map((output) => output.buffer.toString("utf8")),
             Effect.forkScoped,
           )
           let observed = 0
-          const rows = yield* Stream.decodeText(handle.stdout).pipe(
-            Stream.splitLines,
+          let unterminated = false
+          const records = input.nullSeparated
+            ? Stream.decodeText(handle.stdout).pipe(
+                Stream.mapAccumArray(
+                  () => "",
+                  (remainder, chunk) => {
+                    const records = `${remainder}${chunk.join("")}`.split("\0")
+                    return [records.pop() ?? "", records]
+                  },
+                  {
+                    onHalt: (remainder) => {
+                      unterminated = remainder.length > 0
+                      return []
+                    },
+                  },
+                ),
+              )
+            : Stream.decodeText(handle.stdout).pipe(Stream.splitLines)
+          const rows = yield* records.pipe(
             Stream.filter((line) => line.length > 0),
             Stream.mapEffect(input.parse),
             Stream.filter((row): row is A => row !== undefined),
@@ -139,10 +178,14 @@ const layer = Layer.effect(
             Stream.runCollect,
           )
           const truncated = rows.length > input.limit
-          if (truncated) return rows.slice(0, input.limit)
+          if (truncated) {
+            if (input.strict) return yield* failure("ripgrep enumeration was truncated")
+            return rows.slice(0, input.limit)
+          }
 
           const code = yield* handle.exitCode
           const stderr = yield* Fiber.join(stderrFiber)
+          if (unterminated) return yield* failure("ripgrep emitted an incomplete record")
           if (input.pattern && code === 2 && isInvalidPattern(stderr)) {
             return yield* new InvalidPatternError({ pattern: input.pattern, message: stderr.trim() })
           }
@@ -173,6 +216,7 @@ const layer = Layer.effect(
             "--files",
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
+            ...(input.oneFileSystem ? ["--one-file-system"] : []),
             `--glob=${input.pattern}`,
             // Positive globs override rg's hidden-file filter; exclude before applying the result limit.
             ...(input.hidden ? [] : ["--glob=!**/.*"]),
@@ -196,18 +240,24 @@ const layer = Layer.effect(
           cwd: input.cwd,
           limit: input.limit,
           signal: input.signal,
+          nullSeparated: input.nullSeparated,
+          strict: input.strict,
           args: [
             "--no-config",
             "--files",
             ...(input.hidden ? ["--hidden"] : []),
             ...(input.follow ? ["--follow"] : []),
+            ...(input.oneFileSystem ? ["--one-file-system"] : []),
+            ...(input.nullSeparated ? ["--null"] : []),
             ...(input.pattern === "*" ? [] : [`--glob=${input.pattern}`]),
             ...(input.exclude ?? []).map((pattern) => `--glob=!${pattern}`),
             "--glob=!**/.git/**",
             ".",
           ],
           parse: (line) => {
-            const relative = normalizePath(line)
+            const relative = input.preservePath
+              ? line.replace(/^(?:\.[\\/])+/u, "").replace(/^[\\/]+/u, "")
+              : normalizePath(line)
             return Effect.succeed(
               Entry.make({
                 path: RelativePath.make(relative),
@@ -220,6 +270,7 @@ const layer = Layer.effect(
       grep: (input) =>
         run<RawMatchData>({
           ...input,
+          inheritedReadOnlyFds: input.inheritedReadOnlyFds,
           args: [
             "--no-config",
             "--json",
@@ -227,6 +278,7 @@ const layer = Layer.effect(
             "--no-messages",
             ...(input.literal ? ["--fixed-strings"] : []),
             ...(input.caseSensitive === false ? ["--ignore-case"] : []),
+            ...(input.oneFileSystem ? ["--one-file-system"] : []),
             ...(input.include ? [`--glob=${input.include}`] : []),
             "--glob=!**/.git/**",
             "--",

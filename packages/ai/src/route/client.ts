@@ -176,6 +176,7 @@ export interface Interface {
 export interface StreamOptions {
   readonly http?: HttpMiddleware
   readonly webSocket?: WebSocketChannelExecutor
+  readonly providerObservation?: (observation: Record<string, unknown>) => Effect.Effect<void>
 }
 
 export interface StreamMethod {
@@ -463,15 +464,22 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
                 let state = protocol.stream.initial(request)
                 const parsed = events.pipe(
                   Stream.mapEffect(({ event, frame }) =>
-                    protocol.stream.step(state, event).pipe(
+                    (protocol.stream.steered?.is(event)
+                        ? protocol.stream.steered.finish(state, event)
+                        : protocol.stream.step(state, event)).pipe(
                       Effect.catchCause((cause) =>
                         Effect.fail(streamError(route, `Failed to parse ${route} event`, cause)),
                       ),
-                      Effect.map(([next, output]) => {
+                      Effect.flatMap(([next, output]) => {
+                        const observation = options?.providerObservation
+                          ? protocol.stream.observation?.(state, next) : undefined
                         state = next
-                        return request.includeRaw && isProviderFrame(frame)
+                        const emitted = request.includeRaw && isProviderFrame(frame)
                           ? [LLMEvent.raw({ data: execution.raw?.(frame) ?? rawFrame(frame) }), ...output]
                           : output
+                        return observation
+                          ? options!.providerObservation!(observation).pipe(Effect.as(emitted))
+                          : Effect.succeed(emitted)
                       }),
                       Effect.mapError(frameError(frame, event)),
                     ),
@@ -495,13 +503,13 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
                     error.reason.http !== undefined || execution.http === undefined
                       ? error
                       : new AIError({
-                      reason: AIErrorReason.make({
-                        ...error.reason,
-                        message: error.reason.message,
-                        cause: error.reason.cause,
-                        http: execution.http,
-                      }),
-                    }),
+                          reason: AIErrorReason.make({
+                            ...error.reason,
+                            message: error.reason.message,
+                            cause: error.reason.cause,
+                            http: execution.http,
+                          }),
+                        }),
                 ),
               )
               return execution.complete ? stream.pipe(Stream.onEnd(execution.complete)) : stream

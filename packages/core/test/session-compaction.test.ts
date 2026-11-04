@@ -24,7 +24,6 @@ import { SessionHistory } from "@opencode/core/session/history"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
-import { Token } from "@opencode/core/util/token"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { toLLMMessages } from "@opencode/core/session/runner/to-llm-message"
@@ -42,11 +41,17 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
 import { Shell } from "@opencode/schema/shell"
-import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Token } from "@opencode/core/util/token"
+import { SessionRecentText } from "@opencode/core/session/recent-text"
+import { DateTime, Deferred, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { asc, eq, inArray, sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
+import { tmpdirScoped } from "./fixture/tmpdir"
+import { Global } from "@opencode/util/global"
+import { join } from "node:path"
 
 let requests: LLMRequest[] = []
+let summaryReplies: string[] = []
 /** Runs before a request's response streams; tests hold it back to keep a background summary in flight. */
 let beforeResponse: Effect.Effect<void> = Effect.void
 let reject: ((request: LLMRequest) => boolean) | undefined
@@ -75,7 +80,7 @@ const client = Layer.mock(LLMClient.Service)({
       Stream.drain,
       Stream.concat(
         Stream.make(
-          LLMEvent.textDelta({ id: "summary", text: "## Objective\n- manual summary" }),
+          LLMEvent.textDelta({ id: "summary", text: summaryReplies.shift() ?? "## Objective\n- manual summary" }),
           LLMEvent.stepFinish({
             index: 0,
             reason: { normalized: "stop" },
@@ -105,6 +110,7 @@ const resolved = SessionRunnerModel.resolved(model, {
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
+      Agent.node,
       Database.node,
       Bus.node,
       SessionProjector.node,
@@ -116,9 +122,239 @@ const it = testEffect(
     [
       Bus.node.replace(Bus.configured({ persist: true })),
       llmClient.replace(client),
+      SessionRunnerModel.node.replace(
+        Layer.mock(SessionRunnerModel.Service)({ resolve: () => Effect.succeed(resolved) }),
+      ),
       Location.node.replace(Location.boundNode({ directory: AbsolutePath.make("/project") })),
     ],
   ),
+)
+
+const strictUser = (text: string) =>
+  SessionMessage.User.make({
+    id: SessionMessage.ID.create(),
+    type: "user",
+    text,
+    time: { created: DateTime.makeUnsafe(0) },
+  })
+
+test("strict retention counts wrappers and keeps only complete fitting trailing exchanges", () => {
+  const older = strictUser("Older exchange")
+  const middle = strictUser("Middle exchange " + "m".repeat(40_000))
+  const latest = strictUser("Latest exchange " + "z".repeat(40_000))
+  const split = SessionCompaction.splitConversation([older, middle, latest], 15_000, true)!
+  expect(split.keepID).toBe(latest.id)
+  expect(Token.estimate(`\n\n<recent-context>\n${SessionRecentText.messageToText(latest, true)}\n</recent-context>`)).toBeLessThanOrEqual(15_000)
+  const oversized = strictUser("Oversized " + "x".repeat(60_000))
+  const large = SessionCompaction.splitConversation([older, oversized], 15_000, true)!
+  expect(large.keepID).toBeUndefined()
+  // The old non-strict policy still retains the oversized newest exchange.
+  expect(SessionCompaction.splitConversation([older, oversized], 15_000)!.keepID).toBe(oversized.id)
+  const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
+    id: SessionMessage.ID.create(),
+    type: "compaction",
+    status: "completed",
+    reason: "auto",
+    summary: "previous checkpoint",
+    recent: "",
+    time: { created: 0, completed: 0 },
+  })
+  const updated = SessionCompaction.splitConversation([checkpoint, latest], 15_000, true)!
+  expect(updated.keepID).toBe(latest.id)
+})
+
+test("strict retention never truncates a fitting tool result or splits a tool exchange", () => {
+  const older = strictUser("Older exchange")
+  const latest = strictUser("Read the complete output")
+  const output = "full".repeat(2_000)
+  const assistant = Schema.decodeUnknownSync(SessionMessage.Assistant)({
+    id: SessionMessage.ID.create(),
+    type: "assistant",
+    agent: Agent.defaultID,
+    model: { id: "summary-model", providerID: "test" },
+    time: { created: 0 },
+    content: [
+      {
+        type: "tool",
+        id: "call_strict",
+        name: "read",
+        time: { created: 0 },
+        state: { status: "completed", input: {}, content: [{ type: "text", text: output }] },
+      },
+    ],
+  })
+  const split = SessionCompaction.splitConversation([older, latest, assistant], 15_000, true)!
+  expect(split.keepID).toBe(latest.id)
+  expect(SessionRecentText.messageToText(assistant, true)).toContain(`[Tool result]: ${output}`)
+  expect(SessionRecentText.messageToText(assistant, true)).not.toContain("[truncated]")
+  const tiny = SessionCompaction.splitConversation([older, latest, assistant], 100, true)!
+  expect(tiny.keepID).toBeUndefined()
+})
+
+testEffect(Layer.empty).effect("strict keepID reconstruction preserves full tool and shell output after SQLite reopen", () =>
+  Effect.gen(function* () {
+    const { path: directory } = yield* tmpdirScoped("strict-reopen-")
+    const graph = AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node]), [
+      Database.node.replace(Database.layer({ path: join(directory, "fixture.sqlite") }).pipe(
+        Layer.provide(Layer.succeed(Global.Service, Global.make({ data: directory }))),
+      )),
+    ])
+    const sessionID = Session.ID.create()
+    const older = strictUser("Earlier completed work")
+    const latest = strictUser("Keep the complete outputs")
+    const output = "full-tool-result".repeat(300)
+    const shellOutput = "full-shell-output".repeat(300)
+    const assistant = Schema.decodeUnknownSync(SessionMessage.Assistant)({
+      id: SessionMessage.ID.create(), type: "assistant", agent: Agent.defaultID, model: resolved.ref,
+      time: { created: 0, completed: 0 },
+      content: [{ type: "tool", id: "read", name: "read", time: { created: 0 },
+        state: { status: "completed", input: {}, content: [{ type: "text", text: output }] } }],
+    })
+    const shell = Schema.decodeUnknownSync(SessionMessage.Shell)({
+      id: SessionMessage.ID.create(), type: "shell", shellID: "sh_strict", command: "fixture",
+      status: "exited", exit: 0, output: { output: shellOutput, cursor: shellOutput.length, size: shellOutput.length, truncated: false }, time: { created: 0 },
+    })
+    const messages = [older, latest, assistant, shell]
+    const keepID = SessionCompaction.splitConversation(messages, 15_000, true)?.keepID
+    expect(keepID).toBe(latest.id)
+    yield* Effect.gen(function* () {
+      const session = yield* insertSession(sessionID)
+      yield* storeMessages(sessionID, messages)
+      const bus = yield* Bus.Service
+      yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: session.id, reason: "auto" })
+      yield* bus.publish(SessionEvent.Compaction.Ended, { sessionID: session.id, reason: "auto", text: "## Objective\n- fixture" },
+        { metadata: { keepID, keepStrict: true } })
+    }).pipe(Effect.scoped, Effect.provide(Layer.fresh(graph)))
+    yield* Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const [checkpoint] = yield* SessionHistory.load(db, sessionID, "local")
+      expect(checkpoint).toMatchObject({ type: "compaction", metadata: { keepID, keepStrict: true } })
+      const recent = checkpoint.type === "compaction" && checkpoint.status === "completed" ? SessionRecentText.kept(checkpoint) : ""
+      expect(recent).toContain(output)
+      expect(recent).toContain(shellOutput)
+      expect(recent).not.toContain("[truncated]")
+      expect(recent).not.toContain(older.text)
+      expect(Token.estimate(`\n\n<recent-context>\n${recent}\n</recent-context>`)).toBeLessThanOrEqual(15_000)
+    }).pipe(Effect.scoped, Effect.provide(Layer.fresh(graph)))
+  }),
+)
+
+it.effect("Haiku original reference controls strict 15k retention with a separate Sol summary agent", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    const agents = yield* Agent.Service
+    const summaryRef = resolved.ref
+    yield* agents.transform((editor) =>
+      editor.update(Agent.ID.make("compaction"), (agent) => {
+        agent.model = summaryRef
+      }),
+    )
+    yield* compaction.transform((editor) =>
+      editor.configure({
+        auto: true,
+        buffer: 80_000,
+        keep: 50_000,
+        models: Object.fromEntries(
+          ["anthropic", "claude-code"].flatMap((provider) =>
+            ["claude-haiku-5-5", "claude-haiku"].map((id) => [
+              `${provider}/${id}`,
+              { keep: { tokens: 15_000, strict: true } },
+            ]),
+          ),
+        ),
+      }),
+    )
+    for (const providerID of ["anthropic", "claude-code"]) {
+      for (const id of ["claude-haiku-5-5", "claude-haiku"]) {
+        const session = yield* insertSession(Session.ID.create())
+        const selected = SessionRunnerModel.resolved(
+          LanguageModel.make({ id, provider: providerID, route: OpenAIChat.route }),
+          {
+            capabilities: resolved.capabilities,
+            cost: [],
+            variant: id === "claude-haiku" ? Model.VariantID.make("low") : undefined,
+            limit: { context: 1_000_000, input: 170_000, output: 128_000 },
+          },
+        )
+        const measured = Schema.decodeUnknownSync(SessionMessage.Assistant)({
+          id: SessionMessage.ID.create(),
+          type: "assistant",
+          agent: Agent.defaultID,
+          model: { id, providerID },
+          content: [{ type: "text", text: "closed old work" }],
+          time: { created: 0 },
+          tokens: { input: 90_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+        const messages = [strictUser("Old context"), measured, strictUser("latest " + "x".repeat(80_000))]
+        const context = { ...loaded(session, messages), model: selected }
+        const bus = yield* Bus.Service
+        const completed = yield* bus
+          .subscribe(SessionEvent.Compaction.Ended)
+          .pipe(Stream.runHead, Effect.forkScoped({ startImmediately: true }))
+        if (id === "claude-haiku")
+          yield* bus.publish(SessionEvent.Compaction.Started, {
+            sessionID: session.id,
+            reason: "manual",
+            inputID: SessionMessage.ID.create(),
+          })
+        requests = []
+        const trigger =
+          id === "claude-haiku"
+            ? { reason: "manual" as const, context, inputID: SessionMessage.ID.create() }
+            : { reason: "auto" as const, context }
+        expect(yield* compaction.compact(trigger)).toEqual({ status: "completed" })
+        expect(requests[0].model.id).toBe(model.id)
+        expect(requests[0].generation?.maxTokens).toBeLessThanOrEqual(32_000)
+        const ended = Option.getOrThrow(yield* Fiber.join(completed))
+        expect(ended.metadata?.keepID).toBeUndefined()
+      }
+    }
+    const session = yield* insertSession(Session.ID.create())
+    const bus = yield* Bus.Service
+    const completed = yield* bus
+      .subscribe(SessionEvent.Compaction.Ended)
+      .pipe(Stream.runHead, Effect.forkScoped({ startImmediately: true }))
+    const messages = [strictUser("Old Sol context"), strictUser("latest Sol " + "x".repeat(80_000))]
+    expect(
+      yield* compaction.compact({
+        reason: "manual",
+        context: loaded(session, messages),
+        inputID: SessionMessage.ID.create(),
+      }),
+    ).toEqual({ status: "completed" })
+    expect(Option.getOrThrow(yield* Fiber.join(completed)).metadata?.keepID).toBe(messages[1].id)
+
+    const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
+      id: SessionMessage.ID.create(),
+      type: "compaction",
+      status: "completed",
+      reason: "auto",
+      summary: "s".repeat(128_000),
+      recent: "r".repeat(59_800),
+      time: { created: 1, completed: 1 },
+    })
+    const haiku = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "claude-haiku-5-5", provider: "anthropic", route: OpenAIChat.route }),
+      {
+        capabilities: resolved.capabilities,
+        cost: [],
+        limit: { context: 1_000_000, input: 170_000, output: 128_000 },
+      },
+    )
+    const rebuilt = {
+      ...loaded(session, [checkpoint, strictUser("next step")]),
+      model: haiku,
+      initial: [{ key: Instructions.Key.make("test/large"), text: "i".repeat(40_000) }],
+      tools: {
+        definitions: [
+          ToolDefinition.make({ name: "read", description: "d".repeat(8_000), inputSchema: { type: "object" } }),
+        ],
+        execute: () => Effect.die("unused"),
+      },
+    }
+    expect(SessionCompaction.estimateContext(rebuilt)).toBeLessThan(70_000)
+    expect(yield* compaction.compact({ reason: "auto", context: rebuilt })).toEqual({ status: "skipped" })
+  }),
 )
 
 test("compaction prompt preserves detailed work state and relevant files", () => {
@@ -531,6 +767,25 @@ it.effect("auto compaction estimates current content against the buffered prompt
       time: { created: 0, completed: 0 },
     })
     expect(yield* due({ ...grown, messages: [checkpoint] })).toBe(false)
+
+    yield* compaction.transform((editor) => editor.configure({ buffer: 80_000 }))
+    const haikuLimit = { context: 1_000_000, input: 170_000, output: 128_000 }
+    expect(yield* due(input(89_999, haikuLimit))).toBe(false)
+    expect(yield* due(input(90_000, haikuLimit))).toBe(true)
+    const cached = input(1, haikuLimit)
+    const anchor = cached.messages[0]
+    const cachedMessages = [
+      { ...anchor, tokens: { input: 1, output: 1, reasoning: 1, cache: { read: 89_996, write: 1 } } },
+    ]
+    expect(SessionCompaction.estimateContext({ ...cached, messages: cachedMessages })).toBe(90_000)
+    expect(yield* due({ ...cached, messages: cachedMessages })).toBe(true)
+    const before = input(89_999, haikuLimit)
+    expect(yield* due({ ...before, messages: [...before.messages, strictUser("abcd")] })).toBe(true)
+    // The shared buffer leaves subscription Sol at 420k, and large Sonnet/Opus at 920k.
+    expect(yield* due(input(419_999, { context: 1_000_000, input: 500_000, output: 128_000 }))).toBe(false)
+    expect(yield* due(input(420_000, { context: 1_000_000, input: 500_000, output: 128_000 }))).toBe(true)
+    expect(yield* due(input(919_999, { context: 1_000_000, output: 128_000 }))).toBe(false)
+    expect(yield* due(input(920_000, { context: 1_000_000, output: 128_000 }))).toBe(true)
   }),
 )
 
@@ -936,6 +1191,63 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
     ])
+  }),
+)
+
+it.effect("strict summary retry and failure retain checkpoint semantics and bill both attempts", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ keep: 15_000, strict: true }))
+    const session = yield* insertSession(Session.ID.create())
+    const messages = [strictUser("old exchange"), strictUser("latest exchange")]
+    requests = []
+    summaryReplies = ["not a summary", "## Objective\n- repaired summary"]
+    expect(yield* compactManually(session, messages)).toEqual({ status: "completed" })
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests[1].messages.at(-1))).toContain("previous response did not fill")
+    const store = yield* SessionStore.Service
+    const saved = yield* store.context(session.id)
+    expect(saved[0]).toMatchObject({
+      type: "compaction",
+      status: "completed",
+      summary: "## Objective\n- repaired summary",
+    })
+    expect((yield* store.get(session.id))?.tokens.input).toBe(20)
+
+    requests = []
+    summaryReplies = ["not a summary", "still not a summary"]
+    const inputID = SessionMessage.ID.create()
+    expect(
+      yield* compactManually(session, [...saved, strictUser("new closed work"), strictUser("new latest")], inputID),
+    ).toMatchObject({ status: "failed", error: { type: "compaction.failed" } })
+    expect(requests).toHaveLength(2)
+    const after = yield* store.context(session.id)
+    expect(after.find((message) => message.id === saved[0].id)).toMatchObject({
+      type: "compaction",
+      status: "completed",
+      summary: "## Objective\n- repaired summary",
+    })
+    expect((yield* store.get(session.id))?.tokens.input).toBe(40)
+  }),
+)
+
+it.effect("supplied handoffs remain verbatim even above generated summary limits under strict retention", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    const hooks = yield* PluginHooks.Service
+    const store = yield* SessionStore.Service
+    yield* compaction.transform((editor) => editor.configure({ keep: 15_000, strict: true }))
+    const supplied = "User-supplied checkpoint\n" + "handoff".repeat(25_000)
+    yield* hooks.register("session", "compaction", (event) =>
+      Effect.sync(() => {
+        event.result = { summary: supplied }
+      }),
+    )
+    const session = yield* insertSession(Session.ID.create())
+    requests = []
+    expect(yield* compactManually(session, [strictUser("old"), strictUser("latest")])).toEqual({ status: "completed" })
+    expect(requests).toHaveLength(0)
+    expect((yield* store.context(session.id))[0]).toMatchObject({ type: "compaction", summary: supplied })
   }),
 )
 

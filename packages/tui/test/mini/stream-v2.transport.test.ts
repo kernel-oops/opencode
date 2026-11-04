@@ -575,6 +575,36 @@ describe("V2 mini transport", () => {
     await transport.close()
   })
 
+  test.each([false, true])("accepts an informational steering terminal with observed usage: %s", async (known) => {
+    const events = feed()
+    events.push(connected())
+    const ui = footer()
+    const consumed = defer()
+    const transport = await createSessionTransport({
+      sdk: sdk({ streams: [events] }), sessionID: "ses_1", thinking: false, footer: ui.api,
+      onSessionTitle: () => consumed.resolve(),
+    })
+    events.push({
+      id: "evt_start", created: 1, type: "session.step.started", durable: durable("ses_1", 1),
+      data: { started: 1, sessionID: "ses_1", assistantMessageID: "msg_partial", agent: "build", model: { providerID: "test", id: "model" } },
+    })
+    events.push({
+      id: "evt_steered", created: 2, type: "session.step.interrupted", durable: durable("ses_1", 2),
+      data: { sessionID: "ses_1", assistantMessageID: "msg_partial", reason: "steer",
+        ...(known ? { cost: 0, tokens: { input: 10, output: 4, reasoning: 0, cache: { read: 0, write: 0 } } } : {}),
+      },
+    })
+    events.push({
+      id: "evt_barrier", created: 3, type: "session.renamed", durable: durable("ses_1", 3),
+      data: { sessionID: "ses_1", title: "Correction" },
+    })
+    await consumed.promise
+    expect(ui.events.some((event) => event.type === "stream.patch" && event.patch.usage)).toBe(known)
+    if (known) expect(ui.events).toContainEqual({ type: "stream.patch", patch: { usage: { tokens: 14 } } })
+    expect(ui.commits.some((commit) => commit.kind === "error")).toBe(false)
+    await transport.close()
+  })
+
   test("preserves numeric footer tokens, context percentage, and cost-only usage", async () => {
     const events = feed()
     events.push(connected())

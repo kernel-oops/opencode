@@ -2742,7 +2742,10 @@ it.effect("waits for permission before calling an MCP tool", () =>
       action: "demo_search",
       resources: ["*"],
       save: ["*"],
-      metadata: { input: { query: "open issues" } },
+      metadata: {
+        input: { query: "open issues" },
+        action: { identity: "demo_search", arguments: { query: "open issues" }, cwd: expect.any(String), complete: true },
+      },
       sessionID: Session.ID.make("ses_mcp_permission"),
       agent: toolIdentity.agent,
       source: {

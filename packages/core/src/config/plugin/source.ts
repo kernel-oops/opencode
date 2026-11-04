@@ -19,11 +19,20 @@ export type Operation =
       readonly target: string
       readonly options: Record<string, unknown>
       readonly mtime?: number
+      /** Declaration document, retained privately for loader authentication. */
+      readonly document?: string
     }
   | {
       readonly type: "remove"
       readonly target: string
     }
+
+// Origin belongs to the scanner, not a property a plugin or SDK contributor can forge.
+const declarations = new WeakMap<object, { document: string; fingerprint: string }>()
+export const declaration = (operation: Operation) => {
+  const origin = declarations.get(operation)
+  return origin?.fingerprint === JSON.stringify(operation) ? origin.document : undefined
+}
 
 export interface Interface {
   readonly operations: () => Effect.Effect<readonly Operation[], never, Scope.Scope>
@@ -142,7 +151,7 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
           : operation.target.startsWith("./") || operation.target.startsWith("../")
             ? path.resolve(directory, operation.target)
             : operation.target
-        return { ...operation, target }
+        return { ...operation, target, document: entry.path }
       }),
     )
   const resolved = yield* Effect.forEach(configured, (operation) =>
@@ -187,7 +196,16 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
       )
       return [{ ...operation, mtime: Math.max(...times) }]
     }),
-  ).pipe(Effect.map((operations) => operations.flat()))
+  ).pipe(
+    Effect.map((operations) => {
+      const flattened = operations.flat()
+      for (const operation of flattened) {
+        if (operation.type === "add" && operation.document)
+          declarations.set(operation, { document: operation.document, fingerprint: JSON.stringify(operation) })
+      }
+      return flattened
+    }),
+  )
 })
 
 function isPluginSource(entries: readonly Entry[], file: string) {

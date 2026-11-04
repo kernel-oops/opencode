@@ -7,7 +7,7 @@ import { Agent } from "@opencode/core/agent"
 import { testEffect } from "./lib/effect"
 import { makePluginTestLayer } from "./plugin/fixture"
 
-const it = testEffect(makePluginTestLayer(undefined, undefined, true))
+const it = testEffect(makePluginTestLayer(null))
 
 for (const scope of [undefined, "request"] as const) {
   it.effect(`plugin rejection preserves the requested scope (${scope ?? "session"})`, () =>

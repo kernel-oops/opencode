@@ -6,16 +6,27 @@ import { GuiBundle } from "@opencode/schema/plugin"
 import { createPluginSources } from "@opencode/plugin/source"
 import { Hash } from "@opencode/util/hash"
 import { Npm } from "@opencode/util/npm"
-import { Deferred, Effect, FiberSet, PubSub, Schema, Stream } from "effect"
+import { Deferred, Effect, FiberSet, Option, PubSub, Schema, Stream } from "effect"
 import path from "path"
-import { readFile, stat } from "node:fs/promises"
+import { readFile, realpath, stat } from "node:fs/promises"
+import { Global } from "@opencode/util/global"
 import { fileURLToPath, pathToFileURL } from "url"
-import type { ConfigPluginSource } from "../config/plugin/source.js"
+import { ConfigPluginSource } from "../config/plugin/source.js"
 import type { Generation } from "../plugin.js"
 import { PluginPromise } from "./promise.js"
 import { Config } from "../config.js"
 import { ManagedPolicy } from "../managed-policy.js"
 import { Watcher } from "../filesystem/watcher.js"
+
+// Only the actual loader can enrol a generation; callers cannot mint reviewer provenance.
+const sourceReviewers = new WeakMap<Generation, { id: string; revision: string; source: string; effect: Generation["effect"] }>()
+export const isSourceReviewer = (generation: Generation) => {
+  const origin = sourceReviewers.get(generation)
+  return origin !== undefined && origin.id === generation.id && origin.revision === generation.revision &&
+    origin.source === JSON.stringify(generation.source) && origin.effect === generation.effect
+}
+export const isModelReviewer = (generation: Generation) =>
+  isSourceReviewer(generation) && generation.id === "opencode-luna-permission-reviewer"
 
 export const make = Effect.fn("PluginModule.make")(function* () {
   const config = yield* Config.Service
@@ -142,7 +153,8 @@ const load = Effect.fn("PluginModule.load")(function* (
         ),
       )
     : {}
-  return {
+  const pluginOptions = structuredClone(operation.options)
+  const generation = {
     id: plugin.id,
     features: {
       ...(entrypoint ? { server: true as const } : {}),
@@ -162,8 +174,35 @@ const load = Effect.fn("PluginModule.load")(function* (
           target: operation.target,
           ...(installed?.version ? { version: installed.version } : {}),
         },
-    effect: (host) => plugin.effect({ ...host, options: operation.options }),
+    effect: (host) => plugin.effect({ ...host, options: structuredClone(pluginOptions) }),
   } satisfies Generation
+  const global = yield* Effect.serviceOption(Global.Service)
+  const reviewers = [
+    ["bash-permission-evaluator", "opencode-bash-permission-evaluator"],
+    ["luna-permission-reviewer", "opencode-luna-permission-reviewer"],
+  ] as const
+  const reviewer = reviewers.find(([, id]) => id === plugin.id)
+  const declaration = ConfigPluginSource.declaration(operation)
+  if (reviewer && declaration && local && entrypoint && Option.isSome(global)) {
+    const verified = yield* Effect.tryPromise({
+      try: async () => {
+        const root = await realpath(global.value.config)
+        if (!["opencode.json", "opencode.jsonc"].some((name) =>
+          path.resolve(declaration) === path.resolve(global.value.config, name))) return false
+        const document = await realpath(declaration)
+        if (![path.join(root, "opencode.json"), path.join(root, "opencode.jsonc")].includes(document)) return false
+        const expected = path.join(root, "plugins", reviewer[0])
+        // Directory symlinks, copied implementations and alternative entries are not the global reviewer.
+        if ((await realpath(operation.target)) !== expected) return false
+        return (await realpath(fileURLToPath(entrypoint))) === path.join(expected, "index.ts")
+      },
+      catch: () => false,
+    }).pipe(Effect.orElseSucceed(() => false))
+    if (verified) sourceReviewers.set(generation, {
+      id: generation.id, revision: generation.revision, source: JSON.stringify(generation.source), effect: generation.effect,
+    })
+  }
+  return generation
 })
 
 const loadServer = Effect.fn("PluginModule.loadServer")(function* (

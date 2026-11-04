@@ -194,6 +194,7 @@ export type SessionUpdateInput = {
   readonly title?: string | undefined
   readonly metadata?: Session.Metadata | undefined
   readonly permissions?: Permission.Ruleset | undefined
+  readonly contextBudget?: { readonly target: number; readonly maximum: number } | null | undefined
   readonly archived?: boolean | undefined
 }
 export type SessionUpdateOutput = void
@@ -246,6 +247,18 @@ export type SessionSyntheticOutput = SessionInbox.Synthetic
 export type SessionSyntheticOperation<E = never> = (
   input: SessionSyntheticInput,
 ) => Effect.Effect<SessionSyntheticOutput, E>
+
+export type SessionAppendInput = {
+  readonly sessionID: Session.ID
+  readonly id?: SessionMessage.ID | undefined
+  readonly text: string
+  readonly final?: boolean | undefined
+  readonly agent?: Agent.ID | undefined
+  readonly model?: Model.Ref | undefined
+  readonly metadata?: { readonly [x: string]: unknown } | undefined
+}
+export type SessionAppendOutput = { readonly id: SessionMessage.ID }
+export type SessionAppendOperation<E = never> = (input: SessionAppendInput) => Effect.Effect<SessionAppendOutput, E>
 
 export type SessionShellInput = {
   readonly sessionID: Session.ID
@@ -332,6 +345,39 @@ export type SessionInterruptOperation<E = never> = (
   input: SessionInterruptInput,
 ) => Effect.Effect<SessionInterruptOutput, E>
 
+export type SessionTaskStatusInput = { readonly sessionID: Session.ID }
+export type SessionTaskStatusOutput = {
+  readonly paused: boolean
+  readonly active: boolean
+  readonly background: ReadonlyArray<{
+    readonly sessionID: Session.ID
+    readonly agent: string
+    readonly description: string
+    readonly status: "running" | "completed" | "error" | "cancelled"
+  }>
+}
+export type SessionTaskStatusOperation<E = never> = (
+  input: SessionTaskStatusInput,
+) => Effect.Effect<SessionTaskStatusOutput, E>
+
+export type SessionTaskStopResponseInput = { readonly sessionID: Session.ID }
+export type SessionTaskStopResponseOutput = { readonly interrupted: boolean; readonly paused: boolean }
+export type SessionTaskStopResponseOperation<E = never> = (
+  input: SessionTaskStopResponseInput,
+) => Effect.Effect<SessionTaskStopResponseOutput, E>
+
+export type SessionTaskResumeInput = { readonly sessionID: Session.ID }
+export type SessionTaskResumeOutput = { readonly resumed: boolean }
+export type SessionTaskResumeOperation<E = never> = (
+  input: SessionTaskResumeInput,
+) => Effect.Effect<SessionTaskResumeOutput, E>
+
+export type SessionTaskStopAllInput = { readonly sessionID: Session.ID }
+export type SessionTaskStopAllOutput = { readonly interrupted: boolean; readonly cancelled: ReadonlyArray<Session.ID> }
+export type SessionTaskStopAllOperation<E = never> = (
+  input: SessionTaskStopAllInput,
+) => Effect.Effect<SessionTaskStopAllOutput, E>
+
 export type SessionBackgroundInput = { readonly sessionID: Session.ID }
 export type SessionBackgroundOutput = void
 export type SessionBackgroundOperation<E = never> = (
@@ -413,6 +459,7 @@ export interface SessionApi<E = never> {
   readonly prompt: SessionPromptOperation<E>
   readonly command: SessionCommandOperation<E>
   readonly synthetic: SessionSyntheticOperation<E>
+  readonly append: SessionAppendOperation<E>
   readonly shell: SessionShellOperation<E>
   readonly compact: SessionCompactOperation<E>
   readonly revert: {
@@ -429,6 +476,12 @@ export interface SessionApi<E = never> {
   }
   readonly generate: SessionGenerateOperation<E>
   readonly interrupt: SessionInterruptOperation<E>
+  readonly task: {
+    readonly status: SessionTaskStatusOperation<E>
+    readonly stopResponse: SessionTaskStopResponseOperation<E>
+    readonly resume: SessionTaskResumeOperation<E>
+    readonly stopAll: SessionTaskStopAllOperation<E>
+  }
   readonly background: SessionBackgroundOperation<E>
   readonly message: { readonly get: SessionMessageGetOperation<E> }
   readonly form: {
@@ -455,6 +508,15 @@ export interface SessionApi<E = never> {
 
   /** @deprecated Use `client.experimental.session.wait`. Removed in the next minor. */
   readonly wait: ExperimentalSessionWaitOperation<E>
+
+  /** @deprecated Use `client.experimental.session.nativeTest`. Removed in the next minor. */
+  readonly nativeTest: {
+    /** @deprecated Use `client.experimental.session.nativeTest.get`. Removed in the next minor. */
+    readonly get: ExperimentalSessionNativeTestGetOperation<E>
+
+    /** @deprecated Use `client.experimental.session.nativeTest.put`. Removed in the next minor. */
+    readonly put: ExperimentalSessionNativeTestPutOperation<E>
+  }
 
   /** @deprecated Use `client.experimental.session.instructions`. Removed in the next minor. */
   readonly instructions: {
@@ -576,6 +638,232 @@ export type ExperimentalSessionWaitOutput = void
 export type ExperimentalSessionWaitOperation<E = never> = (
   input: ExperimentalSessionWaitInput,
 ) => Effect.Effect<ExperimentalSessionWaitOutput, E>
+
+export type ExperimentalSessionNativeTestGetInput = { readonly sessionID: Session.ID }
+export type ExperimentalSessionNativeTestGetOutput = {
+  readonly sessionID: Session.ID
+  readonly serverRun: string
+  readonly requested: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+  readonly effective: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+  readonly pending: boolean
+  readonly supported: boolean
+  readonly reason:
+    | "not-requested"
+    | "allowed"
+    | "active"
+    | "allowance-missing"
+    | "protocol-unsupported"
+    | "native-interrupt-conflict"
+    | "model-unavailable"
+  readonly execution?:
+    | {
+        readonly id: number
+        readonly active: boolean
+        readonly settings: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+        readonly transport?: "http" | "websocket" | undefined
+        readonly reason?:
+          | (
+              | "not-requested"
+              | "allowed"
+              | "active"
+              | "allowance-missing"
+              | "protocol-unsupported"
+              | "native-interrupt-conflict"
+              | "model-unavailable"
+            )
+          | undefined
+      }
+    | undefined
+  readonly unresolvedFence: boolean
+  readonly diagnostics: {
+    readonly records: ReadonlyArray<{
+      readonly seq: number
+      readonly at: number
+      readonly execution: number
+      readonly exchange: number
+      readonly kind:
+        | "execution-started"
+        | "execution-finished"
+        | "channel-retired"
+        | "connect"
+        | "connect-failed"
+        | "reuse"
+        | "rotate"
+        | "send"
+        | "send-not-sent"
+        | "send-ambiguous"
+        | "fallback"
+        | "parent-created"
+        | "steer-sent"
+        | "steer-send-unknown"
+        | "steer-accepted"
+        | "progress"
+        | "terminal"
+        | "lease"
+        | "handoff"
+        | "successor-created"
+        | "adopt"
+        | "timer-armed"
+        | "timer-expired"
+        | "timer-cancelled"
+        | "closed"
+        | "poisoned"
+      readonly category?:
+        | (
+            | "affinity"
+            | "age"
+            | "completed"
+            | "interrupted"
+            | "steered"
+            | "incomplete"
+            | "provider-failure"
+            | "rejected"
+            | "ready"
+            | "required-input"
+            | "lease-lost"
+            | "successor-timeout"
+            | "unbound-successor"
+            | "unexpected-frame"
+            | "transport-or-decoder-failure"
+            | "receipt"
+            | "parent-idle"
+            | "drain"
+            | "stream-failures"
+            | "message-too-large"
+            | "connect-failure"
+            | "not-sent"
+            | "peer-close"
+            | "transport"
+          )
+        | undefined
+      readonly count?: number | undefined
+      readonly budgetMs?: number | undefined
+      readonly elapsedMs?: number | undefined
+      readonly closeCode?: number | undefined
+    }>
+    readonly dropped: number
+    readonly coalesced: number
+    readonly progress: number
+  }
+}
+export type ExperimentalSessionNativeTestGetOperation<E = never> = (
+  input: ExperimentalSessionNativeTestGetInput,
+) => Effect.Effect<ExperimentalSessionNativeTestGetOutput, E>
+
+export type ExperimentalSessionNativeTestPutInput = {
+  readonly sessionID: Session.ID
+  readonly nativeSteer: false | "response.steer"
+  readonly debug: false | "metadata"
+}
+export type ExperimentalSessionNativeTestPutOutput = {
+  readonly sessionID: Session.ID
+  readonly serverRun: string
+  readonly requested: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+  readonly effective: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+  readonly pending: boolean
+  readonly supported: boolean
+  readonly reason:
+    | "not-requested"
+    | "allowed"
+    | "active"
+    | "allowance-missing"
+    | "protocol-unsupported"
+    | "native-interrupt-conflict"
+    | "model-unavailable"
+  readonly execution?:
+    | {
+        readonly id: number
+        readonly active: boolean
+        readonly settings: { readonly nativeSteer: false | "response.steer"; readonly debug: false | "metadata" }
+        readonly transport?: "http" | "websocket" | undefined
+        readonly reason?:
+          | (
+              | "not-requested"
+              | "allowed"
+              | "active"
+              | "allowance-missing"
+              | "protocol-unsupported"
+              | "native-interrupt-conflict"
+              | "model-unavailable"
+            )
+          | undefined
+      }
+    | undefined
+  readonly unresolvedFence: boolean
+  readonly diagnostics: {
+    readonly records: ReadonlyArray<{
+      readonly seq: number
+      readonly at: number
+      readonly execution: number
+      readonly exchange: number
+      readonly kind:
+        | "execution-started"
+        | "execution-finished"
+        | "channel-retired"
+        | "connect"
+        | "connect-failed"
+        | "reuse"
+        | "rotate"
+        | "send"
+        | "send-not-sent"
+        | "send-ambiguous"
+        | "fallback"
+        | "parent-created"
+        | "steer-sent"
+        | "steer-send-unknown"
+        | "steer-accepted"
+        | "progress"
+        | "terminal"
+        | "lease"
+        | "handoff"
+        | "successor-created"
+        | "adopt"
+        | "timer-armed"
+        | "timer-expired"
+        | "timer-cancelled"
+        | "closed"
+        | "poisoned"
+      readonly category?:
+        | (
+            | "affinity"
+            | "age"
+            | "completed"
+            | "interrupted"
+            | "steered"
+            | "incomplete"
+            | "provider-failure"
+            | "rejected"
+            | "ready"
+            | "required-input"
+            | "lease-lost"
+            | "successor-timeout"
+            | "unbound-successor"
+            | "unexpected-frame"
+            | "transport-or-decoder-failure"
+            | "receipt"
+            | "parent-idle"
+            | "drain"
+            | "stream-failures"
+            | "message-too-large"
+            | "connect-failure"
+            | "not-sent"
+            | "peer-close"
+            | "transport"
+          )
+        | undefined
+      readonly count?: number | undefined
+      readonly budgetMs?: number | undefined
+      readonly elapsedMs?: number | undefined
+      readonly closeCode?: number | undefined
+    }>
+    readonly dropped: number
+    readonly coalesced: number
+    readonly progress: number
+  }
+}
+export type ExperimentalSessionNativeTestPutOperation<E = never> = (
+  input: ExperimentalSessionNativeTestPutInput,
+) => Effect.Effect<ExperimentalSessionNativeTestPutOutput, E>
 
 export type ExperimentalSessionInstructionsEntryListInput = { readonly sessionID: Session.ID }
 export type ExperimentalSessionInstructionsEntryListOutput = ReadonlyArray<InstructionEntry.Info>
@@ -716,6 +1004,52 @@ export type ExperimentalSessionLogOutput =
           readonly id: Event.ID
           readonly created: number
           readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.context-budget.configured"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly policy: { readonly target: number; readonly maximum: number } | null
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.context-budget.changed"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly state: {
+              readonly attempted?: { readonly binding: string; readonly estimated: number } | undefined
+              readonly blocked?:
+                | {
+                    readonly reason: string
+                    readonly model?: Model.Ref | undefined
+                    readonly inputMargin?: number | undefined
+                    readonly estimated?: number | undefined
+                    readonly raw?: number | undefined
+                    readonly replayGenerated?: number | undefined
+                    readonly input?: number | undefined
+                    readonly output?: number | undefined
+                    readonly inputMaximum?: number | undefined
+                    readonly contextMaximum?: number | undefined
+                    readonly maximum: number
+                    readonly selection: string
+                  }
+                | undefined
+            } | null
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
           readonly type: "session.viewed"
           readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
           readonly location?:
@@ -835,6 +1169,114 @@ export type ExperimentalSessionLogOutput =
             | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
             | undefined
           readonly data: { readonly sessionID: Session.ID }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.requested"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly attemptID: Event.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly steer?:
+              | {
+                  readonly version: 1
+                  readonly protocol: "response.steer"
+                  readonly inboxIDs: readonly [SessionMessage.ID, ...Array<SessionMessage.ID>]
+                  readonly parentResponseID: string
+                  readonly model: Model.Ref
+                }
+              | undefined
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.accepted"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly attemptID: Event.ID; readonly steerID: string }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.continuation-requested"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly attemptID: Event.ID
+            readonly callIDs: readonly [string, ...Array<string>]
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.committed"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly attemptID: Event.ID
+            readonly successorResponseID: string
+            readonly successorAssistantID: SessionMessage.ID
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.rejected"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: { readonly sessionID: Session.ID; readonly attemptID: Event.ID; readonly code: string }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.settled"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly attemptID: Event.ID
+            readonly outcome: "verified" | "completed" | "user-recovery"
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.native-control.unresolved"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly attemptID: Event.ID
+            readonly message: string
+            readonly wireBody?: string | undefined
+          }
         }
       | {
           readonly id: Event.ID
@@ -992,6 +1434,50 @@ export type ExperimentalSessionLogOutput =
           readonly id: Event.ID
           readonly created: number
           readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.step.observed"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly native: { readonly [x: string]: Schema.Json }
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.step.interrupted"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly reason: "steer"
+            readonly nativeReceipt?:
+              | { readonly responseID: string; readonly output: ReadonlyArray<unknown> }
+              | undefined
+            readonly cost?: Money.USD | undefined
+            readonly tokens?:
+              | {
+                  readonly input: number
+                  readonly output: number
+                  readonly reasoning: number
+                  readonly cache: { readonly read: number; readonly write: number }
+                }
+              | undefined
+            readonly snapshot?: Snapshot.ID | undefined
+            readonly files?: ReadonlyArray<RelativePath> | undefined
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
           readonly type: "session.step.ended"
           readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
           readonly location?:
@@ -1003,13 +1489,47 @@ export type ExperimentalSessionLogOutput =
             readonly finish: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
             readonly rawFinish?: string | undefined
             readonly native?: SessionMessage.Native | undefined
-            readonly cost: Money.USD
-            readonly tokens: {
-              readonly input: number
-              readonly output: number
-              readonly reasoning: number
-              readonly cache: { readonly read: number; readonly write: number }
-            }
+            readonly cost?: Money.USD | undefined
+            readonly tokens?:
+              | {
+                  readonly input: number
+                  readonly output: number
+                  readonly reasoning: number
+                  readonly cache: { readonly read: number; readonly write: number }
+                }
+              | undefined
+            readonly snapshot?: Snapshot.ID | undefined
+            readonly files?: ReadonlyArray<RelativePath> | undefined
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.step.native-ended"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly assistantMessageID: SessionMessage.ID
+            readonly protocol: "response.steer"
+            readonly boundary: "steered" | "completed"
+            readonly finish: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
+            readonly rawFinish?: string | undefined
+            readonly native?: SessionMessage.Native | undefined
+            readonly usage?:
+              | {
+                  readonly cost: Money.USD
+                  readonly tokens: {
+                    readonly input: number
+                    readonly output: number
+                    readonly reasoning: number
+                    readonly cache: { readonly read: number; readonly write: number }
+                  }
+                }
+              | undefined
             readonly snapshot?: Snapshot.ID | undefined
             readonly files?: ReadonlyArray<RelativePath> | undefined
           }
@@ -1302,6 +1822,7 @@ export type ExperimentalSessionLogOutput =
             readonly model?: Model.Ref | undefined
             readonly native?: SessionMessage.Native | undefined
             readonly text: string
+            readonly checkpoint?: SessionMessage.CheckpointBinding | undefined
             readonly cost?: Money.USD | undefined
             readonly tokens?:
               | {
@@ -1425,6 +1946,10 @@ export interface ExperimentalSessionApi<E = never> {
   readonly export: ExperimentalSessionExportOperation<E>
   readonly skill: ExperimentalSessionSkillOperation<E>
   readonly wait: ExperimentalSessionWaitOperation<E>
+  readonly nativeTest: {
+    readonly get: ExperimentalSessionNativeTestGetOperation<E>
+    readonly put: ExperimentalSessionNativeTestPutOperation<E>
+  }
   readonly instructions: {
     readonly entry: {
       readonly list: ExperimentalSessionInstructionsEntryListOperation<E>
@@ -1480,8 +2005,12 @@ export interface ModelApi<E = never> {
   readonly default: ModelDefaultOperation<E>
 }
 
-export type ExperimentalGenerateTextInput = { readonly prompt: string; readonly model?: Model.Ref | undefined }
-export type ExperimentalGenerateTextOutput = { readonly text: string }
+export type ExperimentalGenerateTextInput = {
+  readonly prompt: string
+  readonly model?: Model.Ref | undefined
+  readonly responseSchema?: Generate.ResponseSchema | undefined
+}
+export type ExperimentalGenerateTextOutput = Generate.Result
 export type ExperimentalGenerateTextOperation<E = never> = (
   input: ExperimentalGenerateTextInput,
 ) => Effect.Effect<ExperimentalGenerateTextOutput, E>
@@ -2063,6 +2592,8 @@ export type EventSubscribeInput = {
         | "session.renamed"
         | "session.metadata.updated"
         | "session.permissions"
+        | "session.context-budget.configured"
+        | "session.context-budget.changed"
         | "session.viewed"
         | "session.archived"
         | "session.unarchived"
@@ -2074,6 +2605,13 @@ export type EventSubscribeInput = {
         | "session.inbox.cancelled"
         | "session.inbox.delivery.changed"
         | "session.execution.started"
+        | "session.native-control.requested"
+        | "session.native-control.accepted"
+        | "session.native-control.continuation-requested"
+        | "session.native-control.committed"
+        | "session.native-control.rejected"
+        | "session.native-control.settled"
+        | "session.native-control.unresolved"
         | "session.execution.succeeded"
         | "session.execution.failed"
         | "session.execution.interrupted"
@@ -2084,7 +2622,10 @@ export type EventSubscribeInput = {
         | "session.shell.ended"
         | "session.step.started"
         | "session.step.streamed"
+        | "session.step.observed"
+        | "session.step.interrupted"
         | "session.step.ended"
+        | "session.step.native-ended"
         | "session.step.failed"
         | "session.text.started"
         | "session.text.delta"
@@ -2827,6 +3368,24 @@ export type SessionWaitOutput = ExperimentalSessionWaitOutput
 
 /** @deprecated Use `ExperimentalSessionWaitOperation`. Removed in the next minor. */
 export type SessionWaitOperation<E = never> = ExperimentalSessionWaitOperation<E>
+
+/** @deprecated Use `ExperimentalSessionNativeTestGetInput`. Removed in the next minor. */
+export type SessionNativeTestGetInput = ExperimentalSessionNativeTestGetInput
+
+/** @deprecated Use `ExperimentalSessionNativeTestGetOutput`. Removed in the next minor. */
+export type SessionNativeTestGetOutput = ExperimentalSessionNativeTestGetOutput
+
+/** @deprecated Use `ExperimentalSessionNativeTestGetOperation`. Removed in the next minor. */
+export type SessionNativeTestGetOperation<E = never> = ExperimentalSessionNativeTestGetOperation<E>
+
+/** @deprecated Use `ExperimentalSessionNativeTestPutInput`. Removed in the next minor. */
+export type SessionNativeTestPutInput = ExperimentalSessionNativeTestPutInput
+
+/** @deprecated Use `ExperimentalSessionNativeTestPutOutput`. Removed in the next minor. */
+export type SessionNativeTestPutOutput = ExperimentalSessionNativeTestPutOutput
+
+/** @deprecated Use `ExperimentalSessionNativeTestPutOperation`. Removed in the next minor. */
+export type SessionNativeTestPutOperation<E = never> = ExperimentalSessionNativeTestPutOperation<E>
 
 /** @deprecated Use `ExperimentalSessionInstructionsEntryListInput`. Removed in the next minor. */
 export type SessionInstructionsEntryListInput = ExperimentalSessionInstructionsEntryListInput

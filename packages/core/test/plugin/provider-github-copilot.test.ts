@@ -43,7 +43,8 @@ const sessions = Effect.fn(function* () {
   const location = yield* Location.Service
   const parent = yield* service.create({ location: { directory: location.directory } })
   const child = yield* service.create({ parentID: parent.id })
-  return { parent: parent.id, child: child.id }
+  const grandchild = yield* service.create({ parentID: child.id })
+  return { parent: parent.id, child: grandchild.id }
 })
 
 const modelRequest = Effect.fn(function* (sessionID: Session.ID, kind: SessionRequestKind, agent = "build") {

@@ -2343,7 +2343,7 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
-  it.effect("preserves standard refusal content as ordinary assistant text", () =>
+  it.effect("preserves standard refusal text while marking the response filtered", () =>
     Effect.gen(function* () {
       const response = yield* LLMClient.generate(request).pipe(
         Effect.provide(
@@ -2406,7 +2406,7 @@ describe("OpenAI Responses route", () => {
       )
 
       expect(response.text).toBe("I can't help with that.")
-      expect(response.finishReason).toEqual({ normalized: "stop", raw: undefined })
+      expect(response.finishReason).toEqual({ normalized: "content-filter", raw: undefined })
       expect(response.message.content).toEqual([
         {
           type: "text",

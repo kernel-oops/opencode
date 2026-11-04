@@ -21,6 +21,7 @@ import { SessionMessage } from "./message.js"
 import { SessionProjector } from "./projector.js"
 import { SessionRunner } from "./runner/index.js"
 import { SessionStore } from "./store.js"
+import { SessionDelegation } from "./delegation.js"
 
 export class DestinationNotFoundError extends Schema.TaggedError<DestinationNotFoundError>()(
   "Session.DestinationNotFoundError",
@@ -45,7 +46,11 @@ export interface Interface {
     delivery?: SessionInbox.Delivery
   }) => Effect.Effect<
     void,
-    NotFoundError | DestinationNotFoundError | DestinationNotDirectoryError | DestinationUnavailableError
+    | NotFoundError
+    | DestinationNotFoundError
+    | DestinationNotDirectoryError
+    | DestinationUnavailableError
+    | SessionDelegation.BlockedError
   >
 }
 
@@ -118,14 +123,15 @@ const layer = Layer.effect(
     return Service.of({
       move: Effect.fn("SessionMove.move")(function* (input) {
         const session = yield* get(input.sessionID)
+        yield* SessionDelegation.protect(database.db, input.sessionID)
         const destination = yield* resolveDestination(session, input)
         // Probe outside the inbox lock so cancellation remains available during initialization.
         const unavailable = yield* sourceUnavailable(session)
-        const item = SessionInbox.Item.make({
-          type: "move",
+        const item = {
+          type: "move" as const,
           payload: destination,
           delivery: input.delivery ?? "steer",
-        })
+        } satisfies SessionInbox.Item
         yield* SessionInbox.serialized(
           input.sessionID,
           Effect.gen(function* () {
@@ -146,7 +152,7 @@ const layer = Layer.effect(
               return yield* bus.publishAll([first, ...cancellations.slice(1), moved])
             }
             yield* admission
-              .admit({
+              .admitMoveLocked({
                 id: SessionMessage.ID.create(),
                 sessionID: input.sessionID,
                 item,

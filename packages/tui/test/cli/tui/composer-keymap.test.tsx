@@ -36,7 +36,10 @@ async function renderComposer(
   defaultTab: "subagents" | "shell",
   keybinds: Partial<TuiKeybind.Keybinds>,
   focusedTextarea = false,
+  nested = false,
+  width = 100,
 ) {
+  const inventory = nested ? { ...sessions, grand: session("grand", "Nested worker", "child-c") } : sessions
   const events = createEventStream()
   const interrupted: string[] = []
   const removed: string[] = []
@@ -47,9 +50,15 @@ async function renderComposer(
   let route!: ReturnType<typeof useRoute>
   const calls = createFetch((url, request) => {
     if (url.pathname === "/api/session/active")
-      return json({ data: { "child-a": { type: "running" }, "child-b": { type: "running" } } })
+      return json({
+        data: {
+          "child-a": { type: "running" },
+          "child-b": { type: "running" },
+          ...(nested ? { grand: { type: "running" } } : {}),
+        },
+      })
     const sessionID = url.pathname.match(/^\/api\/session\/([^/]+)$/)?.[1]
-    if (sessionID && sessionID in sessions) return json({ data: sessions[sessionID as keyof typeof sessions] })
+    if (sessionID && sessionID in inventory) return json({ data: inventory[sessionID as keyof typeof inventory] })
     const interruptID = url.pathname.match(/^\/api\/session\/([^/]+)\/interrupt$/)?.[1]
     if (interruptID && request.method === "POST") {
       interrupted.push(interruptID)
@@ -81,13 +90,7 @@ async function renderComposer(
     route = useRoute()
     dispatch = Keymap.use().dispatch
     onMount(() => {
-      void Promise.all([
-        data.session.sync("parent"),
-        data.session.sync("child-a"),
-        data.session.sync("child-b"),
-        data.session.sync("child-c"),
-        data.shell.sync(),
-      ])
+      void Promise.all([...Object.keys(inventory).map((id) => data.session.sync(id)), data.shell.sync()])
         .then(() => wait(() => data.session.status("child-a") === "running"))
         .then(() => ready.resolve(), ready.reject)
     })
@@ -142,7 +145,7 @@ async function renderComposer(
         </TuiAppProvider>
       </TestTuiContexts>
     ),
-    { width: 100, height: 20, kittyKeyboard: true },
+    { width, height: 20, kittyKeyboard: true },
   )
   await ready.promise
   await app.renderOnce()
@@ -204,6 +207,28 @@ test("the inactive subagent filter only changes with its toggle", async () => {
     await composer.app.renderOnce()
     expect(composer.app.captureCharFrame()).toContain("First")
     expect(composer.app.captureCharFrame()).not.toContain("Third")
+  } finally {
+    composer.app.renderer.destroy()
+  }
+})
+
+test.each([48, 100])("active grandchildren keep navigable idle ancestors at width %s", async (width) => {
+  const composer = await renderComposer("subagents", {}, false, true, width)
+  try {
+    const frame = composer.app.captureCharFrame()
+    expect(frame).toContain("Third")
+    expect(frame).toContain("└─ Build: Nested worker")
+    expect(frame.indexOf("Third")).toBeLessThan(frame.indexOf("Nested worker"))
+    composer.dispatch("composer.subagent.down")
+    composer.dispatch("composer.subagent.down")
+    composer.dispatch("composer.subagent.interrupt")
+    expect(composer.interrupted).toEqual([])
+    composer.dispatch("composer.subagent.select")
+    expect(composer.route()).toMatchObject({ type: "session", sessionID: "child-c" })
+    await composer.app.renderOnce()
+    composer.dispatch("composer.subagent.down")
+    composer.dispatch("composer.subagent.select")
+    expect(composer.route()).toMatchObject({ type: "session", sessionID: "grand" })
   } finally {
     composer.app.renderer.destroy()
   }

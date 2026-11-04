@@ -19,6 +19,7 @@ describe("debug paths command", () => {
 
     try {
       const result = await cli(["debug", "paths"], {
+        OPENCODE_TEST_HOME: os.homedir(),
         XDG_DATA_HOME: path.join(root, "data"),
         XDG_CONFIG_HOME: path.join(root, "config"),
         XDG_CACHE_HOME: path.join(root, "cache"),

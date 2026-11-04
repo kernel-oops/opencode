@@ -82,16 +82,20 @@ export function SessionComposerRegion(props: {
                 </Grow>
 
                 <Grow when={current().permission} fade card class={controller.child() ? "mb-2" : undefined}>
-                  {(request) => (
-                    <SessionPermissionDock
-                      request={request}
-                      responding={controller.state.permissionResponding()}
-                      onDecide={(response) => {
-                        controller.onResponseSubmit()
-                        controller.state.decide(response)
-                      }}
-                    />
-                  )}
+                  <Show when={controller.state.permissionRequest()} keyed>
+                    {(request) => (
+                      <SessionPermissionDock
+                        request={request}
+                        responding={controller.state.permissionResponding()}
+                        onDecide={(response, message) =>
+                          controller.state.decide(request, response, message).then((accepted) => {
+                            if (accepted) controller.onResponseSubmit()
+                            return accepted
+                          })
+                        }
+                      />
+                    )}
+                  </Show>
                 </Grow>
 
                 <Show when={current().composer}>

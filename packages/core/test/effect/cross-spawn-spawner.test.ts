@@ -4,7 +4,7 @@ import os from "node:os"
 import path from "node:path"
 import { Deferred, Effect, Exit, PlatformError, Stream } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
-import { CrossSpawnSpawner } from "@opencode/util/cross-spawn-spawner"
+import { CrossSpawnSpawner, registerInheritedReadOnlyFds } from "@opencode/util/cross-spawn-spawner"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Teardown } from "@opencode/util/teardown"
 import { testEffect } from "../lib/effect"
@@ -49,6 +49,30 @@ async function gone(pid: number, timeout = 5_000) {
 }
 
 describe("cross-spawn spawner", () => {
+  describe("inherited read-only descriptors", () => {
+    fx.live(
+      "passes a registered parent descriptor to the child at the requested number",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const file = path.join(tmp.path, "token.txt")
+        yield* Effect.promise(() => fs.writeFile(file, "inherited-ok"))
+        const handle = yield* Effect.acquireRelease(
+          Effect.promise(() => fs.open(file, "r")),
+          (handle) => Effect.promise(() => handle.close()),
+        )
+        const command = js('process.stdout.write(require("node:fs").readFileSync(3, "utf8"))')
+        registerInheritedReadOnlyFds(command, [{ child: 3, parent: handle.fd }])
+        const out = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) => svc.string(command))
+        expect(out).toBe("inherited-ok")
+      }),
+      10_000,
+    )
+  })
+
   describe("basic spawning", () => {
     fx.effect(
       "captures stdout",

@@ -254,6 +254,21 @@ describe("reuseTimelineRows", () => {
 })
 
 describe("createTimelineProjection", () => {
+  test("renders steering as an informational divider without a stale spinner or error", () => {
+    const messages = [
+      { id: "user", type: "user", text: "Original", time: { created: 1 } },
+      {
+        id: "partial", type: "assistant", agent: "build", model: { id: "model", providerID: "provider" },
+        content: [{ type: "reasoning", text: "Partial thought", time: { created: 2, completed: 3 } }],
+        interruption: "steer", time: { created: 2, completed: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const result = createTimelineProjection({ sessionMessages: messages, status: { type: "busy" }, reasoningMode: "full" })
+    expect(keys(result.rows)).toContain("turn-divider:user")
+    expect(keys(result.rows).some((key) => /thinking|working|error|retry/.test(key))).toBe(false)
+    expect(result.sessionMessageByID.get("partial")).toBe(messages[1])
+  })
+
   test("builds current message, parent, context, and row indexes", () => {
     const selectedModel = { id: "selected", providerID: "provider" } satisfies ModelRef
     const assistantModel = { id: "assistant", providerID: "provider", variant: "fast" } satisfies ModelRef

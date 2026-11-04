@@ -25,6 +25,7 @@ import { SessionInbox } from "./session-inbox.js"
 import { Project } from "./project.js"
 import { SessionFork } from "./session-fork.js"
 import { Permission } from "./permission.js"
+import { SessionContextBudget } from "./session-context-budget.js"
 
 const Base = {
   sessionID: SessionID,
@@ -118,6 +119,18 @@ export const Permissions = Event.durable({
   },
 })
 export type Permissions = typeof Permissions.Type
+
+export const ContextBudgetConfigured = Event.durable({
+  type: "session.context-budget.configured",
+  ...options,
+  schema: { ...Base, policy: Schema.NullOr(SessionContextBudget.Policy) },
+})
+
+export const ContextBudgetChanged = Event.durable({
+  type: "session.context-budget.changed",
+  ...options,
+  schema: { ...Base, state: Schema.NullOr(SessionContextBudget.State) },
+})
 
 export const Viewed = Event.durable({
   type: "session.viewed",
@@ -241,6 +254,74 @@ export const InboxDeliveryChanged = Event.durable({
 })
 export type InboxDeliveryChanged = typeof InboxDeliveryChanged.Type
 
+/** Write-ahead native control intent. An unresolved attempt blocks automatic execution, including after restart. */
+export namespace NativeControl {
+  /**
+   * Versioned public `response.steer` intent: the exact reserved inbox batch, its parent response and the
+   * model binding. Durable correlation only; none of these IDs is a wire field.
+   */
+  export const PublicSteer = Schema.Struct({
+    version: Schema.Literal(1),
+    protocol: Schema.Literal("response.steer"),
+    inboxIDs: Schema.NonEmptyArray(SessionMessage.ID),
+    parentResponseID: Schema.String,
+    model: Model.Ref,
+  })
+  export type PublicSteer = typeof PublicSteer.Type
+
+  export const Requested = Event.durable({
+    type: "session.native-control.requested",
+    ...options,
+    schema: {
+      ...Base,
+      attemptID: Event.ID,
+      assistantMessageID: SessionMessage.ID,
+      /** Absent for the internal interrupt contract, whose historical events keep their shape. */
+      steer: PublicSteer.pipe(optional),
+    },
+  })
+  /** Queued-input ownership moved to the server. Not a commit and not a success verdict. */
+  export const Accepted = Event.durable({
+    type: "session.native-control.accepted",
+    ...options,
+    schema: { ...Base, attemptID: Event.ID, steerID: Schema.String },
+  })
+  /** The automatic successor exists: the reserved correction is consumed, even if the successor later fails. */
+  export const Committed = Event.durable({
+    type: "session.native-control.committed",
+    ...options,
+    schema: {
+      ...Base,
+      attemptID: Event.ID,
+      successorResponseID: Schema.String,
+      successorAssistantID: SessionMessage.ID,
+    },
+  })
+  /** A matching failure before commit. The reserved batch returns to ordinary inbox ownership once. */
+  export const Rejected = Event.durable({
+    type: "session.native-control.rejected",
+    ...options,
+    schema: { ...Base, attemptID: Event.ID, code: Schema.String },
+  })
+  /** Send intent for the single delta-only parent continuation that carries owned results. */
+  export const ContinuationRequested = Event.durable({
+    type: "session.native-control.continuation-requested",
+    ...options,
+    schema: { ...Base, attemptID: Event.ID, callIDs: Schema.NonEmptyArray(Schema.String) },
+  })
+  export const Settled = Event.durable({
+    type: "session.native-control.settled",
+    ...options,
+    // A natural terminal settles execution, but does not acknowledge the interrupt.
+    schema: { ...Base, attemptID: Event.ID, outcome: Schema.Literals(["verified", "completed", "user-recovery"]) },
+  })
+  export const Unresolved = Event.durable({
+    type: "session.native-control.unresolved",
+    ...options,
+    schema: { ...Base, attemptID: Event.ID, message: Schema.String, wireBody: Schema.String.pipe(optional) },
+  })
+}
+
 export namespace Execution {
   export const Started = Event.durable({ type: "session.execution.started", ...options, schema: Base })
   export type Started = typeof Started.Type
@@ -331,6 +412,13 @@ export namespace Shell {
 }
 
 export namespace Step {
+  /** Sparse provider acknowledgements and hosted uncertainty; never a completion receipt. */
+  export const Observed = Event.durable({
+    type: "session.step.observed",
+    ...options,
+    schema: { ...Base, assistantMessageID: SessionMessage.ID, native: Schema.Record(Schema.String, Schema.Json) },
+  })
+  export type Observed = typeof Observed.Type
   export const Started = Event.durable({
     type: "session.step.started",
     ...options,
@@ -357,6 +445,24 @@ export namespace Step {
   })
   export type Streamed = typeof Streamed.Type
 
+  /** A generation superseded by durable steering input, not a provider failure. */
+  export const Interrupted = Event.durable({
+    type: "session.step.interrupted",
+    ...options,
+    schema: {
+      ...Base,
+      assistantMessageID: SessionMessage.ID,
+      reason: Schema.Literals(["steer"]),
+      /** Matching provider receipt, persisted only after decoded consumption and owned-tool settlement. */
+      nativeReceipt: Schema.Struct({ responseID: Schema.String, output: Schema.Array(Schema.Unknown) }).pipe(optional),
+      cost: Money.USD.pipe(optional),
+      tokens: TokenUsage.Info.pipe(optional),
+      snapshot: Snapshot.ID.pipe(optional),
+      files: Schema.Array(RelativePath).pipe(optional),
+    },
+  })
+  export type Interrupted = typeof Interrupted.Type
+
   export const Ended = Event.durable({
     type: "session.step.ended",
     ...options,
@@ -366,8 +472,9 @@ export namespace Step {
       finish: FinishReason,
       rawFinish: Schema.String.pipe(optional),
       native: SessionMessage.Native.pipe(optional),
-      cost: Money.USD,
-      tokens: TokenUsage.Info,
+      /** Absent when the provider did not report usage; unknown is not zero. */
+      cost: Money.USD.pipe(optional),
+      tokens: TokenUsage.Info.pipe(optional),
       snapshot: Snapshot.ID.pipe(optional),
       files: Schema.Array(RelativePath).pipe(optional),
     },
@@ -391,6 +498,28 @@ export namespace Step {
     },
   })
   export type Failed = typeof Failed.Type
+
+  /**
+   * One physical public `response.steer` response ended: the steered/completed parent or its adopted
+   * successor. Usage is paired and present only when the provider reported it; absence means unknown.
+   */
+  export const NativeEnded = Event.durable({
+    type: "session.step.native-ended",
+    ...options,
+    schema: {
+      ...Base,
+      assistantMessageID: SessionMessage.ID,
+      protocol: Schema.Literal("response.steer"),
+      boundary: Schema.Literals(["steered", "completed"]),
+      finish: FinishReason,
+      rawFinish: Schema.String.pipe(optional),
+      native: SessionMessage.Native.pipe(optional),
+      usage: Schema.Struct({ cost: Money.USD, tokens: TokenUsage.Info }).pipe(optional),
+      snapshot: Snapshot.ID.pipe(optional),
+      files: Schema.Array(RelativePath).pipe(optional),
+    },
+  })
+  export type NativeEnded = typeof NativeEnded.Type
 }
 
 export namespace Text {
@@ -614,6 +743,7 @@ export namespace Compaction {
       model: SessionMessage.CompactionCompleted.fields.model,
       native: SessionMessage.CompactionCompleted.fields.native,
       text: Schema.String,
+      checkpoint: SessionMessage.CompactionCompleted.fields.checkpoint,
       // Repeats the internal `session.usage.recorded` figures: that event never reaches clients, and it
       // stays the accounting source for session totals and stats.
       cost: SessionMessage.CompactionCompleted.fields.cost,
@@ -659,6 +789,8 @@ export const Definitions = Event.inventory(
   Renamed,
   MetadataUpdated,
   Permissions,
+  ContextBudgetConfigured,
+  ContextBudgetChanged,
   Viewed,
   Archived,
   Unarchived,
@@ -670,6 +802,13 @@ export const Definitions = Event.inventory(
   InboxCancelled,
   InboxDeliveryChanged,
   Execution.Started,
+  NativeControl.Requested,
+  NativeControl.Accepted,
+  NativeControl.ContinuationRequested,
+  NativeControl.Committed,
+  NativeControl.Rejected,
+  NativeControl.Settled,
+  NativeControl.Unresolved,
   Execution.Succeeded,
   Execution.Failed,
   Execution.Interrupted,
@@ -680,7 +819,10 @@ export const Definitions = Event.inventory(
   Shell.Ended,
   Step.Started,
   Step.Streamed,
+  Step.Observed,
+  Step.Interrupted,
   Step.Ended,
+  Step.NativeEnded,
   Step.Failed,
   Text.Started,
   Text.Delta,

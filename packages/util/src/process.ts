@@ -2,7 +2,7 @@ import { Context, Duration, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import type { PlatformError } from "effect/PlatformError"
 import { ChildProcess } from "effect/process"
 import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner"
-import { CrossSpawnSpawner } from "./cross-spawn-spawner.js"
+import { CrossSpawnSpawner, registerInheritedReadOnlyFds, type InheritedReadOnlyFd } from "./cross-spawn-spawner.js"
 import { makeGlobalNode } from "./effect/app-node.js"
 
 export class AppProcessError extends Schema.TaggedError<AppProcessError>()("AppProcessError", {
@@ -26,6 +26,8 @@ export interface RunOptions {
   readonly signal?: AbortSignal
   readonly timeout?: Duration.Input
   readonly stdin?: string | Uint8Array | Stream.Stream<Uint8Array, PlatformError>
+  /** Parent descriptors inherited read-only by the child at fixed child descriptor numbers (>= 3). */
+  readonly inheritedReadOnlyFds?: ReadonlyArray<InheritedReadOnlyFd>
 }
 
 export interface RunStreamOptions {
@@ -197,17 +199,38 @@ const layer = Layer.effect(
     }
 
     const run = Effect.fn("AppProcess.run")(function* (command: ChildProcess.Command, options?: RunOptions) {
-      if (options?.stdin === undefined) return yield* runCommand(command, options)
+      const inherited = options?.inheritedReadOnlyFds
+      if (options?.stdin === undefined && inherited === undefined) return yield* runCommand(command, options)
       if (command._tag !== "StandardCommand") {
         return yield* new AppProcessError({
           command: describeCommand(command),
-          cause: new Error("stdin option only supports StandardCommand; received PipedCommand"),
+          cause: new Error("stdin and inherited file descriptors only support StandardCommand; received PipedCommand"),
         })
       }
       const next = ChildProcess.make(command.command, command.args, {
         ...command.options,
-        stdin: normalizeStdin(options.stdin),
+        ...(options?.stdin === undefined ? {} : { stdin: normalizeStdin(options.stdin) }),
       })
+      if (inherited !== undefined) {
+        const children = new Set<number>()
+        for (const descriptor of inherited) {
+          if (
+            !Number.isInteger(descriptor.child) ||
+            descriptor.child < 3 ||
+            !Number.isInteger(descriptor.parent) ||
+            descriptor.parent < 0 ||
+            children.has(descriptor.child) ||
+            ChildProcess.fdName(descriptor.child) in (next.options.additionalFds ?? {})
+          ) {
+            return yield* new AppProcessError({
+              command: describeCommand(command),
+              cause: new Error("invalid inherited read-only file descriptor"),
+            })
+          }
+          children.add(descriptor.child)
+        }
+        registerInheritedReadOnlyFds(next, inherited)
+      }
       return yield* runCommand(next, options)
     })
 

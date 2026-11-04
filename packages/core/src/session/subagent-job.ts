@@ -5,14 +5,22 @@ import { Node } from "@opencode/util/effect/app-node"
 import type { LayerNode } from "@opencode/util/effect/layer-node"
 import { Job } from "../job.js"
 import { Session } from "../session.js"
+import type { SessionMessage } from "./message.js"
 import { SubagentCompletion } from "./subagent-completion.js"
 
 type Recovery = Extract<Job.Recovery, { kind: "subagent" }>
 
+export type StartOptions = {
+  readonly admissionID?: SessionMessage.ID
+  readonly admitOnly?: boolean
+  readonly foreground?: Session.ID
+  readonly preserveBackground?: boolean
+}
+
 export interface Interface {
-  start: (recovery: Recovery) => Effect.Effect<Job.Info>
-  background: (recovery: Recovery) => Effect.Effect<void>
-  notify: (recovery: Recovery, startedAt: number) => Effect.Effect<void>
+  start: (recovery: Recovery, options?: StartOptions) => Effect.Effect<Job.Acquired>
+  background: (recovery: Recovery, handle: Job.Acquired) => Effect.Effect<void>
+  notify: (recovery: Recovery, handle: Job.Acquired) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SubagentJob") {}
@@ -25,52 +33,78 @@ const make: Effect.Effect<Interface, never, Session.Service | Job.Service | Scop
   // Fork with the global context too, rather than retaining the caller's location.
   const context = yield* Effect.context<never>()
   // One observer per job generation, including continuations of the same child.
-  const notifications = new Set<string>()
+  const lastText = Effect.fnUntraced(function* (
+    childSessionID: Recovery["childSessionID"],
+    admissionID?: SessionMessage.ID,
+  ) {
+    const pending = yield* sessions.inbox(childSessionID)
+    if (pending.some((item) => item.type === "user"))
+      return yield* Effect.fail(new Error("Subagent continuation remains undelivered"))
+    if (admissionID !== undefined) {
+      const after = yield* sessions.messages({
+        sessionID: childSessionID,
+        type: "assistant",
+        order: "asc",
+        limit: 1,
+        cursor: { id: admissionID, direction: "next" },
+      })
+      if (after.length === 0) return yield* Effect.fail(new Error("Subagent continuation has no completed response"))
+    }
+    const assistant = (yield* sessions.messages({
+      sessionID: childSessionID,
+      type: "assistant",
+      order: "desc",
+      limit: 1,
+    })).find((message) => message.type === "assistant")
+    if (assistant?.type === "assistant" && assistant.interruption !== undefined) return yield* Effect.interrupt
+    if (assistant?.type === "assistant" && assistant.error !== undefined)
+      return yield* Effect.fail(new Error("Subagent response failed"))
+    if ((assistant && assistant.time.completed === undefined) || (admissionID !== undefined && !assistant))
+      return yield* Effect.fail(new Error("Subagent continuation has no completed response"))
+    return SubagentCompletion.text(assistant)
+  })
 
-  const notify = Effect.fn("SubagentJob.notify")(function* (recovery: Recovery, startedAt: number) {
-    const key = `${recovery.childSessionID}:${startedAt}`
-    if (notifications.has(key)) return
-    notifications.add(key)
+  const notify = Effect.fn("SubagentJob.notify")(function* (recovery: Recovery, handle: Job.Acquired) {
+    if (!(yield* handle.observe)) return
     yield* Effect.gen(function* () {
-      const info = (yield* jobs.wait({ id: recovery.childSessionID })).info
-      if (info) yield* SubagentCompletion.deliver(sessions, jobs, { ...info, recovery })
-    }).pipe(
-      Effect.ensuring(Effect.sync(() => notifications.delete(key))),
-      Effect.forkIn(scope, { startImmediately: true }),
-      Effect.setContext(context),
-    )
+      const info = yield* handle.wait
+      if (yield* handle.claimBackground)
+        yield* SubagentCompletion.deliver(sessions, jobs, { ...info, recovery })
+    }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.setContext(context))
   })
 
   return Service.of({
-    start: (recovery: Recovery) =>
+    start: (recovery: Recovery, options) =>
       jobs
-        .start({
-          id: recovery.childSessionID,
-          type: "subagent",
-          title: recovery.description,
-          metadata: {},
-          recovery,
-          run: Effect.gen(function* () {
-            yield* sessions.resume(recovery.childSessionID)
-            const messages = yield* sessions.messages({ sessionID: recovery.childSessionID, order: "desc", limit: 20 })
-            const assistant = messages.find(
-              (message) =>
-                message.type === "assistant" && message.time.completed !== undefined && message.error === undefined,
-            )
-            return SubagentCompletion.text(assistant)
-          }),
-        })
+        .acquire(
+          {
+            id: recovery.childSessionID,
+            type: "subagent",
+            title: recovery.description,
+            metadata: {},
+            recovery,
+            preserveBackground: options?.preserveBackground,
+            run: Effect.gen(function* () {
+              if (options?.admitOnly !== false) yield* sessions.resume(recovery.childSessionID)
+              yield* sessions.wait(recovery.childSessionID)
+              return yield* lastText(recovery.childSessionID, options?.admissionID)
+            }),
+          },
+          options?.foreground,
+        )
         .pipe(Effect.setContext(context)),
-    background: Effect.fn("SubagentJob.background")(function* (recovery: Recovery) {
-      const info = yield* jobs.background(recovery.childSessionID)
-      if (info) yield* notify(recovery, info.started_at)
+    background: Effect.fn("SubagentJob.background")(function* (recovery: Recovery, handle) {
+      const info = yield* handle.background
+      if (info) yield* notify(recovery, handle)
     }),
     notify,
   })
 })
 
+export const layer = Layer.effect(Service, make)
+
 export const node: LayerNode.Provider<Service, never, typeof Node.tags.values.global> = Node.makeGlobalNode({
   service: Service,
-  layer: Layer.effect(Service, make),
+  layer,
   deps: [Session.node, Job.node],
 })

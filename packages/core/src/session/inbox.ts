@@ -1,7 +1,7 @@
 export * as SessionInbox from "./inbox.js"
 
 import { and, asc, eq, or } from "drizzle-orm"
-import { Context, DateTime, Effect, Layer, Schema } from "effect"
+import { Context, DateTime, Deferred, Effect, Layer, Option, Schema, Scope } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import {
   Compaction,
@@ -20,17 +20,22 @@ import {
   UserPayload,
 } from "@opencode/schema/session-inbox"
 import { Database } from "../database/database.js"
+import { KVTable } from "../kv/sql.js"
 import { Bus } from "../bus.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
 import { SessionEvent } from "./event.js"
-import { SessionBlob } from "./blob.js"
 import { SessionMessage } from "./message.js"
 import { SessionSchema } from "./schema.js"
+import { SessionDelegation } from "./delegation.js"
+import { SessionBlob } from "./blob.js"
 import { SessionStored } from "./stored.js"
 import { SessionInboxTable, SessionMessageTable } from "./sql.js"
 import { SessionHistory } from "./history.js"
 
 type DatabaseService = Database.Interface["db"]
+
+/** Private freshness fact, not retained bus history or an instruction-compaction epoch. */
+export const userAdmissionKey = (sessionID: SessionSchema.ID) => `session:user-admission:${sessionID}`
 
 export {
   Compaction,
@@ -71,6 +76,78 @@ type PendingRef = { readonly id: SessionMessage.ID; readonly sessionID: SessionS
 
 export const serialized = <A, E, R>(sessionID: SessionSchema.ID, effect: Effect.Effect<A, E, R>) =>
   inboxLocks.withLock(sessionID)(effect)
+
+/** Serialised dispatch ownership; automatic steering invalidation is disabled. */
+export interface SteeringGate {
+  readonly invalidated: () => boolean
+  readonly changed: Effect.Effect<void>
+  readonly guard: <A, E, R>(start: Effect.Effect<A, E, R>) => Effect.Effect<Option.Option<A>, E, R>
+  readonly finish: Effect.Effect<void>
+}
+
+const steering = new Map<SessionSchema.ID, Set<() => Effect.Effect<void>>>()
+const notifySteer = (sessionID: SessionSchema.ID) =>
+  Effect.forEach(steering.get(sessionID) ?? [], (notify) => notify(), { discard: true })
+
+/** Register before inspecting pending input; registration and dispatch share the inbox mutex. */
+export const watch = Effect.fn("SessionInbox.watch")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+): Effect.fn.Return<SteeringGate, never, Scope.Scope> {
+  const changed = yield* Deferred.make<void>()
+  const invalidated = false
+  // Automatic cancellation is deliberately disabled: input is delivered at the
+  // next ordinary boundary, never by cancelling and regenerating a response.
+  // Keep dispatch ownership and inbox serialisation; explicit interruption and
+  // provider/network cancellation use their separate, unchanged paths.
+  const notify = () => Effect.void
+  yield* Effect.acquireRelease(
+    serialized(
+      sessionID,
+      Effect.sync(() => {
+        const listeners = steering.get(sessionID) ?? new Set()
+        listeners.add(notify)
+        steering.set(sessionID, listeners)
+      }),
+    ),
+    () =>
+      serialized(
+        sessionID,
+        Effect.sync(() => {
+          const listeners = steering.get(sessionID)
+          listeners?.delete(notify)
+          if (listeners?.size === 0) steering.delete(sessionID)
+        }),
+      ),
+  )
+  yield* serialized(
+    sessionID,
+    Effect.gen(function* () {
+      // Keep the existing admission/control ordering machinery, but notification
+      // is inert even for input already pending when a physical retry registers.
+      const pending = yield* list(db, sessionID)
+      if (pending.some((item) => item.delivery === "steer" && (item.type === "user" || item.type === "synthetic")))
+        yield* notify()
+    }),
+  )
+  return {
+    invalidated: () => invalidated,
+    changed: Deferred.await(changed),
+    guard: (start) =>
+      serialized(
+        sessionID,
+        Effect.suspend(() => (invalidated ? Effect.succeed(Option.none()) : start.pipe(Effect.map(Option.some)))),
+      ).pipe(Effect.uninterruptible),
+    finish: serialized(
+      sessionID,
+      Effect.sync(() => {
+        const listeners = steering.get(sessionID)
+        listeners?.delete(notify)
+        if (listeners?.size === 0) steering.delete(sessionID)
+      }),
+    ),
+  }
+})
 
 export class LifecycleConflict extends Schema.TaggedError<LifecycleConflict>()("SessionInbox.LifecycleConflict", {
   id: SessionMessage.ID,
@@ -188,45 +265,69 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     return existing
   })
 
-  const admit = Effect.fn("SessionInbox.admit")(function* <Type extends Item["type"]>(request: {
+  const admitLocked = <Type extends Item["type"]>(request: {
     readonly id: SessionMessage.ID
     readonly sessionID: SessionSchema.ID
     readonly item: Item & { readonly type: Type }
-  }) {
-    const existing = yield* reconcile({ ...request, type: request.item.type, delivery: request.item.delivery })
-    if (existing !== undefined) return existing
-    const admitted = yield* bus
-      .publish(SessionEvent.InboxEnqueued, {
-        inboxID: request.id,
-        sessionID: request.sessionID,
-        item: request.item,
-      })
-      .pipe(
-        Effect.map((event) =>
-          Info.make({
-            id: request.id,
+    /** Local projection committed in the same transaction as the admission; its failure rejects the admission. */
+    readonly commit?: (seq: number) => Effect.Effect<void>
+  }) =>
+    Effect.gen(function* () {
+      const existing = yield* reconcile({ ...request, type: request.item.type, delivery: request.item.delivery })
+      if (existing !== undefined) return existing
+      let committed = false
+      const admitted = yield* bus
+        .publish(
+          SessionEvent.InboxEnqueued,
+          {
+            inboxID: request.id,
             sessionID: request.sessionID,
-            time: { created: DateTime.makeUnsafe(event.created) },
-            ...request.item,
-          }),
-        ),
-        Effect.catchDefect((defect) =>
-          defect instanceof LifecycleConflict
-            ? find(db, request.id).pipe(
-                Effect.flatMap((stored) => (stored === undefined ? Effect.fail(defect) : Effect.succeed(stored))),
-              )
-            : Effect.die(defect),
-        ),
-      )
-    if (!matches(admitted, { ...request, type: request.item.type }))
-      return yield* new LifecycleConflict({ id: request.id })
-    return admitted
-  })
+            item: request.item,
+          },
+          request.commit ? { commit: request.commit } : undefined,
+        )
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              committed = true
+            }),
+          ),
+          Effect.map((event) =>
+            Info.make({
+              id: request.id,
+              sessionID: request.sessionID,
+              time: { created: DateTime.makeUnsafe(event.created) },
+              ...request.item,
+            }),
+          ),
+          Effect.catchDefect((defect) =>
+            defect instanceof LifecycleConflict
+              ? find(db, request.id).pipe(
+                  Effect.flatMap((stored) => (stored === undefined ? Effect.fail(defect) : Effect.succeed(stored))),
+                )
+              : Effect.die(defect),
+          ),
+        )
+      if (!matches(admitted, { ...request, type: request.item.type }))
+        return yield* new LifecycleConflict({ id: request.id })
+      if (committed && admitted.delivery === "steer" && (admitted.type === "user" || admitted.type === "synthetic"))
+        yield* notifySteer(request.sessionID)
+      return admitted
+    })
+
+  const admit = <Type extends Item["type"]>(request: {
+    readonly id: SessionMessage.ID
+    readonly sessionID: SessionSchema.ID
+    readonly item: Item & { readonly type: Type }
+  }) => serialized(request.sessionID, admitLocked<Type>(request)).pipe(Effect.uninterruptible)
 
   const admitCompaction = Effect.fn("SessionInbox.admitCompaction")(function* (input: {
     readonly id: SessionMessage.ID
     readonly sessionID: SessionSchema.ID
     readonly delivery: Delivery
+    /** Internal: a controller-state binding, durable in the payload; a bound request never coalesces. */
+    readonly checkpoint?: CompactionPayload["checkpoint"]
+    readonly commit?: (seq: number) => Effect.Effect<void>
   }) {
     return yield* serialized(
       input.sessionID,
@@ -239,11 +340,16 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
         if (yield* promotedFromMessage(db, input.sessionID, input.id, input.delivery))
           return yield* new LifecycleConflict({ id: input.id })
         const pending = (yield* list(db, input.sessionID)).find((item) => item.type === "compaction")
-        if (pending) return pending
-        return yield* admit({
+        if (pending) return input.checkpoint ? yield* new LifecycleConflict({ id: input.id }) : pending
+        return yield* admitLocked({
           id: input.id,
           sessionID: input.sessionID,
-          item: { type: "compaction", payload: {}, delivery: input.delivery },
+          item: {
+            type: "compaction",
+            payload: input.checkpoint ? { checkpoint: input.checkpoint } : {},
+            delivery: input.delivery,
+          },
+          commit: input.commit,
         })
       }),
     )
@@ -262,10 +368,14 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
   const steer = Effect.fn("SessionInbox.steer")((input: PendingRef) =>
     publishMutation(
       input,
-      bus.publish(SessionEvent.InboxDeliveryChanged, {
-        sessionID: input.sessionID,
-        inboxID: input.id,
-        delivery: "steer",
+      Effect.gen(function* () {
+        const pending = yield* find(db, input.id)
+        yield* bus.publish(SessionEvent.InboxDeliveryChanged, {
+          sessionID: input.sessionID,
+          inboxID: input.id,
+          delivery: "steer",
+        })
+        if (pending?.type === "user" || pending?.type === "synthetic") yield* notifySteer(input.sessionID)
       }),
     ),
   )
@@ -285,6 +395,9 @@ export const make = Effect.fn("SessionInbox.make")(function* () {
     list: (sessionID: SessionSchema.ID) => list(db, sessionID),
     reconcile,
     admit,
+    /** Internal control paths must already hold `serialized`; the mutex is not re-entrant. */
+    admitMoveLocked: (request: PendingRef & { readonly item: Extract<Item, { readonly type: "move" }> }) =>
+      admitLocked<"move">(request),
     admitCompaction,
     cancel,
     steer,
@@ -306,6 +419,7 @@ export const projectAdmitted = Effect.fn("SessionInbox.projectAdmitted")(functio
     readonly timeCreated: number
   },
 ) {
+  yield* SessionDelegation.open(db, request.sessionID)
   const message = yield* db
     .select({ id: SessionMessageTable.id })
     .from(SessionMessageTable)
@@ -337,6 +451,15 @@ export const projectAdmitted = Effect.fn("SessionInbox.projectAdmitted")(functio
     .get()
     .pipe(Effect.orDie)
   if (!stored) return yield* Effect.die(new LifecycleConflict({ id: request.id }))
+  // The enqueue projection runs inside the bus transaction. A failed insert or
+  // idempotent admission never advances this revision; delivery/cancellation do not erase it.
+  if (request.item.type === "user")
+    yield* db
+      .insert(KVTable)
+      .values({ key: userAdmissionKey(request.sessionID), value: request.enqueuedSeq })
+      .onConflictDoUpdate({ target: KVTable.key, set: { value: request.enqueuedSeq } })
+      .run()
+      .pipe(Effect.orDie)
   yield* SessionBlob.recordRefs(
     db,
     { sessionID: request.sessionID, messageID: request.id, seq: request.enqueuedSeq },
@@ -467,14 +590,17 @@ export const moveIDs = Effect.fn("SessionInbox.moveIDs")(function* (db: Database
     .pipe(Effect.orDie)
 })
 
+/** "control" settles recovery controls without delivering the retained inputs ahead of them. */
 export const nextPromotable = Effect.fn("SessionInbox.nextPromotable")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
-  promotable: Promotable,
+  promotable: Promotable | "control",
 ) {
-  const steer = (yield* pendingSteers(db, sessionID))[0]
+  const steers = yield* pendingSteers(db, sessionID)
+  const steer =
+    promotable === "control" ? steers.find((row) => row.type === "compaction" || row.type === "move") : steers[0]
   if (steer) return promotion(steer)
-  if (promotable !== "input") return undefined
+  if (promotable === "steer") return undefined
   const queued = yield* db
     .select()
     .from(SessionInboxTable)
@@ -483,12 +609,20 @@ export const nextPromotable = Effect.fn("SessionInbox.nextPromotable")(function*
     .limit(1)
     .get()
     .pipe(Effect.orDie)
-  return queued ? promotion(queued) : undefined
+  return queued && (promotable !== "control" || queued.type === "compaction" || queued.type === "move")
+    ? promotion(queued)
+    : undefined
 })
 
 /** What a boundary decides on: prompts are promoted by id, so only a move's payload is read. */
 export type Promotion =
-  | { readonly id: SessionMessage.ID; readonly type: "user" | "synthetic" | "compaction"; readonly delivery: Delivery }
+  | { readonly id: SessionMessage.ID; readonly type: "user" | "synthetic"; readonly delivery: Delivery }
+  | {
+      readonly id: SessionMessage.ID
+      readonly type: "compaction"
+      readonly delivery: Delivery
+      readonly payload: CompactionPayload
+    }
   | {
       readonly id: SessionMessage.ID
       readonly type: "move"
@@ -499,7 +633,9 @@ export type Promotion =
 const promotion = (row: typeof SessionInboxTable.$inferSelect): Promotion =>
   row.type === "move"
     ? { id: row.id, type: "move", delivery: row.delivery, payload: decodeMove(row.payload) }
-    : { id: row.id, type: row.type, delivery: row.delivery }
+    : row.type === "compaction"
+      ? { id: row.id, type: row.type, delivery: row.delivery, payload: decodeCompaction(row.payload) }
+      : { id: row.id, type: row.type, delivery: row.delivery }
 
 /** Which pending rows count: "input" means any item in either delivery mode. */
 export type Scope = "input" | Delivery
@@ -528,6 +664,7 @@ export const has = Effect.fn("SessionInbox.has")(function* (
 
 const publishMutation = <A, E, R>(input: PendingRef, effect: Effect.Effect<A, E, R>) =>
   serialized(input.sessionID, effect).pipe(
+    Effect.uninterruptible,
     Effect.asVoid,
     // Bus projectors abort their transaction through the defect channel.
     Effect.catchDefect((defect) => (defect instanceof LifecycleConflict ? Effect.fail(defect) : Effect.die(defect))),

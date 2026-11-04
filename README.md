@@ -8,6 +8,8 @@
   </a>
 </p>
 <p align="center">The open source AI coding agent.</p>
+
+Native OpenAI steering is disabled by default. GPT-6 Responses WebSockets require both an operator allowance and an exact-session opt-in; see [Steering and queued input](packages/core/README.md#steering-and-queued-input). Ordinary steering never pre-empts the client stream.
 <p align="center">
   <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/@opencode/cli"><img alt="npm" src="https://img.shields.io/npm/v/@opencode/cli?style=flat-square" /></a>

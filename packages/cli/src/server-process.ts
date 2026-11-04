@@ -88,13 +88,15 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
         delete process.env.OPENCODE_PASSWORD
         delete process.env.OPENCODE_SERVER_PASSWORD
       }
-      const password =
-        options.mode === "service"
+      const unauthenticated = options.mode === "default" && (yield* Env.auth) === "none"
+      const password = unauthenticated
+        ? undefined
+        : options.mode === "service"
           ? config.password || randomBytes(32).toString("base64url")
           : environmentPassword
             ? Redacted.value(environmentPassword)
             : randomBytes(32).toString("base64url")
-      if (!password) return yield* Effect.fail(new Error("Missing server password"))
+      if (!password && !unauthenticated) return yield* Effect.fail(new Error("Missing server password"))
       const instanceID = randomUUID()
       const transform = yield* WebUi.handler()
       const remote = { urls: [] as ReadonlyArray<string> }
@@ -109,6 +111,7 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
           port,
           cors: options.cors ?? config.cors,
           password,
+          unauthenticated,
           pty: { handoff },
           simulation: truthy(process.env.OPENCODE_SIMULATE),
           database: {
@@ -131,6 +134,7 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
             ),
             file: process.env.OPENCODE_CONFIG,
             content: process.env.OPENCODE_CONFIG_CONTENT,
+            globalAlias: process.env.OPENCODE_CONFIG_GLOBAL_ALIAS,
           },
           windows: {
             gitbash: process.env.OPENCODE_GIT_BASH_PATH,
@@ -148,6 +152,8 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
           : {
               onListen: (address, shutdown) =>
                 Effect.gen(function* () {
+                  // Service mode never runs unauthenticated, so the password is always set here.
+                  if (password === undefined) return yield* Effect.die(new Error("Missing service password"))
                   if (!config.password) yield* ServiceConfig.password(password)
                   return yield* ServiceRegistration.register({
                     address,
@@ -206,7 +212,8 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       }
       const url = HttpServer.formatAddress(server.address)
       console.log(options.mode === "stdio" ? JSON.stringify({ url }) : `server listening on ${url}`)
-      if (foreground && !environmentPassword) console.log(`server password ${password}`)
+      if (unauthenticated) console.log("server authentication disabled (OPENCODE_SERVER_AUTH=none)")
+      else if (foreground && !environmentPassword) console.log(`server password ${password}`)
       return yield* options.mode === "service"
         ? server.shutdown
         : options.mode === "stdio"

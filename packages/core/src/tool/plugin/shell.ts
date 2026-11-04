@@ -10,6 +10,7 @@ import { Environment } from "../../environment/index.js"
 import { Job } from "../../job.js"
 import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
+import { ReviewAction } from "@opencode/util/bound/review-action"
 import { NonNegativeInt } from "../../schema.js"
 import { Session } from "../../session.js"
 import { SessionSchema } from "../../session/schema.js"
@@ -127,12 +128,35 @@ export const Plugin = {
           kind: "directory",
         }),
       )
-      yield* access.authorizeExternal([target, ...directories], context)
+      // The exact invocation is published for review; a shell command is never attested as effect-free.
+      const action = ReviewAction.make({
+        identity: name,
+        arguments: {
+          command: invocation.command,
+          timeout,
+          workdir: target.absolute,
+          shell: invocation.shell,
+        },
+        cwd: target.absolute,
+        complete: true,
+      })
+      yield* access.authorizeExternal([target, ...directories], context, {
+        command: invocation.command,
+        directories: directories.map((directory) => directory.absolute),
+        [ReviewAction.KEY]: action,
+      })
       if (parsed.commands.length > 0)
         yield* permission.assert({
           action: name,
           resources: parsed.commands.map((command) => command.resource),
           save: parsed.commands.map((command) => command.save),
+          // Exact invocation for permission hooks such as the external Bash evaluator.
+          metadata: {
+            command: invocation.command,
+            cwd: target.absolute,
+            shell: invocation.shell,
+            [ReviewAction.KEY]: action,
+          },
           sessionID: context.sessionID,
           agent: context.agent,
           source,

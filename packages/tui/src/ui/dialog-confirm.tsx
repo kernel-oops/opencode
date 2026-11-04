@@ -11,6 +11,8 @@ export type DialogConfirmProps = {
   message: string
   onConfirm?: () => void
   onCancel?: () => void
+  /** Option focused when the dialog opens; defaults to confirm. */
+  initial?: "confirm" | "cancel"
   label?: {
     confirm?: string
     cancel?: string
@@ -22,7 +24,7 @@ export function DialogConfirm(props: DialogConfirmProps) {
   const theme = useTheme().surface("dialog")
   const newDesigns = useNewDesigns()
   const [store, setStore] = createStore({
-    active: "confirm" as "confirm" | "cancel",
+    active: (props.initial ?? "confirm") as "confirm" | "cancel",
   })
 
   const choose = (key: "confirm" | "cancel") => {

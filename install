@@ -232,8 +232,6 @@ print_message() {
 
 check_version() {
     if command -v "$APP" >/dev/null 2>&1; then
-        opencode_path=$(which "$APP")
-
         ## Check the installed version
         installed_version=$("$APP" --version 2>/dev/null || echo "")
         installed_version="${installed_version##* }"
@@ -254,9 +252,11 @@ print_progress() {
     local on=$(( percent * width / 100 ))
     local off=$(( width - on ))
 
-    local filled=$(printf "%*s" "$on" "")
+    local filled
+    filled=$(printf "%*s" "$on" "")
     filled=${filled// /■}
-    local empty=$(printf "%*s" "$off" "")
+    local empty
+    empty=$(printf "%*s" "$off" "")
     empty=${empty// /･}
 
     printf "\r${ORANGE}%s%s %3d%%${NC}" "$filled" "$empty" "$percent" >&4
@@ -277,6 +277,8 @@ download_with_progress() {
     # Hide cursor
     printf "\033[?25l" >&4
 
+    # Capture this invocation's temporary path before the local variable leaves scope.
+    # shellcheck disable=SC2064
     trap "trap - RETURN; rm -f \"$headers\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
     # Poll the file size on a timer so rendering cost stays fixed no matter how many bytes arrive.
@@ -288,6 +290,8 @@ download_with_progress() {
     while kill -0 "$curl_pid" 2>/dev/null; do
         if [ -f "$output" ]; then
             length=$(grep -i '^content-length:' "$headers" 2>/dev/null | tail -n 1 | tr -dc '0-9' || true)
+            # Numeric metadata only; avoid busybox wc reading the growing file on every tick.
+            # shellcheck disable=SC2012
             bytes=$(ls -ln "$output" | awk '{print $5}')
             print_progress "$bytes" "${length:-0}"
         fi
@@ -297,6 +301,7 @@ download_with_progress() {
     local ret=0
     wait "$curl_pid" || ret=$?
     if [ "$ret" -eq 0 ]; then
+        # shellcheck disable=SC2012 # Metadata only, for the same bounded-cost reason as above.
         bytes=$(ls -ln "$output" | awk '{print $5}')
         print_progress "$bytes" "$bytes"
     fi
@@ -468,7 +473,7 @@ if [[ "$no_modify_path" != "true" ]]; then
 fi
 
 if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" == "true" ]; then
-    echo "$INSTALL_DIR" >> $GITHUB_PATH
+    echo "$INSTALL_DIR" >> "$GITHUB_PATH"
     print_message info "Added $INSTALL_DIR to \$GITHUB_PATH"
 fi
 

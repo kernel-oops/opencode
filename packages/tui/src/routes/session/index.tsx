@@ -45,6 +45,7 @@ import {
   type ModelInfo,
 } from "@opencode/client"
 import { useLocal } from "../../context/local"
+import { PromptMetadataRow } from "../../component/prompt/metadata"
 import { Locale } from "../../util/locale"
 import { FilePath } from "../../ui/file-path"
 import {
@@ -133,6 +134,7 @@ import { SessionGroupView } from "./group-view"
 import { useEntryAnchor } from "./anchor-view"
 import { containsAnchor, createTimelineAnchors, groupID } from "./anchors"
 import { rowsAfter, rowsBefore, rowWeight } from "./mount-budget"
+import { cardSession, cardTask, taskBackground, taskBadge } from "../../component/task-controls"
 export { InlineToolRow } from "./message-parts"
 export { toolDisplay } from "./message-parts"
 
@@ -175,6 +177,22 @@ export function Session(props: {
   const theme = useTheme()
   const promptRef = usePromptRef()
   const session = createMemo(() => data.session.get(route.sessionID))
+  // The agent and model a subagent session runs with, for the line shown in place of its (absent) prompt footer.
+  const childModel = createMemo(() => {
+    const current = session()
+    const model = current?.model
+    if (!current?.parentID || !model) return undefined
+    const location = current.location
+    const info = data.location.model.list(location)?.find((item) => item.providerID === model.providerID && item.id === model.id)
+    const provider = data.location.provider.list(location)?.find((item) => item.id === model.providerID)
+    return {
+      agent: current.agent ? Locale.titlecase(current.agent) : "Subagent",
+      color: current.agent ? local.agent.color(current.agent) : theme.text.base,
+      model: info?.name ?? model.id,
+      provider: provider?.name ?? model.providerID,
+      variant: model.variant,
+    }
+  })
   const messages = () => data.session.message.list(route.sessionID)
   const messageIndexes = createMemo(() => new Map(messages().map((message, index) => [message.id, index])))
   const legacy = createMemo(() => SessionTurn.legacy(messages()))
@@ -210,7 +228,7 @@ export function Session(props: {
       (sessionID) => data.session.permission.list(sessionID) ?? [],
     )
   })
-  const promptedPermissions = createMemo(() => (local.permission.mode === "autoaccept" ? [] : permissions()))
+  const promptedPermissions = createMemo(() => permissions().filter((request) => local.permission.mode !== "autoaccept" || !!request.review))
   const forms = createMemo(() => {
     const global = data.session.form.list("global", location()) ?? []
     if (session()?.parentID) return global
@@ -221,7 +239,11 @@ export function Session(props: {
   const pendingUsers = createMemo(() =>
     data.session.pending.list(route.sessionID).flatMap((item) => (item.type === "user" ? [item] : [])),
   )
-  const pendingDeliveries = createMemo(() => new Map(pendingUsers().map((item) => [item.id, item.delivery])))
+  const pendingDeliveries = createMemo(() =>
+    new Map(data.session.pending.list(route.sessionID).flatMap((item) =>
+      item.type === "user" || item.type === "synthetic" ? [[item.id, item.delivery] as const] : [],
+    )),
+  )
   const queuedPrompts = createMemo(() =>
     pendingUsers().flatMap((item) =>
       item.delivery === "queue" ? [{ id: item.id, text: item.payload.text, payload: item.payload }] : [],
@@ -269,6 +291,7 @@ export function Session(props: {
   createEffect(() => {
     if (local.permission.mode !== "autoaccept") return
     permissions().forEach((request) => {
+      if (request.review) return
       if (autoApproved.has(request.id)) return
       autoApproved.add(request.id)
       void data.session.permission
@@ -338,12 +361,15 @@ export function Session(props: {
     if (client.connection.status() !== "connected") return
     setSynced(false)
     const sessionID = route.sessionID
+    const controller = new AbortController()
+    onCleanup(() => controller.abort())
     void (async () => {
       await Promise.all([
         data.session.sync(sessionID, { children: true }),
         data.session.permission.sync(sessionID).catch(() => undefined),
         data.session.form.sync(sessionID).catch(() => undefined),
       ])
+      if (controller.signal.aborted) return
       const info = data.session.get(sessionID)
       if (!info) {
         toast.show({
@@ -356,7 +382,22 @@ export function Session(props: {
       }
       editor.reconnect(info.location.directory)
       setSynced(true)
+      // A cold grandchild route cannot rely on the sidebar being mounted to load its family.
+      void (async () => {
+        const visited = new Set([sessionID])
+        let ancestor = info
+        while (ancestor.parentID && !visited.has(ancestor.parentID)) {
+          if (controller.signal.aborted) return
+          visited.add(ancestor.parentID)
+          await data.session.sync(ancestor.parentID)
+          const parent = data.session.get(ancestor.parentID)
+          if (!parent) break
+          ancestor = parent
+        }
+        await data.session.descendants.sync(ancestor.id, { signal: controller.signal })
+      })().catch(() => undefined)
     })().catch((error) => {
+      if (controller.signal.aborted) return
       if (route.sessionID !== sessionID) return
       toast.show({
         message: errorMessage(error),
@@ -1582,6 +1623,26 @@ export function Session(props: {
                 <QueuedPromptDock prompts={queuedPrompts()} onOpen={openQueuedPrompts} />
               </Show>
               <Slot path="session.composer.top" input={{ sessionID: route.sessionID }} />
+              {/* A subagent has no prompt, so no footer saying who is running it: show its agent and model here. */}
+              <Show when={session()?.parentID ? childModel() : undefined}>
+                {(info) => (
+                  <box flexDirection="row" paddingLeft={2} paddingRight={2} flexShrink={0}>
+                    <PromptMetadataRow
+                      mode="normal"
+                      agent={info().agent}
+                      auto={false}
+                      model={info().model}
+                      provider={info().provider}
+                      variant={info().variant}
+                      muted={false}
+                      highlight={info().color}
+                      agentAlpha={1}
+                      modelAlpha={1}
+                      variantAlpha={1}
+                    />
+                  </box>
+                )}
+              </Show>
               <Composer
                 sessionID={route.sessionID}
                 open={composer.open || (!!session()?.parentID && forms().length === 0)}
@@ -2014,7 +2075,7 @@ function AssistantFooter(props: { message: SessionMessageAssistant }) {
   const turn = () => ({ index: ctx.messageIndex(props.message.id), legacy: ctx.legacyTurns() })
   const duration = createMemo(() => SessionTurn.duration(messages(), props.message, turn()))
   const tokensPerSecond = createMemo(() => SessionTurn.tokensPerSecond(messages(), props.message, turn()))
-  const interrupted = createMemo(() => props.message.error?.message === "Step interrupted")
+  const interrupted = createMemo(() => props.message.interruption === "steer" || props.message.error?.message === "Step interrupted")
   const freeLimit = createMemo(() => props.message.error?.type === "provider.free-limit")
   const limitNotice = useLimitNotice(() => props.message)
   return (
@@ -2092,11 +2153,25 @@ function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
   const theme = useTheme()
   const renderer = useRenderer()
   const { navigate } = useRoute()
+  return <SessionNoticeRow message={props.message} theme={theme} width={ctx.width} pending={!!ctx.pendingDelivery(props.message.id)} onNavigate={(id) => {
+    if (!renderer.getSelection()?.getSelectedText()) navigate({ type: "session", sessionID: id })
+  }} />
+}
+
+export function SessionNoticeRow(props: {
+  message: SessionMessageInfo
+  theme: ReturnType<typeof useTheme>
+  width: number
+  pending: boolean
+  onNavigate(id: string): void
+}) {
+  const theme = props.theme
   const [hover, setHover] = createSignal(false)
   const metadata = () => (props.message.type === "synthetic" ? props.message.metadata : undefined)
   const source = () => stringValue(metadata()?.source)
-  const completion = () => source() === "subagent" || source() === "shell"
-  const childID = () => (source() === "subagent" ? stringValue(metadata()?.childID) : undefined)
+  const completion = () => source() === "subagent" || source() === "shell" || source() === "new_session"
+  const delivery = () => props.pending
+  const childID = () => (source() === "subagent" || source() === "new_session" ? stringValue(metadata()?.childID) : undefined)
   const state = () => stringValue(metadata()?.state)
   const actor = () => (source() === "shell" ? "Shell" : Locale.titlecase(stringValue(metadata()?.agent) ?? "Subagent"))
   const text = () => {
@@ -2106,15 +2181,22 @@ function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
   }
   const description = () => (source() === "shell" ? text().replace(/\s+/g, " ").trim() : text())
   const status = () => {
+    if (source() === "new_session") {
+      if (state() === "succeeded") return "succeeded"
+      if (state() === "failed") return "failed"
+      if (state() === "interrupted") return "interrupted"
+      return "outcome unknown"
+    }
     if (state() === "completed") return "finished"
     if (state() === "error") return "failed"
-    return state() ?? "finished"
+    return state() ?? "outcome unknown"
   }
-  const heading = () => `${state() === "completed" ? "↳" : "!"} ${actor()} ${status()}`
-  const suffix = () => Locale.truncateWidth(` · ${description()}`, Math.max(0, ctx.width - 3 - stringWidth(heading())))
+  const heading = () => `${state() === "completed" || state() === "succeeded" ? "↳" : "!"} ${source() === "new_session" ? "Independent Build" : actor()} ${status()}`
+  const suffix = () => Locale.truncateWidth(` · ${description()}`, Math.max(0, props.width - 3 - stringWidth(heading())))
   const color = () => {
-    if (state() === "error") return theme.text.feedback.error.base
-    if (state() === "cancelled") return theme.text.feedback.warning.base
+    if (delivery()) return theme.text.muted
+    if (state() === "error" || state() === "failed") return theme.text.feedback.error.base
+    if (state() === "cancelled" || state() === "interrupted") return theme.text.feedback.warning.base
     if (hover() && childID()) return theme.text.base
     return theme.text.feedback.info.base
   }
@@ -2122,9 +2204,10 @@ function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
     <Show
       when={completion()}
       fallback={
-        <InlineToolRow icon={source() === "goal" ? "◎" : "◈"} color={theme.text.muted} pending="Notice" complete={true}>
-          {text()}
-        </InlineToolRow>
+        <box marginLeft={3}>
+          <text fg={theme.text.muted} attributes={delivery() ? TextAttributes.DIM : undefined}>◈ {text()}</text>
+          <Show when={delivery()}><text fg={theme.text.muted} attributes={TextAttributes.DIM}>Notice · pending delivery</text></Show>
+        </box>
       }
     >
       <box
@@ -2132,15 +2215,20 @@ function SessionNoticeMessageV2(props: { message: SessionMessageInfo }) {
         onMouseOver={() => childID() && setHover(true)}
         onMouseOut={() => setHover(false)}
         onMouseUp={() => {
-          if (renderer.getSelection()?.getSelectedText()) return
           const id = childID()
-          if (id) navigate({ type: "session", sessionID: id })
+          if (id) props.onNavigate(id)
         }}
       >
-        <text wrapMode="none">
+        <text wrapMode="none" attributes={delivery() ? TextAttributes.DIM : undefined}>
           <span style={{ fg: color() }}>{heading()}</span>
           <span style={{ fg: theme.text.muted }}>{suffix()}</span>
         </text>
+        <Show when={delivery()}><text fg={theme.text.muted} attributes={TextAttributes.DIM}>Report · pending delivery</text></Show>
+        <Show when={source() === "new_session"}>
+          <text fg={theme.text.muted} attributes={delivery() ? TextAttributes.DIM : undefined}>Independently owned</text>
+          <Show when={stringValue(metadata()?.launchKey)}>{(key) => <text fg={theme.text.muted} wrapMode="none" truncate attributes={delivery() ? TextAttributes.DIM : undefined}>Launch · {key()}</text>}</Show>
+          <text fg={theme.text.muted} attributes={delivery() ? TextAttributes.DIM : undefined}>Acceptance required</text>
+        </Show>
       </box>
     </Show>
   )
@@ -2410,6 +2498,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
           backgroundColor={hover() ? theme.decrease(theme.background.raised.base) : theme.background.raised.base}
           flexShrink={0}
         >
+          <Show when={delivery()}><text fg={theme.text.muted}>{delivery() === "queue" ? "Queued" : "Steer"} · pending delivery</text></Show>
           <text fg={theme.text.base}>{props.message.text}</text>
           <Show when={skills().length}>
             <box flexDirection="row" paddingTop={1} gap={1} flexWrap="wrap">
@@ -2490,7 +2579,7 @@ function QueuedPromptDock(props: { prompts: { id: string; text: string }[]; onOp
         flexDirection="row"
       >
         <text fg={theme.text.muted} wrapMode="none" truncate flexGrow={1} flexShrink={1} minWidth={0}>
-          <span style={{ fg: theme.text.base }}>{props.prompts.length} queued</span>
+          <span style={{ fg: theme.text.base }}>Queued · pending delivery ({props.prompts.length})</span>
           <Show when={next()}>{(text) => <> · {text()}</>}</Show>
         </text>
       </box>
@@ -2780,8 +2869,8 @@ function useToolPermission(part: () => SessionMessageAssistantTool | undefined) 
   const data = useData()
   const local = useLocal()
   return createMemo(() => {
-    if (local.permission.mode === "autoaccept") return false
     const request = data.session.permission.list(ctx.sessionID)?.[0]
+    if (local.permission.mode === "autoaccept" && !request?.review) return false
     return request?.source?.type === "tool" && request.source.id === part()?.id
   })
 }
@@ -3276,17 +3365,23 @@ function WebSearch(props: ToolProps) {
 function Subagent(props: ToolProps) {
   const { navigate } = useRoute()
   const data = useData()
-  const sessionID = createMemo(
-    () =>
-      stringValue(props.metadata.sessionID) ??
-      stringValue(props.metadata.sessionId) ??
-      // A failed continuation may name an unrelated session, such as the parent itself.
-      (props.part.state.status === "error" ? undefined : stringValue(props.input.sessionID)),
-  )
+  const ctx = use()
   const description = createMemo(() => stringValue(props.input.description))
+  const sessionID = createMemo(() =>
+    cardSession(
+      data.session.task.get(ctx.sessionID),
+      stringValue(props.metadata.sessionID) ?? stringValue(props.metadata.sessionId),
+      stringValue(props.input.sessionID),
+      description(),
+    ),
+  )
   const continuation = createMemo(() => Boolean(stringValue(props.input.sessionID)))
   const model = createMemo(() => subagentModelLabel(stringValue(props.input.model), data.location.model.list()))
+  const task = createMemo(() => cardTask(taskBackground(data.session.task.get(ctx.sessionID), sessionID()), description()))
   const isRunning = createMemo(() => {
+    const observed = task()
+    if (observed) return observed.status === "running"
+    if (props.part.state.status === "completed" || props.part.state.status === "error") return false
     const id = sessionID()
     return props.part.state.status === "running" || Boolean(id && data.session.status(id) === "running")
   })
@@ -3304,9 +3399,14 @@ function Subagent(props: ToolProps) {
         if (id) navigate({ type: "session", sessionID: id })
       }}
       status={
-        isBackgroundSubagent(props.metadata, props.part.state.status) ? (
-          <StatusBadge>Background</StatusBadge>
-        ) : undefined
+        <Show
+          when={
+            taskBadge(task()) ??
+            (isBackgroundSubagent(props.metadata, props.part.state.status) ? "Background" : undefined)
+          }
+        >
+          {(badge) => <StatusBadge>{badge()}</StatusBadge>}
+        </Show>
       }
     >
       {`${continuation() ? "Continue subagent" : `${Locale.titlecase(stringValue(props.input.agent) ?? stringValue(props.input.subagent_type) ?? "General")} Subagent`} — ${description() ?? "Subagent"}${model() ? ` · ${model()}` : ""}`}

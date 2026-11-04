@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import { DESKTOP_NATIVE_LOCALES } from "./desktop-native"
-import { localizedListParts, richTemplateParts } from "./language"
+import { pluralCategory, resolveTemplate } from "@opencode/ui/context/i18n"
+import en from "./en"
+import { backgroundSummaryText, localizedListParts, richTemplateParts } from "./language"
 
 describe("rich translations", () => {
   test("lets the translated phrase position a rich slot", () => {
@@ -16,20 +17,21 @@ describe("rich translations", () => {
   })
 })
 
-describe("dictionaries", () => {
-  test("are flat string maps in every locale", async () => {
-    const modules = await Promise.all(
-      DESKTOP_NATIVE_LOCALES.flatMap((locale) => [
-        import(`./${locale}`),
-        import(`../../../../ui/src/i18n/${locale}`),
-      ]),
-    )
+describe("background summary", () => {
+  const source: Record<string, string> = en
 
-    const nested = modules.flatMap((module) =>
-      // oxlint-disable-next-line anti-slop/no-runtime-typeof -- the check is that no value is nested
-      Object.entries<unknown>(module.dict).filter(([, value]) => typeof value !== "string"),
-    )
+  const plural = (key: string, count: number) =>
+    resolveTemplate(source[`${key}.${pluralCategory("en", count)}`], { count })
 
-    expect(nested).toEqual([])
+  const none = { running: 0, completed: 0, error: 0, cancelled: 0, idle: 0 }
+
+  test("lists each non-zero status count with its plural phrase", () => {
+    expect(backgroundSummaryText("en", { ...none, running: 2, completed: 1 }, plural)).toBe(
+      "2 subagents running, 1 completed",
+    )
+    expect(backgroundSummaryText("en", { ...none, completed: 1, error: 1, cancelled: 1 }, plural)).toBe(
+      "1 completed, 1 failed, 1 cancelled",
+    )
+    expect(backgroundSummaryText("en", none, plural)).toBe("")
   })
 })

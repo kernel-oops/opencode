@@ -13,6 +13,7 @@ import { SessionMessage } from "./message.js"
 import { Session } from "@opencode/schema/session"
 import { SessionMessageTable, SessionTable } from "./sql.js"
 import { fromRow } from "./info.js"
+import { SessionDelegation } from "./delegation.js"
 
 const ListInputBase = {
   workspaceID: Workspace.ID.pipe(Schema.optional),
@@ -216,15 +217,22 @@ const layer = Layer.effect(
           )
       }),
       claim: Effect.fn("SessionStore.claim")(function* (sessionID) {
-        // The null guard makes re-claiming a still-claimed Session a zero-row
-        // no-op (a resumed turn re-claims through the same started hook).
-        // Claim bookkeeping never counts as user activity: time_updated is
-        // pinned so session ordering only moves on real changes.
         yield* db
-          .update(SessionTable)
-          .set({ time_suspended: Date.now(), time_updated: sql`${SessionTable.time_updated}` })
-          .where(and(eq(SessionTable.id, sessionID), isNull(SessionTable.time_suspended)))
-          .run()
+          .transaction((tx) =>
+            Effect.gen(function* () {
+              yield* SessionDelegation.open(tx, sessionID)
+              // The null guard makes re-claiming a still-claimed Session a zero-row
+              // no-op (a resumed turn re-claims through the same started hook).
+              // Claim bookkeeping never counts as user activity: time_updated is
+              // pinned so session ordering only moves on real changes.
+              yield* tx
+                .update(SessionTable)
+                .set({ time_suspended: Date.now(), time_updated: sql`${SessionTable.time_updated}` })
+                .where(and(eq(SessionTable.id, sessionID), isNull(SessionTable.time_suspended)))
+                .run()
+                .pipe(Effect.orDie)
+            }),
+          )
           .pipe(Effect.orDie)
       }),
       release: Effect.fn("SessionStore.release")(function* (sessionID) {

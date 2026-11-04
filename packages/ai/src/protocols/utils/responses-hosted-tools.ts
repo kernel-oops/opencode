@@ -60,7 +60,7 @@ export const onDone: (
         providerMetadata,
       }),
     )
-    return [{ ...state, lifecycle }, events] satisfies OpenResponses.StepResult
+    return [{ ...state, lifecycle, completedOutputItems: [...state.completedOutputItems, item] }, events] satisfies OpenResponses.StepResult
   },
 )
 

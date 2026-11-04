@@ -217,8 +217,10 @@ function rootEvent(state: TurnState, event: OpenCodeEvent, ctx: TurnContext): Fo
   switch (event.type) {
     case "session.step.started":
       return sessionEvent({ ...state, stepError: undefined }, event, ctx, undefined)
-    case "session.step.ended":
-      return { state: { ...recordStep(state, event.data.tokens), finish: event.data.finish }, outputs: [] }
+    case "session.step.ended": {
+      const recorded = event.data.tokens ? recordStep(state, event.data.tokens) : state
+      return { state: { ...recorded, finish: event.data.finish }, outputs: [] }
+    }
     case "session.step.failed": {
       const recorded = event.data.tokens ? recordStep(state, event.data.tokens) : state
       return { state: { ...recorded, stepError: event.data.error }, outputs: [] }

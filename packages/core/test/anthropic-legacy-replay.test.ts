@@ -8,7 +8,7 @@ import { SessionLegacy } from "@opencode/schema/session-legacy"
 import { Model } from "@opencode/core/model"
 import { toLLMMessages } from "../src/session/runner/to-llm-message"
 
-const ref = { providerID: "anthropic", id: "claude-opus-5-5", variant: "medium" } as Model.Ref
+const ref = { providerID: "claude-code", id: "claude-opus-5-5", variant: "medium" } as Model.Ref
 const tool = (name: string, id: string, state: unknown, extra = {}) => ({
   type: "tool", id, name, executed: true, providerState: {}, providerResultState: {},
   state, time: { created: 1, ran: 2, completed: 3 }, ...extra,
@@ -40,8 +40,13 @@ test("diagnosis repro and mixed observed empty-state CLI/native projection compi
   expect(mixed.messages.at(-1)!.content[0]).toMatchObject({ type: "tool_result", tool_use_id: "jira", is_error: true })
 })
 
-test("pending executed calls reject", async () => {
+test("pending executed calls reject and interrupted unknown outcomes remain cautionary text", async () => {
   await expect(compile(project([tool("Bash", "pending", { status: "running", input: {} })]))).rejects.toThrow("cannot safely replay")
+  const unknown = project([tool("Bash", "unknown", { status: "error", input: {}, error: { type: "tool.outcome-unknown", message: "Unknown" } })], { interruption: "steer" })
+  const body = (await compile(unknown)).body
+  expect(JSON.stringify(body)).toContain("Its external outcome is unknown")
+  expect(JSON.stringify(body)).toContain("do not assume it did not run or automatically repeat it")
+  expect(JSON.stringify(body)).not.toContain("tool_use")
 })
 
 test("projection preserves non-empty state for rejection and rejects empty IDs", async () => {

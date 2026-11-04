@@ -1,5 +1,5 @@
 import { HttpRecorder } from "@opencode/http-recorder"
-import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
+import { OpenAIChat } from "@opencode/ai/protocols"
 import { Auth, LLMClient, type LLMClientService, RequestExecutor } from "@opencode/ai/route"
 import { Model } from "@opencode/core/model"
 import { Database } from "@opencode/core/database/database"
@@ -114,12 +114,13 @@ const execution = (llmClient: Layer.Layer<LLMClientService>) =>
     SessionExecution.Service,
     Effect.gen(function* () {
       const sessionRunner = yield* SessionRunner.Service
-      const coordinator = yield* SessionRunCoordinator.make<Session.ID, SessionRunner.RunError>({
+      const coordinator = yield* SessionRunCoordinator.make<Session.ID, SessionRunner.RunError, "user" | "inactivity">({
         drain: (sessionID, force) => sessionRunner.drain({ sessionID, force }).pipe(Effect.asVoid),
       })
       return SessionExecution.Service.of({
         active: coordinator.active,
         isActive: coordinator.isActive,
+        bindInterrupt: coordinator.bindInterrupt,
         resume: coordinator.run,
         wake: coordinator.wake,
         interrupt: (sessionID) => coordinator.interrupt(sessionID),

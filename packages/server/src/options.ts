@@ -14,6 +14,8 @@ export const ServerOptions = Schema.Struct({
   hostname: Schema.optional(Schema.String),
   port: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(65_535))),
   password: Schema.optional(Schema.String),
+  // Serve without Basic auth; only honoured when explicitly set, never inferred from a missing password.
+  unauthenticated: Schema.optional(Schema.Boolean),
   cors: Schema.optional(Schema.Array(Schema.String)),
   simulation: Schema.optional(Schema.Boolean),
   database: Schema.optional(Database.Options),
@@ -27,6 +29,7 @@ export const ServerOptions = Schema.Struct({
   config: Schema.optional(
     Schema.Struct({
       directory: Schema.optional(Schema.String),
+      globalAlias: Schema.optional(Schema.String),
       project: Schema.optional(Schema.Boolean),
       claude: Schema.optional(Schema.Boolean),
       file: Schema.optional(Schema.String),

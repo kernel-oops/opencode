@@ -1376,8 +1376,8 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
       syncBlockers()
       return
     }
-    if (event.type === "session.step.ended") {
-      const total =
+    if (event.type === "session.step.ended" || event.type === "session.step.interrupted") {
+      const total = event.data.tokens === undefined ? undefined :
         event.data.tokens.input +
         event.data.tokens.output +
         event.data.tokens.reasoning +
@@ -1388,10 +1388,10 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
       if (!showTools()) flushQuietText(event.data.assistantMessageID)
       write([], {
         usage:
-          total > 0 || event.data.cost
+          total !== undefined && (total > 0 || event.data.cost)
             ? {
                 tokens: total,
-                percent: limit ? Math.round((total / limit) * 100) : undefined,
+                percent: limit && total !== undefined ? Math.round((total / limit) * 100) : undefined,
                 cost: event.data.cost || undefined,
               }
             : undefined,

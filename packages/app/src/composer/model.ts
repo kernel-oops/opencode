@@ -33,6 +33,7 @@ import { createComposerHistory } from "./history/store"
 import { createComposerSubmit } from "./submit"
 import { useAttachmentDestination } from "./attachments/destination"
 import { parseClientSlashCommand } from "./client-slash-command"
+import { sessionPermissionRequest } from "@/session/requests/session-request-tree"
 
 export type ComposerModel = ComposerEditorModel & {
   readonly model: ComposerControls["model"]
@@ -352,6 +353,15 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
         await command.trigger(selected.id, "slash", selected.input)
       }
     },
+    reviewApproval: async (requestID) => {
+      const request = adapter.kind === "active-session"
+        ? sessionPermissionRequest(data.session.list(), data.session.permission.list, adapter.session().id,
+            (item) => item.id === requestID && !!item.review)
+        : undefined
+      if (!request) throw new Error(language.t("permission.review.invalid"))
+      await data.session.permission.reply({ sessionID: request.sessionID, requestID: request.id, decision: "review_once" })
+    },
+    invalidReviewApproval: () => language.t("permission.review.invalid"),
   })
 
   const controller = createComposerEditor({

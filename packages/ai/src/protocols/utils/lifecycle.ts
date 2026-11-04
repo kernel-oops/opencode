@@ -102,9 +102,11 @@ export const finish = (
     readonly reason: FinishReasonDetails
     readonly usage?: Usage
     readonly providerMetadata?: ProviderMetadata
+    /** Discarded partial blocks remain display-only; never manufacture end acknowledgements. */
+    readonly discardPartial?: boolean
   },
 ): State => {
-  const stepped = closeOpenBlocks(stepStart(state, events), events)
+  const stepped = input.discardPartial ? stepStart(state, events) : closeOpenBlocks(stepStart(state, events), events)
   events.push(
     LLMEvent.stepFinish({
       index: 0,

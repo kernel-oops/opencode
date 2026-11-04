@@ -64,6 +64,8 @@ export type RelativePath = string
 
 export type SessionMetadata = { [x: string]: JsonValue }
 
+export type SessionContextBudget = { target: number; maximum: number }
+
 export type SnapshotID = string
 
 export type FileDiffInfo = {
@@ -93,7 +95,13 @@ export type SessionInboxDelivery = "steer" | "queue"
 
 export type SessionInboxSyntheticPayload = { text: string; description?: string; metadata?: { [x: string]: JsonValue } }
 
-export type SessionInboxCompactionPayload = {}
+export type SessionMessageCheckpointBinding = {
+  version: 1
+  sessionID: string
+  revision: number | "Infinity" | "-Infinity" | "NaN"
+  stateHash: string
+  maintenance?: true
+}
 
 export type ShellID = string
 
@@ -122,6 +130,10 @@ export type SessionStructuredError = {
 export type SessionGenerateResponse = { data: { text: string } }
 
 export type SessionInterruptResponse = { interrupted: boolean }
+
+export type SessionTaskStopResponseResult = { interrupted: boolean; paused: boolean }
+
+export type SessionTaskResumeResult = { resumed: boolean }
 
 export type FormID = string
 
@@ -152,6 +164,73 @@ export type SessionStatsToolUsage = {
 
 export type SessionStatsActivity = { date: string; steps: number }
 
+export type SessionNativeTestNativeSteer = false | "response.steer"
+
+export type SessionNativeTestDebug = false | "metadata"
+
+export type SessionNativeTestReason =
+  | "not-requested"
+  | "allowed"
+  | "active"
+  | "allowance-missing"
+  | "protocol-unsupported"
+  | "native-interrupt-conflict"
+  | "model-unavailable"
+
+export type SessionNativeTestKind =
+  | "execution-started"
+  | "execution-finished"
+  | "channel-retired"
+  | "connect"
+  | "connect-failed"
+  | "reuse"
+  | "rotate"
+  | "send"
+  | "send-not-sent"
+  | "send-ambiguous"
+  | "fallback"
+  | "parent-created"
+  | "steer-sent"
+  | "steer-send-unknown"
+  | "steer-accepted"
+  | "progress"
+  | "terminal"
+  | "lease"
+  | "handoff"
+  | "successor-created"
+  | "adopt"
+  | "timer-armed"
+  | "timer-expired"
+  | "timer-cancelled"
+  | "closed"
+  | "poisoned"
+
+export type SessionNativeTestCategory =
+  | "affinity"
+  | "age"
+  | "completed"
+  | "interrupted"
+  | "steered"
+  | "incomplete"
+  | "provider-failure"
+  | "rejected"
+  | "ready"
+  | "required-input"
+  | "lease-lost"
+  | "successor-timeout"
+  | "unbound-successor"
+  | "unexpected-frame"
+  | "transport-or-decoder-failure"
+  | "receipt"
+  | "parent-idle"
+  | "drain"
+  | "stream-failures"
+  | "message-too-large"
+  | "connect-failure"
+  | "not-sent"
+  | "peer-close"
+  | "transport"
+
 export type InstructionEntryKey = string
 
 export type EventID = string
@@ -165,6 +244,14 @@ export type InstructionKey = string
 export type InstructionHash = string
 
 export type SessionInboxSyntheticPayload1 = { text: string; description?: string; metadata?: { [x: string]: any } }
+
+export type SessionMessageCheckpointBinding1 = {
+  version: 1
+  sessionID: string
+  revision: number
+  stateHash: string
+  maintenance?: true
+}
 
 export type SessionMessageNative1 = { [x: string]: any }
 
@@ -190,9 +277,19 @@ export type ModelCapabilities = { tools: boolean; input: Array<string>; output: 
 
 export type MoneyUSDPerMillionTokens = number
 
-export type GenerateTextResponse = { data: { text: string } }
+export type GenerateUsage = {
+  contextTokens?: number
+  inputTokens?: number
+  outputTokens?: number
+  nonCachedInputTokens?: number
+  cacheReadInputTokens?: number
+  cacheWriteInputTokens?: number
+  reasoningTokens?: number
+  totalTokens?: number
+  providerMetadata?: { [x: string]: JsonValue }
+}
 
-export type GenerateUsage = { input?: number; output?: number }
+export type GenerateMediaUsage = { input?: number; output?: number }
 
 export type GenerateNative = { [x: string]: JsonValue }
 
@@ -296,7 +393,7 @@ export type CommandInfo = { name: string; description?: string }
 
 export type RpcOutput = { output?: any }
 
-export type PermissionReply = "once" | "always" | "reject"
+export type PermissionReply = "once" | "always" | "reject" | "review_once"
 
 export type PtyID = string
 
@@ -407,6 +504,15 @@ export type PermissionRule = { action: string; resource: string; effect: Permiss
 
 export type PluginInfo = { id?: PluginID; source: PluginSource; features: PluginFeatures; state: PluginState }
 
+export type SessionTaskBackground = {
+  sessionID: SessionID
+  agent: string
+  description: string
+  status: "running" | "completed" | "error" | "cancelled"
+}
+
+export type SessionTaskStopAllResult = { interrupted: boolean; cancelled: Array<SessionID> }
+
 export type SessionForkBoundary =
   | { type: "before"; messageID: SessionMessageID }
   | { type: "through"; messageID: SessionMessageID }
@@ -502,14 +608,7 @@ export type SessionInboxSynthetic = {
   delivery: SessionInboxDelivery
 }
 
-export type SessionInboxCompaction = {
-  id: SessionMessageID
-  sessionID: SessionID
-  time: { created: number }
-  type: "compaction"
-  payload: SessionInboxCompactionPayload
-  delivery: SessionInboxDelivery
-}
+export type SessionInboxCompactionPayload = { checkpoint?: SessionMessageCheckpointBinding }
 
 export type SessionMessageShell = {
   id: SessionMessageID
@@ -662,6 +761,21 @@ export type SessionStatsTools =
   | { mode: "summary"; totals: SessionStatsToolTotals }
   | { mode: "detail"; totals: SessionStatsToolTotals; usage: Array<SessionStatsToolUsage> }
 
+export type SessionNativeTestSettings = { nativeSteer: SessionNativeTestNativeSteer; debug: SessionNativeTestDebug }
+
+export type SessionNativeTestRecord = {
+  seq: number
+  at: number
+  execution: number
+  exchange: number
+  kind: SessionNativeTestKind
+  category?: SessionNativeTestCategory
+  count?: number
+  budgetMs?: number
+  elapsedMs?: number
+  closeCode?: number
+}
+
 export type InstructionEntryInfo = { key: InstructionEntryKey; value: JsonValue }
 
 export type InstructionEntrySnapshot = Array<{ key: InstructionEntryKey; value: JsonValue; removed: boolean }>
@@ -669,6 +783,8 @@ export type InstructionEntrySnapshot = Array<{ key: InstructionEntryKey; value: 
 export type EventLogSynced = { type: "log.synced"; aggregateID: string; seq?: EventSeq }
 
 export type LocationRef = { directory: AbsolutePath; workspaceID?: WorkspaceID }
+
+export type SessionInboxCompactionPayload1 = { checkpoint?: SessionMessageCheckpointBinding1 }
 
 export type SessionMessageAssistantText1 = { type: "text"; text: string; native?: SessionMessageNative1 }
 
@@ -797,6 +913,7 @@ export type PermissionRequest = {
   metadata?: { [x: string]: JsonValue }
   source?: PermissionSource
   message?: string
+  review?: { kind: "model-refusal"; reason: string }
 }
 
 export type PermissionSavedInfo = {
@@ -982,6 +1099,21 @@ export type ReferenceSource = ReferenceLocalSource | ReferenceGitSource
 
 export type WorktreeList = Array<WorktreeDirectory>
 
+export type SessionContextBudgetBlocked = {
+  reason: string
+  model?: ModelRef
+  inputMargin?: number
+  estimated?: number
+  raw?: number
+  replayGenerated?: number
+  input?: number
+  output?: number
+  inputMaximum?: number
+  contextMaximum?: number
+  maximum: number
+  selection: string
+}
+
 export type SessionMessageModelSelected = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
@@ -1001,11 +1133,14 @@ export type SessionMessageCompactionCompleted = {
   model?: ModelRef
   native?: SessionMessageNative
   summary: string
+  checkpoint?: SessionMessageCheckpointBinding
   cost?: MoneyUSD
   tokens?: TokenUsageInfo
 }
 
 export type SessionStatsModelUsage = { model: ModelRef; steps: number; tokens: TokenUsageInfo; cost: MoneyUSD }
+
+export type GenerateResult = { text: string; responseSchemaName?: string; usage?: GenerateUsage; model?: ModelRef }
 
 export type ProviderSettings = {
   timeout?: number | false
@@ -1014,6 +1149,8 @@ export type ProviderSettings = {
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
+  nativeInterrupt?: string
+  nativeSteer?: "response.steer"
   encoding?: ProviderEncoding
 } & { [x: string]: any }
 
@@ -1028,6 +1165,8 @@ export type ConfigProviderSettings = {
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
+  nativeInterrupt?: string
+  nativeSteer?: "response.steer"
   encoding?: ProviderEncoding
 } & { [x: string]: JsonValue | null }
 
@@ -1045,6 +1184,8 @@ export type ModelVariant = {
 }
 
 export type PermissionRuleset = Array<PermissionRule>
+
+export type SessionTaskStatus = { paused: boolean; active: boolean; background: Array<SessionTaskBackground> }
 
 export type UsageLimitsBudget = {
   id: string
@@ -1064,7 +1205,7 @@ export type UsageLimitsBudget = {
 export type GenerateImageResult = {
   images: Array<GenerateImageOutput2>
   cost?: MoneyUSD
-  tokens?: GenerateUsage
+  tokens?: GenerateMediaUsage
   native?: GenerateNative
 }
 
@@ -1095,6 +1236,15 @@ export type SessionInboxUserPayload1 = {
   metadata?: { [x: string]: any }
 }
 
+export type SessionInboxCompaction = {
+  id: SessionMessageID
+  sessionID: SessionID
+  time: { created: number }
+  type: "compaction"
+  payload: SessionInboxCompactionPayload
+  delivery: SessionInboxDelivery
+}
+
 export type SessionMessageToolStateCompleted = {
   status: "completed"
   input: { [x: string]: JsonValue }
@@ -1122,6 +1272,14 @@ export type FormState =
   | { status: "pending" }
   | { status: "answered"; answer: FormAnswer }
   | { status: "cancelled"; message?: string }
+
+export type SessionNativeTestExecution = {
+  id: number
+  active: boolean
+  settings: SessionNativeTestSettings
+  transport?: "http" | "websocket"
+  reason?: SessionNativeTestReason
+}
 
 export type SessionAgentSelected = {
   id: EventID
@@ -1171,6 +1329,16 @@ export type SessionMetadataUpdated = {
   durable: { aggregateID: string; seq: EventSeq; version: 1 }
   location?: LocationRef
   data: { sessionID: SessionID; metadata: SessionMetadata }
+}
+
+export type SessionContextBudgetConfigured = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.context-budget.configured"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; policy: SessionContextBudget | null }
 }
 
 export type SessionViewed = {
@@ -1269,6 +1437,92 @@ export type SessionExecutionStarted = {
   durable: { aggregateID: string; seq: EventSeq; version: 1 }
   location?: LocationRef
   data: { sessionID: SessionID }
+}
+
+export type SessionNativeControlRequested = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.requested"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    attemptID: EventID
+    assistantMessageID: SessionMessageID
+    steer?: {
+      version: 1
+      protocol: "response.steer"
+      inboxIDs: [SessionMessageID, ...Array<SessionMessageID>]
+      parentResponseID: string
+      model: ModelRef
+    }
+  }
+}
+
+export type SessionNativeControlAccepted = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.accepted"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; attemptID: EventID; steerID: string }
+}
+
+export type SessionNativeControlContinuationRequested = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.continuation-requested"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; attemptID: EventID; callIDs: [string, ...Array<string>] }
+}
+
+export type SessionNativeControlCommitted = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.committed"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    attemptID: EventID
+    successorResponseID: string
+    successorAssistantID: SessionMessageID
+  }
+}
+
+export type SessionNativeControlRejected = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.rejected"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; attemptID: EventID; code: string }
+}
+
+export type SessionNativeControlSettled = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.settled"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; attemptID: EventID; outcome: "verified" | "completed" | "user-recovery" }
+}
+
+export type SessionNativeControlUnresolved = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.native-control.unresolved"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; attemptID: EventID; message: string; wireBody?: string }
 }
 
 export type SessionExecutionSucceeded = {
@@ -1382,6 +1636,35 @@ export type SessionStepStreamed = {
   data: { sessionID: SessionID; assistantMessageID: SessionMessageID }
 }
 
+export type SessionStepObserved = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.step.observed"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; assistantMessageID: SessionMessageID; native: { [x: string]: JsonValue } }
+}
+
+export type SessionStepInterrupted = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.step.interrupted"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    assistantMessageID: SessionMessageID
+    reason: "steer"
+    nativeReceipt?: { responseID: string; output: Array<any> }
+    cost?: MoneyUSD
+    tokens?: TokenUsageInfo
+    snapshot?: SnapshotID
+    files?: Array<RelativePath>
+  }
+}
+
 export type SessionStepEnded = {
   id: EventID
   created: number
@@ -1395,8 +1678,29 @@ export type SessionStepEnded = {
     finish: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
     rawFinish?: string
     native?: SessionMessageNative1
-    cost: MoneyUSD
-    tokens: TokenUsageInfo
+    cost?: MoneyUSD
+    tokens?: TokenUsageInfo
+    snapshot?: SnapshotID
+    files?: Array<RelativePath>
+  }
+}
+
+export type SessionStepNativeEnded = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.step.native-ended"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    assistantMessageID: SessionMessageID
+    protocol: "response.steer"
+    boundary: "steered" | "completed"
+    finish: "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown"
+    rawFinish?: string
+    native?: SessionMessageNative1
+    usage?: { cost: MoneyUSD; tokens: TokenUsageInfo }
     snapshot?: SnapshotID
     files?: Array<RelativePath>
   }
@@ -1551,6 +1855,7 @@ export type SessionCompactionEnded = {
     model?: ModelRef
     native?: SessionMessageNative1
     text: string
+    checkpoint?: SessionMessageCheckpointBinding1
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
   }
@@ -1772,6 +2077,7 @@ export type PermissionAsked = {
     metadata?: { [x: string]: any }
     source?: PermissionSource
     message?: string
+    review?: { kind: "model-refusal"; reason: string }
   }
 }
 
@@ -2208,6 +2514,11 @@ export type ReferenceInfo = {
   source: ReferenceSource
 }
 
+export type SessionContextBudgetState = {
+  attempted?: { binding: string; estimated: number }
+  blocked?: SessionContextBudgetBlocked
+}
+
 export type SessionMessageCompaction =
   | SessionMessageCompactionRunning
   | SessionMessageCompactionCompleted
@@ -2227,6 +2538,8 @@ export type SessionStatsInfo = {
   activity: Array<SessionStatsActivity>
   models: Array<SessionStatsModelUsage>
 }
+
+export type GenerateTextResponse = { data: GenerateResult }
 
 export type ProviderRequest = {
   settings: ProviderSettings
@@ -2267,25 +2580,6 @@ export type ModelInfo = {
   status: "alpha" | "beta" | "deprecated" | "active"
   enabled: boolean
   limit: { context: number; input?: number; output: number }
-}
-
-export type SessionInfo = {
-  id: SessionID
-  parentID?: SessionID
-  fork?: { sessionID: SessionID; boundary: SessionForkBoundary }
-  projectID: ProjectID
-  agent?: AgentID
-  model?: ModelRef
-  cost: MoneyUSD
-  tokens: TokenUsageInfo
-  outcome?: "succeeded" | "failed" | "interrupted"
-  time: { created: number; updated: number; busy?: number; idle?: number; viewed?: number; archived?: number }
-  title?: string
-  subpath?: RelativePath
-  metadata?: SessionMetadata
-  permissions?: PermissionRuleset
-  revert?: SessionRevert
-  location: LocationPublicRef
 }
 
 export type SessionCreated = {
@@ -2426,7 +2720,12 @@ export type ConfigEntry =
                 }
           }
         }
-        compaction?: { auto?: boolean; keep?: { tokens?: number }; buffer?: ConfigCompactionPercent | number }
+        compaction?: {
+          auto?: boolean
+          keep?: { tokens?: number; strict?: boolean }
+          buffer?: ConfigCompactionPercent | number
+          models?: { [x: string]: { keep?: { tokens?: number; strict?: boolean } } }
+        }
         skills?: Array<string>
         commands?: {
           [x: string]: {
@@ -2520,6 +2819,8 @@ export type ConfigEntry =
             resource: string
             effect: "allow" | "deny"
           }>
+          task_continuation_agents?: Array<string>
+          task_continuation_eligible?: Array<string>
         }
       }
     }
@@ -2558,10 +2859,23 @@ export type SessionMessageAssistantTool = {
 
 export type FormFields = [FormField, ...Array<FormField>]
 
+export type SessionNativeTestStatus = {
+  sessionID: SessionID
+  serverRun: string
+  requested: SessionNativeTestSettings
+  effective: SessionNativeTestSettings
+  pending: boolean
+  supported: boolean
+  reason: SessionNativeTestReason
+  execution?: SessionNativeTestExecution
+  unresolvedFence: boolean
+  diagnostics: { records: Array<SessionNativeTestRecord>; dropped: number; coalesced: number; progress: number }
+}
+
 export type SessionInboxItem =
   | { type: "user"; payload: SessionInboxUserPayload1; delivery: SessionInboxDelivery }
   | { type: "synthetic"; payload: SessionInboxSyntheticPayload1; delivery: SessionInboxDelivery }
-  | { type: "compaction"; payload: SessionInboxCompactionPayload; delivery: SessionInboxDelivery }
+  | { type: "compaction"; payload: SessionInboxCompactionPayload1; delivery: SessionInboxDelivery }
   | { type: "move"; payload: SessionInboxMovePayload1; delivery: SessionInboxDelivery }
 
 export type SessionMessageAssistantTool1 = {
@@ -2581,7 +2895,7 @@ export type SessionMessageAssistantTool1 = {
 export type GenerateDecisionResult = {
   answers: Array<GenerateDecisionAnswer>
   cost?: MoneyUSD
-  tokens?: GenerateUsage
+  tokens?: GenerateMediaUsage
   native?: GenerateNative
 }
 
@@ -2615,6 +2929,37 @@ export type ScheduleInfo = {
   time: { created: number; updated: number }
 }
 
+export type SessionInfo = {
+  id: SessionID
+  parentID?: SessionID
+  fork?: { sessionID: SessionID; boundary: SessionForkBoundary }
+  projectID: ProjectID
+  agent?: AgentID
+  model?: ModelRef
+  cost: MoneyUSD
+  tokens: TokenUsageInfo
+  outcome?: "succeeded" | "failed" | "interrupted"
+  time: { created: number; updated: number; busy?: number; idle?: number; viewed?: number; archived?: number }
+  title?: string
+  subpath?: RelativePath
+  metadata?: SessionMetadata
+  permissions?: PermissionRuleset
+  contextBudget?: SessionContextBudget
+  contextBudgetState?: SessionContextBudgetState
+  revert?: SessionRevert
+  location: LocationPublicRef
+}
+
+export type SessionContextBudgetChanged = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.context-budget.changed"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; state: SessionContextBudgetState | null }
+}
+
 export type AgentInfo = {
   id: AgentID
   name: string
@@ -2627,11 +2972,6 @@ export type AgentInfo = {
   color?: AgentColor
   steps?: number
   permissions: PermissionRuleset
-}
-
-export type SessionsResponse = {
-  data: Array<SessionInfo>
-  cursor: { previous?: SessionsCursor | null; next?: SessionsCursor | null }
 }
 
 export type SessionInboxInfo = SessionInboxUser | SessionInboxSynthetic | SessionInboxCompaction | SessionInboxMove
@@ -2652,6 +2992,7 @@ export type SessionMessageAssistant = {
   tokens?: TokenUsageInfo
   error?: SessionStructuredError
   retry?: SessionMessageAssistantRetry
+  interruption?: "steer"
 }
 
 export type FormInfo = { id: FormID; sessionID: string; title: string; metadata?: FormMetadata; fields: FormFields }
@@ -2689,6 +3030,11 @@ export type SessionMessageAssistantContentEncoded =
 export type GenerateDecisionsResponse = { data: GenerateDecisionResult }
 
 export type FormInfo1 = { id: FormID; sessionID: string; title: string; metadata?: FormMetadata1; fields: FormFields1 }
+
+export type SessionsResponse = {
+  data: Array<SessionInfo>
+  cursor: { previous?: SessionsCursor | null; next?: SessionsCursor | null }
+}
 
 export type SessionMessageInfo =
   | SessionMessageAgentSelected
@@ -2752,6 +3098,8 @@ export type SessionEventDurable =
   | SessionRenamed
   | SessionMetadataUpdated
   | SessionPermissions
+  | SessionContextBudgetConfigured
+  | SessionContextBudgetChanged
   | SessionViewed
   | SessionArchived
   | SessionUnarchived
@@ -2762,6 +3110,13 @@ export type SessionEventDurable =
   | SessionInboxCancelled
   | SessionInboxDeliveryChanged
   | SessionExecutionStarted
+  | SessionNativeControlRequested
+  | SessionNativeControlAccepted
+  | SessionNativeControlContinuationRequested
+  | SessionNativeControlCommitted
+  | SessionNativeControlRejected
+  | SessionNativeControlSettled
+  | SessionNativeControlUnresolved
   | SessionExecutionSucceeded
   | SessionExecutionFailed
   | SessionExecutionInterrupted
@@ -2772,7 +3127,10 @@ export type SessionEventDurable =
   | SessionShellEnded
   | SessionStepStarted
   | SessionStepStreamed
+  | SessionStepObserved
+  | SessionStepInterrupted
   | SessionStepEnded
+  | SessionStepNativeEnded
   | SessionStepFailed
   | SessionTextStarted
   | SessionTextEnded
@@ -2809,6 +3167,8 @@ export type V2Event =
   | SessionRenamed
   | SessionMetadataUpdated
   | SessionPermissions
+  | SessionContextBudgetConfigured
+  | SessionContextBudgetChanged
   | SessionViewed
   | SessionArchived
   | SessionUnarchived
@@ -2820,6 +3180,13 @@ export type V2Event =
   | SessionInboxCancelled
   | SessionInboxDeliveryChanged
   | SessionExecutionStarted
+  | SessionNativeControlRequested
+  | SessionNativeControlAccepted
+  | SessionNativeControlContinuationRequested
+  | SessionNativeControlCommitted
+  | SessionNativeControlRejected
+  | SessionNativeControlSettled
+  | SessionNativeControlUnresolved
   | SessionExecutionSucceeded
   | SessionExecutionFailed
   | SessionExecutionInterrupted
@@ -2830,7 +3197,10 @@ export type V2Event =
   | SessionShellEnded
   | SessionStepStarted
   | SessionStepStreamed
+  | SessionStepObserved
+  | SessionStepInterrupted
   | SessionStepEnded
+  | SessionStepNativeEnded
   | SessionStepFailed
   | SessionTextStarted
   | SessionTextDelta
@@ -3028,6 +3398,34 @@ export type SkillNotFoundError = {
 }
 export const isSkillNotFoundError = (value: unknown): value is SkillNotFoundError =>
   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "SkillNotFoundError"
+
+export type SessionNativeTestUnsupportedError = {
+  readonly _tag: "SessionNativeTestUnsupportedError"
+  readonly reason:
+    | "not-requested"
+    | "allowed"
+    | "active"
+    | "allowance-missing"
+    | "protocol-unsupported"
+    | "native-interrupt-conflict"
+    | "model-unavailable"
+  readonly message: string
+}
+export const isSessionNativeTestUnsupportedError = (value: unknown): value is SessionNativeTestUnsupportedError =>
+  typeof value === "object" &&
+  value !== null &&
+  "_tag" in value &&
+  value["_tag"] === "SessionNativeTestUnsupportedError"
+
+export type SessionNativeTestLaneOccupiedError = {
+  readonly _tag: "SessionNativeTestLaneOccupiedError"
+  readonly message: string
+}
+export const isSessionNativeTestLaneOccupiedError = (value: unknown): value is SessionNativeTestLaneOccupiedError =>
+  typeof value === "object" &&
+  value !== null &&
+  "_tag" in value &&
+  value["_tag"] === "SessionNativeTestLaneOccupiedError"
 
 export type InstructionEntryValueTooLargeError = {
   readonly _tag: "InstructionEntryValueTooLargeError"
@@ -3323,6 +3721,7 @@ export type SessionUpdateInput = {
   readonly permissions?:
     | ReadonlyArray<{ readonly action: string; readonly resource: string; readonly effect: "allow" | "deny" | "ask" }>
     | undefined
+  readonly contextBudget?: { readonly target: number; readonly maximum: number } | null | undefined
   readonly archived?: boolean | undefined
 }
 
@@ -3410,6 +3809,18 @@ export type SessionSyntheticInput = {
 
 export type SessionSyntheticOutput = { data: SessionInboxSynthetic }["data"]
 
+export type SessionAppendInput = {
+  readonly sessionID: string
+  readonly id?: string | null | undefined
+  readonly text: string
+  readonly final?: boolean | null | undefined
+  readonly agent?: string | null | undefined
+  readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null | undefined
+  readonly metadata?: { readonly [x: string]: JsonValue } | null | undefined
+}
+
+export type SessionAppendOutput = { data: { id: SessionMessageID } }["data"]
+
 export type SessionShellInput = {
   readonly sessionID: string
   readonly id?: string | undefined
@@ -3478,6 +3889,22 @@ export type SessionGenerateOutput = SessionGenerateResponse["data"]
 export type SessionInterruptInput = { readonly sessionID: string; readonly resume?: boolean | undefined }
 
 export type SessionInterruptOutput = SessionInterruptResponse
+
+export type SessionTaskStatusInput = { readonly sessionID: string }
+
+export type SessionTaskStatusOutput = SessionTaskStatus
+
+export type SessionTaskStopResponseInput = { readonly sessionID: string }
+
+export type SessionTaskStopResponseOutput = SessionTaskStopResponseResult
+
+export type SessionTaskResumeInput = { readonly sessionID: string }
+
+export type SessionTaskResumeOutput = SessionTaskResumeResult
+
+export type SessionTaskStopAllInput = { readonly sessionID: string }
+
+export type SessionTaskStopAllOutput = SessionTaskStopAllResult
 
 export type SessionBackgroundInput = { readonly sessionID: string }
 
@@ -3784,6 +4211,24 @@ export type ExperimentalSessionImportInput = {
       readonly resource: string
       readonly effect: "allow" | "deny" | "ask"
     }>
+    readonly contextBudget?: { readonly target: number; readonly maximum: number }
+    readonly contextBudgetState?: {
+      readonly attempted?: { readonly binding: string; readonly estimated: number }
+      readonly blocked?: {
+        readonly reason: string
+        readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+        readonly inputMargin?: number
+        readonly estimated?: number
+        readonly raw?: number
+        readonly replayGenerated?: number
+        readonly input?: number
+        readonly output?: number
+        readonly inputMaximum?: number
+        readonly contextMaximum?: number
+        readonly maximum: number
+        readonly selection: string
+      }
+    }
     readonly revert?: {
       readonly messageID: string
       readonly partID?: string
@@ -3820,6 +4265,18 @@ export type ExperimentalSessionSkillOutput = void
 export type ExperimentalSessionWaitInput = { readonly sessionID: string }
 
 export type ExperimentalSessionWaitOutput = void
+
+export type ExperimentalSessionNativeTestGetInput = { readonly sessionID: string }
+
+export type ExperimentalSessionNativeTestGetOutput = { data: SessionNativeTestStatus }["data"]
+
+export type ExperimentalSessionNativeTestPutInput = {
+  readonly sessionID: string
+  readonly nativeSteer: false | "response.steer"
+  readonly debug: false | "metadata"
+}
+
+export type ExperimentalSessionNativeTestPutOutput = { data: SessionNativeTestStatus }["data"]
 
 export type ExperimentalSessionInstructionsEntryListInput = { readonly sessionID: string }
 
@@ -3881,6 +4338,10 @@ export type ModelDefaultOutput = { location: LocationPublicRef; data: ModelInfo 
 export type ExperimentalGenerateTextInput = {
   readonly prompt: string
   readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null | undefined
+  readonly responseSchema?:
+    | { readonly name: string; readonly schema: { readonly [x: string]: JsonValue } }
+    | null
+    | undefined
 }
 
 export type ExperimentalGenerateTextOutput = GenerateTextResponse["data"]
@@ -4213,7 +4674,7 @@ export type PermissionGetOutput = { data: PermissionRequest }["data"]
 export type PermissionReplyInput = {
   readonly sessionID: string
   readonly requestID: string
-  readonly decision: "once" | "always" | "reject"
+  readonly decision: "once" | "always" | "reject" | "review_once"
   readonly message?: string | undefined
   readonly experimental?: { readonly scope?: "request" | undefined } | undefined
 }
@@ -4300,6 +4761,8 @@ export type EventSubscribeInput = {
         | "session.renamed"
         | "session.metadata.updated"
         | "session.permissions"
+        | "session.context-budget.configured"
+        | "session.context-budget.changed"
         | "session.viewed"
         | "session.archived"
         | "session.unarchived"
@@ -4311,6 +4774,13 @@ export type EventSubscribeInput = {
         | "session.inbox.cancelled"
         | "session.inbox.delivery.changed"
         | "session.execution.started"
+        | "session.native-control.requested"
+        | "session.native-control.accepted"
+        | "session.native-control.continuation-requested"
+        | "session.native-control.committed"
+        | "session.native-control.rejected"
+        | "session.native-control.settled"
+        | "session.native-control.unresolved"
         | "session.execution.succeeded"
         | "session.execution.failed"
         | "session.execution.interrupted"
@@ -4321,7 +4791,10 @@ export type EventSubscribeInput = {
         | "session.shell.ended"
         | "session.step.started"
         | "session.step.streamed"
+        | "session.step.observed"
+        | "session.step.interrupted"
         | "session.step.ended"
+        | "session.step.native-ended"
         | "session.step.failed"
         | "session.text.started"
         | "session.text.delta"
@@ -4827,6 +5300,18 @@ export type SessionWaitInput = ExperimentalSessionWaitInput
 
 /** @deprecated Use `ExperimentalSessionWaitOutput`. Removed in the next minor. */
 export type SessionWaitOutput = ExperimentalSessionWaitOutput
+
+/** @deprecated Use `ExperimentalSessionNativeTestGetInput`. Removed in the next minor. */
+export type SessionNativeTestGetInput = ExperimentalSessionNativeTestGetInput
+
+/** @deprecated Use `ExperimentalSessionNativeTestGetOutput`. Removed in the next minor. */
+export type SessionNativeTestGetOutput = ExperimentalSessionNativeTestGetOutput
+
+/** @deprecated Use `ExperimentalSessionNativeTestPutInput`. Removed in the next minor. */
+export type SessionNativeTestPutInput = ExperimentalSessionNativeTestPutInput
+
+/** @deprecated Use `ExperimentalSessionNativeTestPutOutput`. Removed in the next minor. */
+export type SessionNativeTestPutOutput = ExperimentalSessionNativeTestPutOutput
 
 /** @deprecated Use `ExperimentalSessionInstructionsEntryListInput`. Removed in the next minor. */
 export type SessionInstructionsEntryListInput = ExperimentalSessionInstructionsEntryListInput

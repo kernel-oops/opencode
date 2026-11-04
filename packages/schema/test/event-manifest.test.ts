@@ -51,6 +51,8 @@ describe("public event manifest", () => {
     expect(Workspace.Event).toBe(WorkspaceEvent)
     expect(Workspace.Event.Definitions).toBe(WorkspaceEvent.Definitions)
     expect(EventManifest.Latest.get("session.step.ended")).toBe(SessionEvent.Step.Ended)
+    expect(EventManifest.Latest.get("session.step.interrupted")).toBe(SessionEvent.Step.Interrupted)
+    expect(EventManifest.Durable.get("session.step.interrupted.1")).toBe(SessionEvent.Step.Interrupted)
     expect(EventManifest.Latest.get("agent.updated")).toBe(Agent.Event.Updated)
     expect(EventManifest.Latest.get("project.updated")).toBe(Project.Event.Updated)
     expect(Agent.Event.Definitions).toEqual([Agent.Event.Updated])
@@ -114,6 +116,8 @@ describe("public event manifest", () => {
         "session.renamed.1",
         "session.metadata.updated.1",
         "session.permissions.1",
+        "session.context-budget.configured.1",
+        "session.context-budget.changed.1",
         "session.viewed.1",
         "session.archived.1",
         "session.unarchived.1",
@@ -125,6 +129,13 @@ describe("public event manifest", () => {
         "session.inbox.cancelled.1",
         "session.inbox.delivery.changed.1",
         "session.execution.started.1",
+        "session.native-control.requested.1",
+        "session.native-control.settled.1",
+        "session.native-control.unresolved.1",
+        "session.native-control.accepted.1",
+        "session.native-control.continuation-requested.1",
+        "session.native-control.committed.1",
+        "session.native-control.rejected.1",
         "session.execution.succeeded.1",
         "session.execution.failed.1",
         "session.execution.interrupted.1",
@@ -135,8 +146,11 @@ describe("public event manifest", () => {
         "session.shell.ended.1",
         "session.step.started.1",
         "session.step.streamed.1",
+        "session.step.observed.1",
         "session.step.ended.1",
+        "session.step.native-ended.1",
         "session.step.failed.1",
+        "session.step.interrupted.1",
         "session.text.started.1",
         "session.text.ended.1",
         "session.tool.input.started.1",

@@ -21,7 +21,14 @@ type DraftAssistant = WritableDraft<SessionMessage.Assistant>
 
 const decodeAssistantContent = Schema.decodeUnknownSync(Schema.Array(SessionMessage.AssistantContent))
 
-const projectTerminalSnapshot = (draft: DraftAssistant, event: SessionEvent.Step.Ended | SessionEvent.Step.Failed) => {
+const projectTerminalSnapshot = (
+  draft: DraftAssistant,
+  event:
+    | SessionEvent.Step.Ended
+    | SessionEvent.Step.NativeEnded
+    | SessionEvent.Step.Failed
+    | SessionEvent.Step.Interrupted,
+) => {
   if (event.data.snapshot || event.data.files)
     draft.snapshot = {
       ...draft.snapshot,
@@ -82,7 +89,16 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
     Match.type<SessionEvent.DurableEvent>(),
     Match.discriminatorsExhaustive("type")({
       "session.created": () => Effect.void,
+      "session.context-budget.configured": () => Effect.void,
+      "session.context-budget.changed": () => Effect.void,
       "session.viewed": () => Effect.void,
+      "session.native-control.requested": () => Effect.void,
+      "session.native-control.settled": () => Effect.void,
+      "session.native-control.unresolved": () => Effect.void,
+      "session.native-control.accepted": () => Effect.void,
+      "session.native-control.continuation-requested": () => Effect.void,
+      "session.native-control.committed": () => Effect.void,
+      "session.native-control.rejected": () => Effect.void,
       "session.archived": () => Effect.void,
       "session.unarchived": () => Effect.void,
       "session.message.content.updated": (event) =>
@@ -262,14 +278,31 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
           draft.time.streamed = created
         })
       },
+      "session.step.observed": (event) => updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+        draft.native = castDraft({ ...draft.native, ...event.data.native })
+      }),
       "session.step.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.time.completed = created
           draft.finish = event.data.finish
           draft.rawFinish = event.data.rawFinish
-          draft.native = castDraft(event.data.native)
+          draft.native = castDraft({ ...draft.native, ...event.data.native })
           draft.cost = event.data.cost
           draft.tokens = event.data.tokens
+          projectTerminalSnapshot(draft, event)
+        })
+      },
+      "session.step.native-ended": (event) => {
+        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.completed = created
+          draft.finish = event.data.finish
+          draft.rawFinish = event.data.rawFinish
+          // Merge: observed done-item proof from Step.Observed survives the terminal.
+          draft.native = castDraft({ ...draft.native, ...event.data.native })
+          if (event.data.usage) {
+            draft.cost = event.data.usage.cost
+            draft.tokens = castDraft(event.data.usage.tokens)
+          }
           projectTerminalSnapshot(draft, event)
         })
       },
@@ -278,9 +311,28 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
           draft.time.completed = created
           draft.finish = event.data.finish ?? "error"
           draft.rawFinish = event.data.rawFinish
-          draft.native = castDraft(event.data.native)
+          draft.native = castDraft({ ...draft.native, ...event.data.native })
           draft.error = castDraft(event.data.error)
           draft.retry = undefined
+          if (event.data.cost !== undefined && event.data.tokens !== undefined) {
+            draft.cost = event.data.cost
+            draft.tokens = castDraft(event.data.tokens)
+          }
+          projectTerminalSnapshot(draft, event)
+        })
+      },
+      "session.step.interrupted": (event) => {
+        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.completed = created
+          draft.interruption = event.data.reason
+          draft.retry = undefined
+          draft.finish = undefined
+          draft.rawFinish = undefined
+          draft.native = event.data.nativeReceipt ? {
+            nativeInterrupted: true,
+            responseId: event.data.nativeReceipt.responseID,
+            completedOutputItems: event.data.nativeReceipt.output,
+          } : undefined
           if (event.data.cost !== undefined && event.data.tokens !== undefined) {
             draft.cost = event.data.cost
             draft.tokens = castDraft(event.data.tokens)
@@ -436,6 +488,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
               model: event.data.model,
               native: event.data.native,
               summary: event.data.text,
+              checkpoint: event.data.checkpoint,
               cost: event.data.cost,
               tokens: event.data.tokens,
             })
@@ -451,6 +504,7 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
               model: event.data.model,
               native: event.data.native,
               summary: event.data.text,
+              checkpoint: event.data.checkpoint,
               cost: event.data.cost,
               tokens: event.data.tokens,
               time: { created },

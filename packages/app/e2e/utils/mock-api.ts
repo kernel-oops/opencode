@@ -396,6 +396,13 @@ const Group = HttpApiGroup.make("mock")
     }),
   )
   .add(
+    HttpApiEndpoint.get("sessionTask", "/api/session/:sessionID/task", {
+      params: SessionParams,
+      success: Json,
+      error: MockInternal.pipe(HttpApiSchema.status(500)),
+    }),
+  )
+  .add(
     HttpApiEndpoint.get("sessionInbox", "/api/session/:sessionID/inbox", {
       params: SessionParams,
       success: Json,

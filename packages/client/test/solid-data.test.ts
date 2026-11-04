@@ -14,6 +14,69 @@ const session = (viewed: number): SessionInfo => ({
   location: { directory: "/project" },
 })
 
+test("task observations share one read, survive one view's disposal, and fence released or replaced clients", async () => {
+  const requests: Array<{ sessionID: string; reply: (response: Response) => void }> = []
+  const makeClient = () => OpenCode.make({
+    baseUrl: "http://fixture.local",
+    fetch: (input, init) => new Promise<Response>((reply) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      requests.push({ sessionID: new URL(request.url).pathname.split("/")[3]!, reply })
+    }),
+  })
+  let client = makeClient()
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => client, directory: "/project-a", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  const state = (active: boolean) => Response.json({ active, paused: false, background: [] })
+  try {
+    const first = setup.data.session.task.observe("ses_a")
+    const second = setup.data.session.task.observe("ses_a")
+    const pending = setup.data.session.task.sync("ses_a")
+    expect(requests.map((request) => request.sessionID)).toEqual(["ses_a"])
+    first()
+    first()
+    requests[0]!.reply(state(true))
+    await pending
+    expect(setup.data.session.task.get("ses_a")?.active).toBe(true)
+    const old = setup.data.session.task.sync("ses_a")
+    second()
+    expect(setup.data.session.task.get("ses_a")).toBeUndefined()
+    const replacement = setup.data.session.task.observe("ses_a")
+    const current = setup.data.session.task.sync("ses_a")
+    expect(requests).toHaveLength(3)
+    requests[2]!.reply(state(false))
+    await current
+    requests[1]!.reply(state(true))
+    await old
+    expect(setup.data.session.task.get("ses_a")?.active).toBe(false)
+    const staleClient = setup.data.session.task.sync("ses_a")
+    client = makeClient()
+    const switched = setup.data.session.task.sync("ses_a")
+    expect(setup.data.session.task.get("ses_a")).toBeUndefined()
+    requests[3]!.reply(state(true))
+    await staleClient
+    await switched
+    expect(setup.data.session.task.get("ses_a")).toBeUndefined()
+    const newClient = setup.data.session.task.sync("ses_a")
+    requests[4]!.reply(state(false))
+    await newClient
+    expect(setup.data.session.task.get("ses_a")?.active).toBe(false)
+    const other = setup.data.session.task.observe("ses_b")
+    const otherRead = setup.data.session.task.sync("ses_b")
+    requests[5]!.reply(state(true))
+    await otherRead
+    expect(setup.data.session.task.get("ses_a")?.active).toBe(false)
+    expect(setup.data.session.task.get("ses_b")?.active).toBe(true)
+    replacement()
+    other()
+    expect(setup.data.session.task.get("ses_a")).toBeUndefined()
+    expect(setup.data.session.task.get("ses_b")).toBeUndefined()
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("uses the configured initial window and retains normal cursor page sizes", async () => {
   const requests: { limit: string | null; cursor: string | null }[] = []
   const api = OpenCode.make({
@@ -1555,3 +1618,336 @@ async function wait(check: () => boolean) {
     await Bun.sleep(10)
   }
 }
+
+for (const terminal of ["shell.exited", "shell.deleted"] as const) {
+  test(`shell hydration overlays concurrent creation and ${terminal}`, async () => {
+    const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+    const info = (id: string) => ({
+      id,
+      command: "fixture",
+      cwd: "/project",
+      shell: "/bin/sh",
+      file: "/fixture/output",
+      status: "running" as const,
+      metadata: { sessionID: "ses_refresh" },
+      time: { started: 1 },
+    })
+    const request = Promise.withResolvers<Response>()
+    const started = Promise.withResolvers<void>()
+    const api = OpenCode.make({
+      baseUrl: "http://opencode.local",
+      fetch: async () => {
+        started.resolve()
+        return request.promise
+      },
+    })
+    const setup = createRoot((dispose) => ({
+      data: createData({
+        api: () => api,
+        directory: "/project",
+        event: {
+          on: () => () => {},
+          listen(handler) {
+            listeners.add(handler)
+            return () => listeners.delete(handler)
+          },
+        },
+      }),
+      dispose,
+    }))
+    try {
+      const pending = setup.data.shell.sync()
+      await started.promise
+      const emit = (details: OpenCodeEvent) => listeners.forEach((handler) => handler({ details }))
+      emit({
+        type: "shell.created",
+        location: { directory: "/project" },
+        data: { info: info("shell_new") },
+      } as OpenCodeEvent)
+      emit({
+        type: terminal,
+        location: { directory: "/project" },
+        data: { id: "shell_old", status: "exited", exit: 0 },
+      } as OpenCodeEvent)
+      request.resolve(Response.json({ location: { directory: "/project" }, data: [info("shell_old")] }))
+      await pending
+      expect(setup.data.shell.list().map((item) => item.id)).toEqual(["shell_new"])
+      emit({
+        type: "shell.created",
+        location: { directory: "/project" },
+        data: { info: { ...info("shell_done"), status: "exited" } },
+      } as OpenCodeEvent)
+      expect(setup.data.shell.list().map((item) => item.id)).toEqual(["shell_new"])
+    } finally {
+      setup.dispose()
+    }
+  })
+}
+
+test("descendant hydration coalesces parent pages and cancels obsolete subtree traversal", async () => {
+  const page = Promise.withResolvers<Response>()
+  const requested = Promise.withResolvers<void>()
+  const requests: string[] = []
+  const api = OpenCode.make({
+    baseUrl: "http://fixture.invalid",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      requests.push(url.pathname + url.search)
+      if (url.pathname === "/api/session/ses_refresh") return Response.json({ data: session(1) })
+      if (url.searchParams.get("parentID") === "ses_refresh") {
+        requested.resolve()
+        return page.promise.then((response) => response.clone())
+      }
+      return Response.json({ data: [], cursor: {} })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    const controller = new AbortController()
+    const old = setup.data.session.descendants.sync("ses_refresh", { signal: controller.signal })
+    await requested.promise
+    controller.abort()
+    page.resolve(Response.json({ data: [{ ...session(1), id: "ses_child", parentID: "ses_refresh" }], cursor: {} }))
+    await old
+    expect(requests.filter((request) => request.includes("parentID=ses_child"))).toHaveLength(0)
+    await Promise.all([
+      setup.data.session.descendants.sync("ses_refresh"),
+      setup.data.session.descendants.sync("ses_refresh"),
+    ])
+    expect(requests.filter((request) => request.includes("parentID=ses_refresh"))).toHaveLength(1)
+    expect(requests.filter((request) => request.includes("parentID=ses_child"))).toHaveLength(1)
+    setup.data.session.descendants.invalidate("ses_refresh")
+    await setup.data.session.descendants.sync("ses_refresh")
+    expect(requests.filter((request) => request.includes("parentID=ses_refresh"))).toHaveLength(2)
+    expect(requests.filter((request) => request.includes("parentID=ses_child"))).toHaveLength(2)
+  } finally {
+    setup.dispose()
+  }
+})
+
+test.each(["metadata", "location", "project"] as const)(
+  "live %s updates survive a held descendant snapshot",
+  async (kind) => {
+    const page = Promise.withResolvers<Response>()
+    const started = Promise.withResolvers<void>()
+    const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+    const child = { ...session(1), id: "ses_child", parentID: "ses_refresh", metadata: { running: false } }
+    const api = OpenCode.make({
+      baseUrl: "http://fixture.invalid",
+      fetch: async (input, init) => {
+        const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+        if (url.searchParams.get("parentID") !== "ses_refresh") return Response.json({ data: [], cursor: {} })
+        started.resolve()
+        return page.promise
+      },
+    })
+    const setup = createRoot((dispose) => ({
+      data: createData({
+        api: () => api,
+        directory: "/project",
+        event: {
+          on: () => () => {},
+          listen(handler) {
+            listeners.add(handler)
+            return () => listeners.delete(handler)
+          },
+        },
+      }),
+      dispose,
+    }))
+    try {
+      setup.data.session.remember(session(1))
+      setup.data.session.remember(child)
+      const hydration = setup.data.session.descendants.sync("ses_refresh")
+      await started.promise
+      const details: OpenCodeEvent =
+        kind === "metadata"
+          ? { type: "session.metadata.updated", data: { sessionID: child.id, metadata: { running: true } } }
+          : {
+              type: "session.moved",
+              id: "evt_move",
+              created: 2,
+              data: {
+                sessionID: child.id,
+                location: { directory: kind === "location" ? "/new-location" : "/project" },
+                projectID: kind === "project" ? "new-project" : "project",
+                subpath: "new-subpath",
+              },
+            }
+      listeners.forEach((listener) => listener({ name: details.type, details }))
+      page.resolve(Response.json({ data: [child], cursor: {} }))
+      await hydration
+      const current = setup.data.session.get(child.id)
+      expect(current?.parentID).toBe("ses_refresh")
+      if (kind === "metadata") expect(current?.metadata).toEqual({ running: true })
+      else {
+        expect(current?.location.directory).toBe(kind === "location" ? "/new-location" : "/project")
+        expect(current?.projectID).toBe(kind === "project" ? "new-project" : "project")
+        expect(current?.subpath).toBe("new-subpath")
+      }
+    } finally {
+      page.resolve(Response.json({ data: [], cursor: {} }))
+      setup.dispose()
+    }
+  },
+)
+
+test("large fully cached descendant hydration yields to input and cancellation without HTTP", async () => {
+  let requests = 0
+  const children = Array.from({ length: 2_000 }, (_, index) => ({
+    ...session(1),
+    id: `child_${index}`,
+    parentID: "ses_refresh",
+  }))
+  const api = OpenCode.make({
+    baseUrl: "http://fixture.invalid",
+    fetch: async (input, init) => {
+      requests++
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      if (url.pathname === "/api/session/ses_refresh") return Response.json({ data: session(1) })
+      return Response.json({ data: url.searchParams.get("parentID") === "ses_refresh" ? children : [], cursor: {} })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    await setup.data.session.descendants.sync("ses_refresh")
+    requests = 0
+    let completed = false
+    let inputBeforeCompletion = false
+    const input = setTimeout(() => {
+      inputBeforeCompletion = !completed
+    }, 5)
+    await setup.data.session.descendants.sync("ses_refresh")
+    completed = true
+    clearTimeout(input)
+    expect(inputBeforeCompletion).toBe(true)
+    expect(requests).toBe(0)
+
+    setup.data.session.descendants.invalidate("ses_refresh")
+    const controller = new AbortController()
+    const cancel = setTimeout(() => controller.abort(), 0)
+    await setup.data.session.descendants.sync("ses_refresh", { signal: controller.signal })
+    clearTimeout(cancel)
+    expect(controller.signal.aborted).toBe(true)
+    // Cancellation is processed during index construction, before any obsolete subtree request.
+    expect(requests).toBe(0)
+  } finally {
+    setup.dispose()
+  }
+})
+
+test("cold paginated idle descendants stay selected-scope and metadata changes supersede a page", async () => {
+  const page = Promise.withResolvers<Response>()
+  const started = Promise.withResolvers<void>()
+  const requests: string[] = []
+  let moved = false
+  const info = (id: string, parentID?: string) => ({ ...session(1), id, parentID })
+  const api = OpenCode.make({
+    baseUrl: "http://fixture.invalid",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      const parentID = url.searchParams.get("parentID")
+      if (url.pathname === "/api/session/ses_refresh") return Response.json({ data: session(1) })
+      if (url.pathname === "/api/session/moved")
+        return Response.json({ data: info("moved", moved ? "other" : "ses_refresh") })
+      if (url.pathname === "/api/session/created") return Response.json({ data: info("created", "idle") })
+      requests.push(`${parentID}:${url.searchParams.get("cursor") ?? ""}`)
+      if (parentID === "ses_refresh" && !url.searchParams.has("cursor")) {
+        started.resolve()
+        return page.promise
+      }
+      if (parentID === "ses_refresh")
+        return Response.json({ data: [info("idle", "ses_refresh"), info("sibling", "other")], cursor: {} })
+      if (parentID === "idle") return Response.json({ data: [info("grand", "idle")], cursor: {} })
+      return Response.json({ data: [], cursor: {} })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    await setup.data.session.sync("moved")
+    const hydration = setup.data.session.descendants.sync("ses_refresh")
+    await started.promise
+    moved = true
+    setup.data.session.invalidate("moved")
+    await setup.data.session.sync("moved")
+    await setup.data.session.sync("created")
+    page.resolve(Response.json({ data: [info("moved", "ses_refresh")], cursor: { next: "second" } }))
+    await hydration
+    expect(requests).toEqual(["ses_refresh:", "ses_refresh:second", "idle:", "grand:", "created:"])
+    expect(setup.data.session.get("moved")?.parentID).toBe("other")
+    expect(setup.data.session.get("sibling")).toBeUndefined()
+  } finally {
+    setup.dispose()
+  }
+})
+
+test.each([
+  { decision: "review_once" as const, status: 404, outcome: "rejected", pending: 0 },
+  { decision: "once" as const, status: 404, outcome: "resolved", pending: 0 },
+  { decision: "review_once" as const, status: 400, outcome: "rejected", pending: 1 },
+])("a $status reply to $decision is $outcome and leaves $pending pending", async (input) => {
+  const request = {
+    id: "per_expired",
+    sessionID: "ses_permission",
+    action: "synthetic",
+    resources: ["/synthetic"],
+    ...(input.decision === "review_once" ? { review: { kind: "model-refusal" as const, reason: "Fixture" } } : {}),
+  }
+  const posts: unknown[] = []
+  // Real HTTP, so the generated client decodes the server's declared error bodies itself.
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(incoming) {
+      if (incoming.method === "GET") return Response.json({ data: [request] })
+      posts.push(await incoming.json())
+      return input.status === 404
+        ? Response.json(
+            {
+              _tag: "PermissionNotFoundError",
+              requestID: request.id,
+              message: "Permission request not found: per_expired",
+            },
+            { status: 404 },
+          )
+        : Response.json(
+            { _tag: "InvalidRequestError", message: "Fixture invalid", kind: "invalid_permission_reply" },
+            { status: 400 },
+          )
+    },
+  })
+  const api = OpenCode.make({ baseUrl: `http://127.0.0.1:${server.port}` })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/synthetic",
+      event: { on: () => () => {}, listen: () => () => {} },
+    }),
+    dispose,
+  }))
+  try {
+    await setup.data.session.permission.sync(request.sessionID)
+    expect(setup.data.session.permission.list(request.sessionID)).toHaveLength(1)
+    const outcome = await setup.data.session.permission
+      .reply({ sessionID: request.sessionID, requestID: request.id, decision: input.decision })
+      .then(
+        () => "resolved",
+        () => "rejected",
+      )
+    expect(outcome).toBe(input.outcome)
+    expect(setup.data.session.permission.list(request.sessionID)).toHaveLength(input.pending)
+    expect(posts).toEqual([{ decision: input.decision }])
+  } finally {
+    setup.dispose()
+    await server.stop(true)
+  }
+})

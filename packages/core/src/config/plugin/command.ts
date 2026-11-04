@@ -98,7 +98,7 @@ export const Plugin = define({
                     agent: selected.id,
                     model: model ?? selected.info?.model ?? parent.model,
                   })
-                  yield* sessions.prompt({
+                  const admitted = yield* sessions.prompt({
                     ...input.prompt,
                     sessionID: child.id,
                     text: ["You are a subagent spawned by another session.", text].join("\n"),
@@ -111,8 +111,8 @@ export const Plugin = define({
                     agent: selected.id,
                     description: command.description ?? name,
                   }
-                  yield* subagents.start(recovery)
-                  yield* subagents.background(recovery)
+                  const handle = yield* subagents.start(recovery, { admissionID: admitted.id, admitOnly: true })
+                  yield* subagents.background(recovery, handle)
                   return
                 }
                 if (agent !== undefined) {

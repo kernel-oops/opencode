@@ -789,6 +789,12 @@ describe("ChatGPTPlugin", () => {
         "thread-id": child.id,
         "x-client-request-id": child.id,
       })
+      const grandchild = yield* sessions.create({ parentID: child.id })
+      expect((yield* request(Provider.ID.openai, "https://api.openai.com/v1", grandchild.id)).headers).toEqual({
+        "session-id": parent.id,
+        "thread-id": grandchild.id,
+        "x-client-request-id": grandchild.id,
+      })
       const eligible = required(yield* models.get(Provider.ID.openai, Model.ID.make("gpt-5.5")))
       expect(eligible.package).toBe("@opencode/ai/providers/openai")
       expect(eligible.headers).not.toHaveProperty("x-openai-chatpass-test")
@@ -1149,8 +1155,11 @@ describe("ChatGPTPlugin", () => {
       yield* addGithubCopilotPlugin()
       const executor = { execute: () => Effect.die("unused WebSocket execution") }
       const transport = SessionModelTransport.Service.of({
+        steer: () => Effect.succeed(false),
+        hasPendingInput: () => false,
         bind: () => executor,
         close: () => Effect.void,
+        retire: () => Effect.void,
         closeAll: Effect.void,
       })
       const sessionID = Session.ID.make("ses_websocket_hooks")
@@ -1194,7 +1203,7 @@ describe("ChatGPTPlugin", () => {
       const disabled = yield* prepare("http")
 
       expect(prepared.options.webSocket).toBe(executor)
-      expect(prepared.options.http).toBeUndefined()
+      expect(prepared.options.http).toBeFunction()
       expect(defaulted.options.webSocket).toBeUndefined()
       expect(disabled.options.webSocket).toBeUndefined()
     }),

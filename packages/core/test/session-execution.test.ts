@@ -19,20 +19,169 @@ import { SessionRestart } from "@opencode/core/session/execution/restart"
 import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
+import { SessionProjector } from "@opencode/core/session/projector"
+import { SessionHistory } from "@opencode/core/session/history"
+import { toLLMMessages } from "@opencode/core/session/runner/to-llm-message"
+import { Agent } from "@opencode/core/agent"
+import { Model } from "@opencode/schema/model"
 import { SessionRunner } from "@opencode/core/session/runner/index"
-import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
+import { SessionInboxTable, SessionTable, SessionMessageTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
+import { SessionModelTransport } from "@opencode/core/session/model-transport"
+import { Event } from "@opencode/schema/event"
+import { Global } from "@opencode/util/global"
+import { join } from "node:path"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope, Schema } from "effect"
 import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
+import { tmpdirScoped } from "./fixture/tmpdir"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, Job.node, KV.node, Session.node]),
+    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, Job.node, KV.node, Session.node, SessionNativeTest.node, SessionModelTransport.node]),
   ),
 )
 
 describe("SessionExecution lifecycle", () => {
+  it.effect(
+    "budget blocks ordinary wakes and receipts once while preserving controls, stops and explicit rechecks",
+    () =>
+      Effect.gen(function* () {
+        const database = yield* Database.Service
+        const sessions = yield* Session.Service
+        const bus = yield* Bus.Service
+        const sessionID = Session.ID.create()
+        yield* seedSessions(database, [sessionID])
+        yield* sessions.setContextBudget({ sessionID, contextBudget: { target: 400_000, maximum: 480_000 } })
+        const scope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+        let drains = 0
+        const context = yield* buildExecution(scope, () => Effect.sync(() => void drains++))
+        const execution = Context.get(context, SessionExecution.Service)
+        yield* bus.publish(SessionEvent.ContextBudgetChanged, {
+          sessionID,
+          state: {
+            attempted: { binding: "fixture", estimated: 500_000 },
+            blocked: { reason: "Protected floor", estimated: 500_000, maximum: 480_000, selection: "null" },
+          },
+        })
+        yield* seedInbox(database, sessionID, ["steer", "queue"])
+        yield* execution.wake(sessionID)
+        yield* execution.resume(sessionID)
+        yield* execution.awaitIdle(sessionID)
+        expect(drains).toBe(0)
+        expect(yield* SessionInbox.list(database.db, sessionID)).toHaveLength(2)
+        expect(yield* execution.interrupt(sessionID)).toBe(false)
+        yield* database.db
+          .insert(SessionInboxTable)
+          .values({
+            id: SessionMessage.ID.create(),
+            session_id: sessionID,
+            type: "compaction",
+            payload: {},
+            delivery: "steer",
+            enqueued_seq: 100,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* execution.resume(sessionID)
+        expect(drains).toBe(1)
+        // A model switch requests a fresh check; it is not itself evidence that the next request fits.
+        yield* database.db
+          .delete(SessionInboxTable)
+          .where(eq(SessionInboxTable.session_id, sessionID))
+          .run()
+          .pipe(Effect.orDie)
+        yield* sessions.switchModel({
+          sessionID,
+          model: Schema.decodeUnknownSync(Model.Ref)({ id: "smaller", providerID: "fixture" }),
+        })
+        yield* execution.resume(sessionID)
+        expect(drains).toBe(2)
+        yield* sessions.setContextBudget({ sessionID, contextBudget: { target: 400_000, maximum: 480_000 } })
+        yield* execution.resume(sessionID)
+        expect(drains).toBe(3)
+        expect((yield* sessions.get(sessionID)).contextBudgetState).toBeUndefined()
+      }),
+  )
+  for (const persist of [false, true]) it.effect(`opaque observations survive SQLite reopen and do not block ordinary restart (persist=${persist})`, () => Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const { path: directory } = yield* tmpdirScoped("native-reopen-")
+    const parent = Session.ID.create()
+    const child = Session.ID.create()
+    const ids = [parent, child]
+    const fileLayer = AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionStore.node, Job.node, SessionProjector.node]), [
+      Database.node.replace(Database.layer({ path: join(directory, "fixture.sqlite") }).pipe(
+        Layer.provide(Layer.succeed(Global.Service, Global.make({ data: directory }))),
+      )),
+      Bus.node.replace(Bus.configured({ persist })),
+    ])
+    const identities = yield* Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      yield* seedSessions(database, [parent], { time_suspended: 123, resume_attempts: 0 })
+      yield* seedSessions(database, [child], { parent_id: parent, time_suspended: 123, resume_attempts: 0 })
+      yield* seedInbox(database, parent, ["steer"])
+      return yield* Effect.forEach(ids, (sessionID) => Effect.gen(function* () {
+        const data = { sessionID, attemptID: Event.ID.create(), assistantMessageID: SessionMessage.ID.create() }
+        if (sessionID === parent) {
+          yield* bus.publish(SessionEvent.Step.Started, { sessionID, assistantMessageID: data.assistantMessageID,
+            agent: Agent.defaultID, model: Schema.decodeUnknownSync(Model.Ref)({ id: "fixture", providerID: "openai" }), started: 0 })
+          yield* bus.publish(SessionEvent.Step.Observed, { sessionID, assistantMessageID: data.assistantMessageID, native: {
+            nativeObserved: true, unresolvedHostedItems: [{ type: "mcp_call", id: "external_action" }],
+            completedOutputItems: [
+              { type: "message", id: "ack_text", content: [{ type: "output_text", text: "Acknowledged prefix" }] },
+              { type: "reasoning", id: "ack_reasoning", summary: [], encrypted_content: "acknowledged-proof" },
+            ],
+          } })
+          // Simulate a crash before any display parts or terminal event are published.
+        }
+        return data
+      }))
+    }).pipe(Effect.scoped, Effect.provide(Layer.fresh(fileLayer)))
+    // All first-scope SQL handles are closed; this is a new connection and service graph.
+    yield* Effect.gen(function* () {
+      const database = yield* Database.Service
+      const store = yield* SessionStore.Service
+      const jobs = yield* Job.Service
+      const row = yield* database.db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, identities[0].assistantMessageID)).get()
+      const assistant = yield* SessionHistory.decodeMessageRow(row!)
+      const replay = JSON.stringify(toLLMMessages([assistant], Schema.decodeUnknownSync(Model.Ref)({ id: "fixture", providerID: "openai" }), "openai"))
+      expect(replay).toContain("external outcome is unknown")
+      expect(replay).toContain("external_action")
+      expect(replay).toContain("Acknowledged prefix")
+      expect(replay).toContain("acknowledged-proof")
+      expect(assistant).not.toHaveProperty("native.nativeInterrupted")
+      let drains = 0
+      const restarted = yield* Deferred.make<void>()
+      const runner = SessionRunner.Service.of({ drain: () => Effect.sync(() => {
+        drains++
+        return SessionRunner.DrainResult.Complete()
+      }).pipe(Effect.tap(() => Deferred.succeed(restarted, undefined))) })
+      // The execution under test uses only the runner capability, supplied explicitly here.
+      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+      const provide = (() => Effect.provideService(SessionRunner.Service, runner)) as Instance.Interface["provide"]
+      const executionContext = yield* Layer.build(Layer.fresh(SessionExecution.layer).pipe(
+        Layer.provide(Layer.succeed(Instance.Service, Instance.Service.of({ provide }))),
+      ))
+      const execution = Context.get(executionContext, SessionExecution.Service)
+      const restartContext = yield* Layer.build(SessionRestart.layer().pipe(
+        Layer.provide(Layer.succeed(SessionExecution.Service, execution)),
+        Layer.provide(Layer.succeed(Session.Service, sessions)),
+      ))
+      yield* Context.get(restartContext, SessionRestart.Service).resumeSuspendedSessions
+      yield* Deferred.await(restarted)
+      yield* Effect.forEach(ids, execution.awaitIdle, { discard: true })
+      expect(drains).toBeGreaterThan(0)
+      expect(yield* store.listSuspended()).not.toContain(parent)
+      // Restart does not consume input itself; the runner owns its delivery.
+      expect(yield* SessionInbox.list(database.db, parent)).toHaveLength(1)
+      // Keep references explicit: these are reopened-file services, not outer memory fixtures.
+      expect(yield* jobs.pendingBackground).toHaveLength(0)
+    }).pipe(Effect.scoped, Effect.provide(Layer.fresh(fileLayer)))
+  }))
+
   test("classifies success and typed failure terminals", () => {
     expect(SessionExecution.terminal(Exit.succeed(undefined))).toEqual({ type: "succeeded" })
     expect(
@@ -1309,7 +1458,7 @@ function seedInbox(
           id: SessionMessage.ID.create(),
           session_id: sessionID,
           type: entry.type,
-          payload: entry.type === "user" ? { text: "queued prompt" } : {},
+          payload: entry.type === "user" ? { text: "queued prompt" } : ({} as typeof SessionInboxTable.$inferInsert.payload),
           delivery: entry.delivery,
           enqueued_seq: index + 1,
         }

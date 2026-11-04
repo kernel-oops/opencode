@@ -40,9 +40,17 @@ export interface Target {
 
 export type Invocation = Pick<Tool.Context, "sessionID" | "agent" | "messageID" | "id">
 
+export interface ReviewMetadata {
+  /** Extra metadata for the external_directory request (bound scope, binding identity). */
+  readonly external?: Permission.AssertInput["metadata"]
+  /** Extra metadata for the read request (review action, binding identity). */
+  readonly read?: Permission.AssertInput["metadata"]
+}
+
 export interface ReadOptions {
   /** A target already authorized by this invocation, used for filename recovery. */
-  readonly siblingOf: Target
+  readonly siblingOf?: Target
+  readonly metadata?: ReviewMetadata
 }
 
 export interface Interface {
@@ -146,15 +154,16 @@ const layer = Layer.effect(
       context: Invocation,
       options?: ReadOptions,
     ) {
-      const target = yield* resolve({ path: file, kind: options ? "file" : undefined })
-      const sibling = options && path.dirname(target.absolute) === path.dirname(options.siblingOf.absolute)
+      const target = yield* resolve({ path: file, kind: options?.siblingOf ? "file" : undefined })
+      const sibling = options?.siblingOf && path.dirname(target.absolute) === path.dirname(options.siblingOf.absolute)
 
       // Filename recovery shares the directory approval, but checks the recovered file's own read rules.
-      if (!sibling) yield* authorizeExternal([target], context)
+      if (!sibling) yield* authorizeExternal([target], context, options?.metadata?.external)
       yield* permission.assert({
         action: "read",
         resources: [target.resource],
         save: ["*"],
+        ...(options?.metadata?.read === undefined ? {} : { metadata: options.metadata.read }),
         ...invocation(context),
       })
       return target

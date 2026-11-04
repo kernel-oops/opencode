@@ -43,6 +43,8 @@ import type {
   SessionCommandOutput,
   SessionSyntheticInput,
   SessionSyntheticOutput,
+  SessionAppendInput,
+  SessionAppendOutput,
   SessionShellInput,
   SessionShellOutput,
   SessionCompactInput,
@@ -67,6 +69,14 @@ import type {
   SessionGenerateOutput,
   SessionInterruptInput,
   SessionInterruptOutput,
+  SessionTaskStatusInput,
+  SessionTaskStatusOutput,
+  SessionTaskStopResponseInput,
+  SessionTaskStopResponseOutput,
+  SessionTaskResumeInput,
+  SessionTaskResumeOutput,
+  SessionTaskStopAllInput,
+  SessionTaskStopAllOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -95,6 +105,10 @@ import type {
   ExperimentalSessionSkillOutput,
   ExperimentalSessionWaitInput,
   ExperimentalSessionWaitOutput,
+  ExperimentalSessionNativeTestGetInput,
+  ExperimentalSessionNativeTestGetOutput,
+  ExperimentalSessionNativeTestPutInput,
+  ExperimentalSessionNativeTestPutOutput,
   ExperimentalSessionInstructionsEntryListInput,
   ExperimentalSessionInstructionsEntryListOutput,
   ExperimentalSessionInstructionsEntryPutInput,
@@ -719,6 +733,7 @@ export function make(options: ClientOptions) {
               title: input["title"],
               metadata: input["metadata"],
               permissions: input["permissions"],
+              contextBudget: input["contextBudget"],
               archived: input["archived"],
             },
             successStatus: 204,
@@ -794,6 +809,25 @@ export function make(options: ClientOptions) {
             },
             successStatus: 200,
             declaredStatuses: [400, 401, 404, 409],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      append: (input: SessionAppendInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionAppendOutput }>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/append`,
+            body: {
+              id: input["id"],
+              text: input["text"],
+              final: input["final"],
+              agent: input["agent"],
+              model: input["model"],
+              metadata: input["metadata"],
+            },
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404],
             empty: false,
           },
           requestOptions,
@@ -941,6 +975,52 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ),
+      task: {
+        status: (input: SessionTaskStatusInput, requestOptions?: RequestOptions) =>
+          request<SessionTaskStatusOutput>(
+            {
+              method: "GET",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/task`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        stopResponse: (input: SessionTaskStopResponseInput, requestOptions?: RequestOptions) =>
+          request<SessionTaskStopResponseOutput>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/task/stop-response`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        resume: (input: SessionTaskResumeInput, requestOptions?: RequestOptions) =>
+          request<SessionTaskResumeOutput>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/task/resume`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+        stopAll: (input: SessionTaskStopAllInput, requestOptions?: RequestOptions) =>
+          request<SessionTaskStopAllOutput>(
+            {
+              method: "POST",
+              path: `/api/session/${encodeURIComponent(input.sessionID)}/task/stop-all`,
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404],
+              empty: false,
+            },
+            requestOptions,
+          ),
+      },
       background: (input: SessionBackgroundInput, requestOptions?: RequestOptions) =>
         request<SessionBackgroundOutput>(
           {
@@ -1117,6 +1197,31 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ),
+        nativeTest: {
+          get: (input: ExperimentalSessionNativeTestGetInput, requestOptions?: RequestOptions) =>
+            request<{ readonly data: ExperimentalSessionNativeTestGetOutput }>(
+              {
+                method: "GET",
+                path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/native-test`,
+                successStatus: 200,
+                declaredStatuses: [400, 401, 404, 503],
+                empty: false,
+              },
+              requestOptions,
+            ).then((value) => value.data),
+          put: (input: ExperimentalSessionNativeTestPutInput, requestOptions?: RequestOptions) =>
+            request<{ readonly data: ExperimentalSessionNativeTestPutOutput }>(
+              {
+                method: "PUT",
+                path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/native-test`,
+                body: { nativeSteer: input["nativeSteer"], debug: input["debug"] },
+                successStatus: 200,
+                declaredStatuses: [400, 401, 404, 409, 503],
+                empty: false,
+              },
+              requestOptions,
+            ).then((value) => value.data),
+        },
         instructions: {
           entry: {
             list: (input: ExperimentalSessionInstructionsEntryListInput, requestOptions?: RequestOptions) =>
@@ -1177,7 +1282,7 @@ export function make(options: ClientOptions) {
             {
               method: "POST",
               path: `/api/experimental/generate/text`,
-              body: { prompt: input["prompt"], model: input["model"] },
+              body: { prompt: input["prompt"], model: input["model"], responseSchema: input["responseSchema"] },
               successStatus: 200,
               declaredStatuses: [400, 401, 404, 422, 502, 503],
               empty: false,
@@ -2682,6 +2787,13 @@ export function make(options: ClientOptions) {
       skill: client.experimental.session.skill,
       /** @deprecated Use `client.experimental.session.wait`. Removed in the next minor. */
       wait: client.experimental.session.wait,
+      /** @deprecated Use `client.experimental.session.nativeTest`. Removed in the next minor. */
+      nativeTest: {
+        /** @deprecated Use `client.experimental.session.nativeTest.get`. Removed in the next minor. */
+        get: client.experimental.session.nativeTest.get,
+        /** @deprecated Use `client.experimental.session.nativeTest.put`. Removed in the next minor. */
+        put: client.experimental.session.nativeTest.put,
+      },
       /** @deprecated Use `client.experimental.session.instructions`. Removed in the next minor. */
       instructions: {
         /** @deprecated Use `client.experimental.session.instructions.entry`. Removed in the next minor. */

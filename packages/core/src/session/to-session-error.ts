@@ -6,6 +6,7 @@ import { Integration } from "../integration.js"
 import { AgentNotFoundError, StepFailedError } from "./error.js"
 import { ModelResolver } from "../model-resolver.js"
 import { SessionRunnerModel } from "./runner/model.js"
+import { SessionContextBudget } from "./context-budget.js"
 
 const tokenSharingMessages = {
   subscription_sharing_user_not_eligible:
@@ -31,6 +32,7 @@ const BUDGET_LIMIT_MESSAGE = "Workspace usage limit reached. Model use is paused
 const MODEL_BUDGET_LIMIT_MESSAGE = "You've reached the spend limit for this model. Switch models to keep going."
 
 export function toSessionError(cause: unknown): SessionError.Error {
+  if (SessionContextBudget.isBlocked(cause)) return { type: "context.budget-blocked", message: cause.message }
   if (cause instanceof AIError) {
     // ChatGPT's usage limit arrives in HTTP and stream errors alike, whatever their reason, so its code decides the type.
     if (cause.reason.body?.includes("subscription_sharing_usage_limit_exceeded"))
@@ -71,6 +73,7 @@ export function toSessionError(cause: unknown): SessionError.Error {
     }
   }
   if (cause instanceof Permission.BlockedError) return { type: "permission.rejected", message: cause.message }
+  if (cause instanceof Permission.ReviewStaleError) return { type: "permission.review-stale", message: cause.message }
   if (cause instanceof Permission.CorrectedError) return { type: "permission.rejected", message: cause.feedback }
   if (cause instanceof ToolFailure || cause instanceof Tool.Error) {
     if (cause.error === undefined) return { type: "tool.execution", message: cause.message }

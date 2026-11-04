@@ -11,6 +11,8 @@ import { Mcp } from "../mcp/index.js"
 import { Mime } from "../mime.js"
 import { Permission } from "../permission.js"
 import { Tool } from "../tool.js"
+import { ReviewAction } from "@opencode/util/bound/review-action"
+import { Location } from "../location.js"
 import { ToolOutput } from "../tool-output.js"
 import { ReadToolFileSystem } from "./read-filesystem.js"
 
@@ -36,6 +38,7 @@ export const layer = Layer.effect(
     const tools = yield* Tool.Service
     const bus = yield* Bus.Service
     const permission = yield* Permission.Service
+    const location = yield* Location.Service
     const toolOutput = yield* ToolOutput.Service
     const lock = Semaphore.makeUnsafe(1)
     let discovered: Mcp.Tool[] = []
@@ -55,11 +58,17 @@ export const layer = Layer.effect(
                 output: (tool.outputSchema ?? {}) as JsonSchema.JsonSchema,
                 execute: (input, context) =>
                   Effect.gen(function* () {
+                    const args = structuredClone((input ?? {}) as Record<string, unknown>)
                     yield* permission.assert({
                       action: name(tool.server, tool.name),
                       resources: ["*"],
                       save: ["*"],
-                      metadata: { input: input ?? {} },
+                      metadata: {
+                        input: structuredClone(args),
+                        [ReviewAction.KEY]: ReviewAction.make({
+                          identity: name(tool.server, tool.name), arguments: args, cwd: location.directory, complete: true,
+                        }),
+                      },
                       sessionID: context.sessionID,
                       agent: context.agent,
                       source: {
@@ -72,7 +81,7 @@ export const layer = Layer.effect(
                       .callTool({
                         server: tool.server,
                         name: tool.name,
-                        args: (input ?? {}) as Record<string, unknown>,
+                        args,
                         sessionID: context.sessionID,
                       })
                       .pipe(
@@ -165,5 +174,5 @@ const toContent = Effect.fnUntraced(function* (part: Mcp.ToolResultContent, tool
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Tool.node, Mcp.node, Bus.node, Permission.node, ToolOutput.node],
+  deps: [Tool.node, Mcp.node, Bus.node, Permission.node, Location.node, ToolOutput.node],
 })

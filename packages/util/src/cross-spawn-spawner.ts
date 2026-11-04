@@ -36,6 +36,21 @@ const killGroups = () =>
     }
   })
 
+export interface InheritedReadOnlyFd {
+  readonly child: number
+  readonly parent: number
+}
+
+const inheritedReadOnlyFds = new WeakMap<ChildProcess.StandardCommand, ReadonlyArray<InheritedReadOnlyFd>>()
+
+/** Pass already-open parent descriptors to the child at fixed numbers instead of reopening their pathnames. */
+export function registerInheritedReadOnlyFds(
+  command: ChildProcess.StandardCommand,
+  descriptors: ReadonlyArray<InheritedReadOnlyFd>,
+) {
+  inheritedReadOnlyFds.set(command, descriptors)
+}
+
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
 const toTag = (err: NodeJS.ErrnoException): PlatformError.SystemErrorTag => {
@@ -173,18 +188,20 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
     sout: ChildProcess.StdoutConfig,
     serr: ChildProcess.StderrConfig,
     extra: ReadonlyArray<{ fd: number; config: ChildProcess.AdditionalFdConfig }>,
+    inherited: ReadonlyArray<InheritedReadOnlyFd>,
   ): NodeChildProcess.StdioOptions => {
     const pipe = (x: NodeChildProcess.IOType | undefined) =>
       process.platform === "win32" && x === "pipe" ? "overlapped" : x
-    const arr: Array<NodeChildProcess.IOType | undefined> = [
+    const arr: Array<NodeChildProcess.IOType | number | undefined> = [
       pipe(input(sin.stream)),
       pipe(output(sout.stream)),
       pipe(output(serr.stream)),
     ]
-    if (extra.length === 0) return arr as NodeChildProcess.StdioOptions
-    const max = extra.reduce((acc, x) => Math.max(acc, x.fd), 2)
+    if (extra.length === 0 && inherited.length === 0) return arr as NodeChildProcess.StdioOptions
+    const max = [...extra.map((x) => x.fd), ...inherited.map((x) => x.child)].reduce((acc, fd) => Math.max(acc, fd), 2)
     for (let i = 3; i <= max; i++) arr[i] = "ignore"
     for (const x of extra) arr[x.fd] = pipe("pipe")
+    for (const x of inherited) arr[x.child] = x.parent
     return arr as NodeChildProcess.StdioOptions
   }
 
@@ -456,13 +473,14 @@ const makeCrossSpawnSpawner = Effect.gen(function* () {
           const sout = stdio(command.options, "stdout")
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
+          const inherited = inheritedReadOnlyFds.get(command) ?? []
           const dir = yield* cwd(command.options)
 
           const [proc, closed, exited, stopOutput] = yield* Effect.acquireRelease(
             spawn(command, {
               cwd: dir,
               env: env(command.options),
-              stdio: stdios(sin, sout, serr, extra),
+              stdio: stdios(sin, sout, serr, extra, inherited),
               detached: command.options.detached ?? process.platform !== "win32",
               shell: command.options.shell,
               windowsHide: process.platform === "win32",

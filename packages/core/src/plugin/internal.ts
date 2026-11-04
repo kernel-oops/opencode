@@ -63,6 +63,7 @@ import { Schedule } from "../schedule.js"
 import { Session } from "../session.js"
 import { SessionCompaction } from "../session/compaction.js"
 import { SessionInstructions } from "../session/instructions.js"
+import { SessionTaskControl } from "../session/task-control.js"
 import { SubagentJob } from "../session/subagent-job.js"
 import { Shell } from "../shell.js"
 import { ShellSelect } from "../shell/select.js"
@@ -84,7 +85,13 @@ import { ArtifactTools } from "../tool/plugin/artifact.js"
 import { ScheduleTools } from "../tool/plugin/schedule.js"
 import { ShellTool } from "../tool/plugin/shell.js"
 import { SkillTool } from "../tool/plugin/skill.js"
+import { TaskCallbackPlugin } from "./task-callback.js"
 import { SubagentTool } from "../tool/plugin/subagent.js"
+import { NewSessionTool } from "../tool/plugin/new-session.js"
+import { Database } from "../database/database.js"
+import { SessionExecution } from "../session/execution.js"
+import { SessionStore } from "../session/store.js"
+import { TaskTool } from "../tool/plugin/task.js"
 import { TodoTool } from "../tool/plugin/todo.js"
 import { Tool } from "../tool.js"
 import { ToolOutput } from "../tool-output.js"
@@ -109,6 +116,7 @@ import { VcsHgPlugin } from "./vcs/hg.js"
 import { ToolInputRepairPlugin } from "./tool-input-repair.js"
 import { OptimizePlugin } from "./optimize.js"
 import { VcsGitPlugin } from "./vcs/git.js"
+import { Git } from "../git.js"
 import { VerbosityPlugin } from "./verbosity.js"
 import { WarmingPlugin } from "./warming.js"
 import { WellKnownPlugin } from "../wellknown/plugin.js"
@@ -151,8 +159,13 @@ const services = [
   Ripgrep.Service,
   Schedule.Service,
   Session.Service,
+  Database.Service,
+  Git.Service,
+  SessionStore.Service,
+  SessionExecution.Service,
   SessionCompaction.Service,
   SessionInstructions.Service,
+  SessionTaskControl.Service,
   SubagentJob.Service,
   Shell.Service,
   ShellSelect.Service,
@@ -207,8 +220,13 @@ export const requirements = LayerNode.group([
   Ripgrep.node,
   Schedule.node,
   Session.node,
+  Database.node,
+  Git.node,
+  SessionStore.node,
+  SessionExecution.node,
   SessionCompaction.node,
   SessionInstructions.node,
+  SessionTaskControl.node,
   SubagentJob.node,
   Shell.node,
   ShellSelect.node,
@@ -259,7 +277,11 @@ const pre = [
   ShellTool.Plugin,
   SkillTool.Plugin,
   SubagentTool.Plugin,
+  NewSessionTool.Plugin,
+  TaskTool.Plugin,
   TodoTool.Plugin,
+  // Runs after tool plugins so the report-only guard sees every advertised tool.
+  TaskCallbackPlugin.Plugin,
   WebFetchTool.Plugin,
   WebSearchTool.Plugin,
   WriteTool.Plugin,

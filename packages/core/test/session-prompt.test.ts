@@ -58,6 +58,7 @@ const execution = Layer.succeed(
   SessionExecution.Service.of({
     active: Effect.sync(() => new Set(activeSessions)),
     isActive: (sessionID) => Effect.sync(() => activeSessions.has(sessionID)),
+    bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
     resume: (sessionID) =>
       Effect.sync(() => {
         executionCalls.push(sessionID)

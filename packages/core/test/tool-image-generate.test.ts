@@ -59,6 +59,7 @@ const it = testEffect(
     Layer.succeed(
       Generate.Service,
       Generate.Service.of({
+        result: () => Effect.die("unused"),
         text: () => Effect.succeed(""),
         image: (input) =>
           Effect.sync(() => fixture.requests.push(input)).pipe(

@@ -1,6 +1,5 @@
 import "@/index.css"
-import { VoiceProvider } from "@/voice/context"
-import { VoiceOverlay } from "@/voice/composer"
+import "@/features"
 import { DialogProvider } from "@opencode/ui/context/dialog"
 import { FileComponentProvider } from "@opencode/ui/context/file"
 import { Font } from "@opencode/ui/font"
@@ -20,6 +19,8 @@ import { SettingsProvider } from "@/settings/model"
 import { TabsProvider } from "@/shell/tabs/tabs"
 import { ErrorPage } from "@/shell/errors/error"
 import { AppRoutes, File, preloadRoute } from "@/shell/routes/routes"
+import { VoiceProvider } from "@/voice/context"
+import { VoiceOverlay } from "@/voice/composer"
 import { PluginRoot } from "@/runtime/plugin/root"
 
 export { preloadRoute }

@@ -46,6 +46,7 @@ import { useDialog } from "../../ui/dialog"
 import { DialogIntegration } from "../dialog-integration"
 import { useConnected } from "../use-connected"
 import { useToast } from "../../ui/toast"
+import { TaskControls, useTaskControls } from "../task-controls"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { useConfig, useCursorStyle } from "../../config"
@@ -57,7 +58,9 @@ import { useArgs } from "../../context/args"
 import { Keymap, type KeymapCommand } from "../../context/keymap"
 import { useInteractivity } from "../../context/interactivity"
 import { abbreviateHome } from "../../runtime"
+import { ReviewApproval } from "@opencode/util/bound/review-approval"
 import { Slot } from "../../plugin/render"
+import { attemptStatus } from "./attempt-status"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import {
   deduplicatePromptImages,
@@ -152,6 +155,10 @@ function hasEditorRangeSelection(selection: EditorSelection["ranges"][number]) {
   )
 }
 
+export function PromptAttemptStatus(props: { label?: string; subdued: RGBA }) {
+  return <Show when={props.label}><text fg={props.subdued} wrapMode="none" truncate>{props.label}</text></Show>
+}
+
 function getEditorRangeLabel(selection: EditorSelection["ranges"][number]) {
   if (!hasEditorRangeSelection(selection)) return
   if (selection.selection.start.line === selection.selection.end.line) return `#${selection.selection.start.line}`
@@ -211,6 +218,15 @@ export function Prompt(props: PromptProps) {
   const dialog = useDialog()
   const toast = useToast()
   const status = createMemo(() => data.session.status(props.sessionID ?? ""))
+  const [attemptClock, setAttemptClock] = createSignal(Date.now())
+  createEffect(() => {
+    if (status() !== "running") return
+    setAttemptClock(Date.now())
+    const timer = setInterval(() => setAttemptClock(Date.now()), 1_000)
+    onCleanup(() => clearInterval(timer))
+  })
+  const attemptLabel = createMemo(() => attemptStatus(status() === "running", data.session.message.list(props.sessionID ?? ""), attemptClock()))
+  const taskControls = useTaskControls(() => props.sessionID)
   const history = usePromptHistory()
   const stash = usePromptStash()
   const keymap = Keymap.use()
@@ -504,7 +520,14 @@ export function Prompt(props: PromptProps) {
         category: "Session",
         palette: undefined,
         enabled: status() === "running",
-        run: () => {
+        run: (_input: string | undefined, event?: KeyEvent) => {
+          // With our Kitty flags requested and support confirmed, bare ESC may be a fragmented terminal report.
+          if (
+            event?.name === "escape" &&
+            event.source === "raw" &&
+            renderer.useKittyKeyboard &&
+            renderer.capabilities?.kitty_keyboard === true
+          ) return
           if (auto()?.visible) return
           if (!input.focused) return
           // TODO: this should be its own command
@@ -1124,6 +1147,34 @@ export function Prompt(props: PromptProps) {
     if (move.creating()) return false
     if (auto()?.visible) return false
     const trimmed = store.prompt.text.trim()
+    const reviewID = store.mode === "normal" ? ReviewApproval.requestID(store.prompt.text) : undefined
+    if (store.mode === "normal" && ReviewApproval.commandInput(store.prompt.text)) {
+      const request = props.sessionID
+        ? data.session.family(props.sessionID).flatMap((id) => data.session.permission.list(id) ?? [])
+            .find((item) => item.id === reviewID && !!item.review)
+        : undefined
+      if (!reviewID) {
+        toast.show({ message: "Enter the exact approval phrase: I approve per_<request ID>.", variant: "error" })
+        return true
+      }
+      if (!request) {
+        toast.show({
+          message: "No matching pending approval request is available in this session. It may have expired or belong to another session. Request a fresh approval after confirming the earlier action did not run.",
+          variant: "error",
+        })
+        return true
+      }
+      if (store.prompt.files?.length || store.prompt.agents?.length || store.prompt.skills?.length || store.prompt.pasted.length) {
+        toast.show({
+          message: "Send the approval phrase by itself, without attachments or additional context, or use the pending request’s approval button.",
+          variant: "error",
+        })
+        return true
+      }
+      await data.session.permission.reply({ sessionID: request.sessionID, requestID: request.id, decision: "review_once" })
+        .then(() => clearPrompt(), (error: unknown) => toast.error(error))
+      return true
+    }
     if (!trimmed && (!props.sessionID || store.mode === "shell" || delivery === "queue"))
       return delivery === "steer" ? (await props.onEmptySubmit?.()) === true : false
     const exitWord = trimmed === "exit" || trimmed === "quit" || trimmed === ":q"
@@ -1680,6 +1731,7 @@ export function Prompt(props: PromptProps) {
   return (
     <>
       <box ref={(r: BoxRenderable) => (anchor = r)} visible={props.visible !== false} width="100%">
+        <TaskControls controls={taskControls} />
         <box
           width="100%"
           border={["left"]}
@@ -1911,20 +1963,23 @@ export function Prompt(props: PromptProps) {
               >
                 <Switch>
                   <Match when={status() === "running"}>
-                    <box flexDirection="row" gap={1} flexGrow={1} justifyContent="flex-start">
-                      <box marginLeft={1}>
-                        <Show when={config.animations ?? true} fallback={<text fg={theme.text.muted}>[⋯]</text>}>
-                          <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
-                        </Show>
+                    <box flexDirection="column" flexGrow={1} minWidth={0}>
+                      <PromptAttemptStatus label={attemptLabel()} subdued={theme.text.muted} />
+                      <box flexDirection="row" gap={1} flexGrow={1} justifyContent="flex-start">
+                        <box marginLeft={1}>
+                          <Show when={config.animations ?? true} fallback={<text fg={theme.text.muted}>[⋯]</text>}>
+                            <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
+                          </Show>
+                        </box>
+                        <PromptInterruptStatus
+                          armed={store.interrupt > 0}
+                          animations={animationsEnabled()}
+                          text={theme.text.base}
+                          subdued={theme.text.muted}
+                          warning={theme.text.feedback.warning.base}
+                          flash={theme.decrease(theme.text.feedback.warning.base, 2)}
+                        />
                       </box>
-                      <PromptInterruptStatus
-                        armed={store.interrupt > 0}
-                        animations={animationsEnabled()}
-                        text={theme.text.base}
-                        subdued={theme.text.muted}
-                        warning={theme.text.feedback.warning.base}
-                        flash={theme.decrease(theme.text.feedback.warning.base, 2)}
-                      />
                     </box>
                   </Match>
                   <Match when={move.progress()}>

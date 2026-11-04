@@ -3,7 +3,6 @@ export * as SessionCompaction from "./compaction.js"
 import {
   ai,
   AIError,
-  type ContentPart,
   InvalidProviderOutputError,
   InvalidRequestError,
   isContextOverflowFailure,
@@ -11,7 +10,6 @@ import {
   LLMEvent,
   LLMRequest,
   Message,
-  type ToolEntry,
   UnknownProviderError,
   type Usage,
 } from "@opencode/ai/effect"
@@ -31,7 +29,7 @@ import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
-import type { SessionMessage } from "./message.js"
+import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
@@ -39,6 +37,10 @@ import { toLLMMessages } from "./runner/to-llm-message.js"
 import { SessionRecentText } from "./recent-text.js"
 import { contentFilterError, toSessionError } from "./to-session-error.js"
 import { SessionUsage } from "./usage.js"
+import { calculateCeiling, estimateRequest, estimateMessage, RESERVE_MIN } from "./context-size.js"
+import { SessionContextBudget } from "./context-budget.js"
+import { SessionBudgetReasoning } from "./context-budget-reasoning.js"
+import { SessionStateCheckpoint } from "./state-checkpoint.js"
 
 export type Settings = {
   auto: boolean
@@ -46,6 +48,8 @@ export type Settings = {
   buffer?: number | string
   /** Tokens of recent conversation kept verbatim beside the summary. */
   keep: number
+  strict?: boolean
+  models?: Record<string, { readonly keep?: { readonly tokens?: number; readonly strict?: boolean } }>
   /** Summarize in the background as the context nears the threshold, so automatic compaction can swap it in. */
   precompute: boolean
 }
@@ -58,10 +62,15 @@ export type Editor = {
 export type Estimate = { readonly measured: number; readonly estimated: number }
 
 export type Trigger =
-  /** `overflow`: the provider just rejected this context as too long. `estimate` is `estimatePrompt(context)`. */
-  | { readonly reason: "auto" | "overflow"; readonly context: SessionContext.Loaded; readonly estimate?: Estimate }
-  /** `inputID` is the `/compact` inbox item, whose message shows the outcome. */
-  | { readonly reason: "manual"; readonly context: SessionContext.Loaded; readonly inputID: SessionMessage.ID }
+  /** `overflow`: the provider just rejected this context as too long. */
+  | { readonly reason: "auto" | "overflow" | "budget"; readonly context: SessionContext.Loaded; readonly estimate?: Estimate }
+  /** `inputID` is the `/compact` inbox item, whose message shows the outcome; `checkpoint` is its durable binding. */
+  | {
+      readonly reason: "manual"
+      readonly context: SessionContext.Loaded
+      readonly inputID: SessionMessage.ID
+      readonly checkpoint?: SessionStateCheckpoint.Binding
+    }
 
 export type Outcome =
   /** Only `auto` skips: the context fits, or automatic compaction is off. */
@@ -126,14 +135,6 @@ type Precomputed = {
 const NOTHING_TO_COMPACT: Failure = { error: { type: "compaction.unavailable", message: "Nothing to compact yet" } }
 /** After each "too long" rejection, the next attempt aims at this share of the first rejected request's size. */
 const SHRINK_STEPS = [0.85, 0.7, 0.5, 0.35]
-// The least of the window kept free for the last reply before compaction and for the summary itself.
-const RESERVE_MIN = 16_000
-/**
- * Share of the window kept free before automatic compaction. Above `RESERVE_MIN`, the margin between it and
- * `summaryRoom` absorbs a large step past the trigger, so the whole conversation still goes out unchanged and reuses
- * the cache. Single steps grew by up to ~22k tokens at p99 in real sessions.
- */
-const RESERVE_SHARE = 0.15
 /** A common window size, assumed for the compaction request when the model's window is unknown. */
 const UNKNOWN_WINDOW = 200_000
 /** A summary gets at least this much output, or the room left if less, even when the estimate margin leaves less. */
@@ -149,8 +150,6 @@ const OMITTED = 4
 const TRANSCRIPT_LEVELS = [0, OUTPUTS_CLIPPED, OUTPUTS_REMOVED, USER_ONLY, OMITTED]
 /** Characters kept, from the start and end, of a cut tool input, tool output, or user message. */
 const TRANSCRIPT_CLIP = 2_000
-const IMAGE_TOKEN_ESTIMATE = 1_500
-const PDF_TOKEN_ESTIMATE = 2_000
 /** Share of the compaction ceiling at which a background summary starts. */
 const PRECOMPUTE_RATIO = 0.85
 /** Measured prompt tokens below which a background summary is not worth its cost. */
@@ -263,7 +262,14 @@ export const layer = Layer.effect(
       initial: () => ({ auto: true, keep: 15_000, precompute: false }),
       editor: (settings) => ({
         configure: (update) => {
+          const models = update.models && Object.fromEntries(
+            Object.entries(update.models).map(([ref, model]) => [
+              ref, { keep: { ...settings.models?.[ref]?.keep, ...model.keep } },
+            ]),
+          )
+          const merged = models ? { ...settings.models, ...models } : settings.models
           Object.assign(settings, update)
+          settings.models = merged
         },
       }),
     })
@@ -292,6 +298,10 @@ export const layer = Layer.effect(
     const compact = Effect.fn("SessionCompaction.compact")(function* (trigger: Trigger): Effect.fn.Return<Outcome> {
       const settings = state.get()
       const context = trigger.context
+      // Retention belongs to the triggering model, not its summary agent.
+      const retention = settings.models?.[`${context.model.ref.providerID}/${context.model.ref.id}`]?.keep
+      const keep = retention?.tokens ?? settings.keep
+      const strict = retention?.strict ?? settings.strict ?? false
 
       // Only the user compacts when automatic compaction is off, overflow included.
       if (trigger.reason !== "manual" && !settings.auto) return { status: "skipped" }
@@ -302,6 +312,8 @@ export const layer = Layer.effect(
         return { status: "skipped" }
       const held = precomputed.get(context.session.id)
       precomputed.delete(context.session.id)
+      const bound = trigger.reason === "manual" ? trigger.checkpoint : undefined
+      if (yield* SessionStateCheckpoint.engaged(db, context.session.id, bound)) return yield* checkpoint(trigger)
       const native = context.model.compaction?.type === "native"
       const model = yield* selectModel(context, settings.buffer, native)
       // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
@@ -315,12 +327,12 @@ export const layer = Layer.effect(
       // opens here, before any wait, so a background summary still being written shows as a running compaction.
       if (trigger.reason !== "manual")
         yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto" })
-      const swapped = held ? yield* usePrecomputed(selected, held, budget, settings) : undefined
+      const swapped = held && !strict ? yield* usePrecomputed(selected, held, budget, settings) : undefined
       const compaction = swapped
         ? Effect.succeed(swapped)
         : native
-          ? compactNatively(selected, budget, settings.keep)
-          : summarize(selected, budget, settings.keep)
+          ? compactNatively(selected, budget, keep)
+          : summarize(selected, budget, keep, undefined, strict)
       return yield* compaction.pipe(
         Effect.matchEffect({
           onSuccess: (result) => publish(selected, result),
@@ -343,6 +355,10 @@ export const layer = Layer.effect(
       const settings = state.get()
       if (!settings.precompute || !settings.auto) return
       const context = yield* load
+      if (yield* SessionStateCheckpoint.engaged(db, context.session.id)) return
+      // A precomputed tail can grow beyond its original budget. Strict retention is selected afresh at compaction.
+      if (settings.models?.[`${context.model.ref.providerID}/${context.model.ref.id}`]?.keep?.strict ?? settings.strict)
+        return
       if (context.model.compaction?.type === "native") return
       const ceiling = calculateCeiling(context.model.limit, settings.buffer)
       if (!Number.isFinite(ceiling)) return
@@ -456,10 +472,11 @@ export const layer = Layer.effect(
       budget: number,
       keep: number,
       background?: Background,
+      strict = false,
     ): Effect.fn.Return<Result, Failure> {
       const context = trigger.context
       const messages = background?.messages ?? context.messages
-      const split = splitConversation(messages, keep)
+      const split = splitConversation(messages, keep, strict)
       if (split === undefined) return yield* Effect.fail(NOTHING_TO_COMPACT)
       // A background summary covers all of its messages; what follows them is kept when it is swapped in.
       const keepID = background ? undefined : split.keepID
@@ -484,6 +501,7 @@ export const layer = Layer.effect(
             context.model.limit,
             size && { ...size, estimated: size.estimated + Token.estimate(prompt) },
           )
+          if (prepared.admit) yield* prepared.admit(prompted)
           const reply = yield* stream(context, prompted, prepared.options, background)
           if (filled(reply.text)) return reply
 
@@ -492,6 +510,7 @@ export const layer = Layer.effect(
             context.model.limit,
             size && { ...size, estimated: size.estimated + Token.estimate(prompt) + Token.estimate(NUDGE) },
           )
+          if (prepared.admit) yield* prepared.admit(nudged)
           const retry = yield* stream(context, nudged, prepared.options, background)
           if (filled(retry.text)) return retry
           return yield* Effect.fail<Failure>({
@@ -524,7 +543,7 @@ export const layer = Layer.effect(
       )
       if (!keepID) return result
       // A compaction hook may choose its own kept range.
-      return { ...result, metadata: { keepID, ...result.metadata } }
+      return { ...result, metadata: { keepID, ...(strict ? { keepStrict: true } : {}), ...result.metadata } }
     })
 
     /**
@@ -545,7 +564,7 @@ export const layer = Layer.effect(
       keep: number,
     ): Effect.fn.Return<Result, Failure> {
       const context = trigger.context
-      if (!context.messages.some(SessionRecentText.messageToText)) return yield* Effect.fail(NOTHING_TO_COMPACT)
+      if (!context.messages.some((message) => SessionRecentText.messageToText(message))) return yield* Effect.fail(NOTHING_TO_COMPACT)
       const unsupported = (message: string) =>
         Effect.fail<Failure>({ error: { type: "provider.unsupported-operation", message } })
       const prepared = yield* prepare(context, context.messages, budget, "session")
@@ -640,11 +659,14 @@ export const layer = Layer.effect(
         }
 
         const size = request === prepared.request ? measured : undefined
-        const attempt = yield* Effect.result(send(request, size))
+        const attempt = yield* Effect.result(
+          (prepared.admit ? prepared.admit(request) : Effect.void).pipe(Effect.andThen(send(request, size))),
+        )
         if (Result.isSuccess(attempt)) return attempt.success
         const cause = attempt.failure
         if (!(cause instanceof AIError)) return yield* Effect.fail(cause)
         const error = toSessionError(cause)
+        if (SessionContextBudget.isBlocked(cause)) return yield* Effect.fail<Failure>({ error })
         const tooLarge = cause.reason._tag === "InvalidRequest" && cause.reason.classification === "payload-too-large"
 
         if (tooLarge && (request === prepared.request || request === shrink.history)) {
@@ -848,6 +870,7 @@ export const layer = Layer.effect(
         messages: base.messages,
         webSocket,
         inputTokens: { measured: budget, estimated: 0 },
+        reasoning: context.session.contextBudget ? SessionBudgetReasoning.capture({ ...context, messages }) : undefined,
       })
     }
 
@@ -922,6 +945,98 @@ export const layer = Layer.effect(
       return { status: "completed" }
     })
 
+    /**
+     * An opted-in session's every compaction is its reviewed controller state plus the exact typed history after the
+     * covered prefix: no summary model call, no precomputed summary, and no fallback when anything does not match.
+     */
+    const checkpoint = Effect.fnUntraced(function* (trigger: Trigger): Effect.fn.Return<Outcome> {
+      const context = trigger.context
+      const sessionID = context.session.id
+      const reason = trigger.reason === "manual" ? "manual" : "auto"
+      const inputID = trigger.reason === "manual" ? trigger.inputID : undefined
+      const requestID = inputID ?? trigger.reason
+      const blocked = (message: string) => {
+        const error = { type: "state-checkpoint.blocked", message }
+        return bus
+          .publish(
+            SessionEvent.Compaction.Failed,
+            { sessionID, reason, inputID, error },
+            { commit: () => SessionStateCheckpoint.blocked(db, sessionID, requestID, message) },
+          )
+          .pipe(Effect.as<Outcome>({ status: "failed", error }))
+      }
+      const prepared = yield* SessionStateCheckpoint.prepare(db, sessionID, {
+        manual: trigger.reason === "manual",
+        bound: trigger.reason === "manual" ? trigger.checkpoint : undefined,
+      })
+      if (trigger.reason !== "manual") yield* bus.publish(SessionEvent.Compaction.Started, { sessionID, reason: "auto" })
+      if (!prepared.ok) return yield* blocked(prepared.message)
+      const binding = prepared.binding
+      const maintenance = trigger.reason === "manual" && trigger.checkpoint?.maintenance === true
+      const policy = context.session.contextBudget
+      if (!policy) return yield* blocked("A controller-state checkpoint needs an explicit session context budget policy")
+      const tail = yield* SessionStateCheckpoint.tail(db, sessionID, binding.coverage.coveredSeq)
+      // shortcut: a stand-in completed checkpoint for sizing; history renders the stored one identically.
+      const replacement = { id: SessionMessage.ID.create(), type: "compaction", status: "completed", reason, summary: binding.rendered } as SessionMessage.Info
+      const base = transcript(context, [replacement, ...tail])
+      const assessed = SessionContextBudget.assess(
+        policy,
+        ai.request({
+          model: context.model.model,
+          system: base.system,
+          messages: base.messages,
+          tools: context.tools.definitions,
+          generation: { maxTokens: SessionModelRequest.outputLimit(context.model.limit) },
+        }),
+        context.model.limit,
+        undefined,
+        SessionBudgetReasoning.capture({ ...context, messages: tail }),
+      )
+      if (assessed.reason) return yield* blocked(`The checkpointed context would not fit: ${assessed.reason}`)
+      const hooked = yield* requests.compaction({
+        session: context.session,
+        agent: context.agent.id,
+        model: context.model,
+        tools: context.tools,
+        system: base.system,
+        messages: base.messages,
+        // A detached copy: whatever a hook does to it, core compares and commits its own binding.
+        checkpoint: structuredClone(binding),
+      })
+      const supplied = hooked.event.result
+      if (supplied?.summary !== binding.rendered || supplied.native !== undefined)
+        return yield* blocked("No compaction hook supplied the exact reviewed controller state")
+      const messageID = yield* SessionStateCheckpoint.running(db, sessionID)
+      if (!messageID) return yield* blocked("No running compaction message to complete")
+      const failed = yield* bus
+        .publish(
+          SessionEvent.Compaction.Ended,
+          {
+            sessionID,
+            reason,
+            model: context.model.ref,
+            text: binding.rendered,
+            // Durable provenance on the checkpoint message itself, projected in this same transaction.
+            checkpoint: {
+              version: 1,
+              sessionID,
+              revision: binding.revision,
+              stateHash: binding.stateHash,
+              ...(maintenance ? { maintenance: true as const } : {}),
+            },
+          },
+          { commit: (seq) => SessionStateCheckpoint.commit(db, sessionID, binding, requestID, messageID, seq) },
+        )
+        .pipe(
+          Effect.as(undefined),
+          Effect.catchDefect((defect) =>
+            defect instanceof SessionStateCheckpoint.Blocked ? Effect.succeed(defect.message) : Effect.die(defect),
+          ),
+        )
+      if (failed !== undefined) return yield* blocked(failed)
+      return { status: "completed" }
+    })
+
     return Service.of({
       transform: state.transform,
       reload: state.reload,
@@ -959,7 +1074,7 @@ const heldIndex = (held: Precomputed, context: SessionContext.Loaded) => {
 
 /** Estimated text a swapped-in summary keeps verbatim: every message from `index` on. */
 const tailTokens = (context: SessionContext.Loaded, index: number) =>
-  Token.estimate(context.messages.slice(index).map(SessionRecentText.messageToText).filter(Boolean).join("\n\n"))
+  Token.estimate(context.messages.slice(index).map((message) => SessionRecentText.messageToText(message)).filter(Boolean).join("\n\n"))
 
 const tailLimit = (keep: number, budget: number) =>
   Math.min(Math.max(keep * 2, PRECOMPUTED_TAIL_MIN), Math.floor(budget * PRECOMPUTED_TAIL_SHARE))
@@ -983,17 +1098,32 @@ const transcript = (context: SessionContext.Loaded, messages: ReadonlyArray<Sess
  * The newest messages within `keep` tokens, from `keepID` on, are kept verbatim beside the summary.
  * Undefined when there is nothing to compact.
  */
-const splitConversation = (messages: ReadonlyArray<SessionMessage.Info>, keep: number) => {
-  const entries = messages.flatMap((message) => {
-    const text = SessionRecentText.messageToText(message)
-    return text ? [{ message, text }] : []
+export const splitConversation = (messages: ReadonlyArray<SessionMessage.Info>, keep: number, strict = false) => {
+  const entries = messages.flatMap((message, index) => {
+    const text = SessionRecentText.messageToText(message, strict)
+    return text ? [{ message, text, index }] : []
   })
   if (entries.length === 0) return undefined
 
-  const first = entries[recentStart(entries, keep, previousCompaction(messages))]
+  const first = entries[strict ? strictRecentStart(entries, keep) : recentStart(entries, keep, previousCompaction(messages))]
   return {
     keepID: first?.message.id,
   }
+}
+
+const strictRecentStart = (
+  entries: ReadonlyArray<{ readonly message: SessionMessage.Info; readonly text: string; readonly index: number }>,
+  keep: number,
+) => {
+  let start = entries.length
+  let text = ""
+  // Budget full output, separators and wrapper together; never clip or split the newest exchange.
+  for (let index = entries.length - 1; index >= 0; index--) {
+    text = entries[index].text + (text ? `\n\n${text}` : "")
+    if (Token.estimate(`\n\n<recent-context>\n${text}\n</recent-context>`) > keep) break
+    if (entries[index].message.type === "user" && entries[index].index > 0) start = index
+  }
+  return start
 }
 
 /** The request without the retained tail, which starts at the message with ID `from`. */
@@ -1127,20 +1257,6 @@ export const estimatePrompt = (context: SessionContext.Loaded): Estimate => {
   }
 }
 
-/**
- * The largest request the model takes while leaving room for its reply: `RESERVE_SHARE` of the window, or
- * `RESERVE_MIN` when that is more. A summary request that must be shrunk is aimed at the same size. A window too small
- * to give up `RESERVE_MIN` keeps `RESERVE_SHARE`.
- */
-const calculateCeiling = (limit: SessionContext.Loaded["model"]["limit"], buffer: Settings["buffer"]) => {
-  // With no window at all, only a provider rejection can limit the request.
-  const window = inputWindow(limit)
-  if (window <= 0) return Number.POSITIVE_INFINITY
-  const tokens = typeof buffer === "string" ? Math.round((window * Number.parseFloat(buffer)) / 100) : buffer
-  // A buffer that leaves no room, such as one set for a larger model, is ignored.
-  if (tokens !== undefined && tokens < window) return window - tokens
-  return window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
-}
 
 /**
  * The largest summary request that leaves `RESERVE_MIN` of the window for the summary, or less when the request
@@ -1203,44 +1319,4 @@ const fitOutput = (request: LLMRequest, limit: SessionContext.Loaded["model"]["l
   )
   if (maxTokens === current) return request
   return LLMRequest.update(request, { generation: { ...request.generation, maxTokens } })
-}
-
-const estimateRequest = (request: Pick<LLMRequest, "system" | "tools" | "messages">) =>
-  request.system.reduce((sum, part) => sum + Token.estimate(part.text), 0) +
-  request.tools.reduce((sum, tool) => sum + estimateTool(tool), 0) +
-  request.messages.reduce((sum, message) => sum + estimateMessage(message), 0)
-
-/** Only what providers receive; `metadata` and `native` stay local. */
-const estimateTool = (tool: ToolEntry): number => {
-  if (tool.type === "tool") return Token.estimate(tool.name + tool.description + JSON.stringify(tool.inputSchema))
-  return (
-    Token.estimate(tool.name + (tool.description ?? "")) +
-    tool.tools.reduce((sum, entry) => sum + estimateTool(entry), 0)
-  )
-}
-
-const estimateMessage = (message: Message) => message.content.reduce((sum, part) => sum + estimatePart(part), 0)
-
-const estimatePart = (part: ContentPart): number => {
-  // An encrypted native compaction has no locally measurable size.
-  if (part.type === "compaction") return Token.estimate(part.text ?? "")
-  if (part.type === "effort") return 0
-  if (part.type === "text" || part.type === "reasoning") return Token.estimate(part.text)
-  if (part.type === "media") return estimateMedia(part.media.mediaType)
-  if (part.type === "tool-call") return Token.estimate(part.name + (JSON.stringify(part.input) ?? ""))
-
-  if (part.result.type === "content")
-    return part.result.value.reduce(
-      (sum, content) => sum + (content.type === "text" ? Token.estimate(content.text) : estimateMedia(content.mime)),
-      0,
-    )
-  const value = part.result.value
-  return Token.estimate(typeof value === "string" ? value : (JSON.stringify(value) ?? ""))
-}
-
-const estimateMedia = (mime: string) => {
-  const type = mime.toLowerCase()
-  if (type.startsWith("image/")) return IMAGE_TOKEN_ESTIMATE
-  if (type === "application/pdf") return PDF_TOKEN_ESTIMATE
-  return 0
 }

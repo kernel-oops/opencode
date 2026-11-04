@@ -55,12 +55,21 @@ export interface ProtocolBody<Body> {
 }
 
 export interface ProtocolStream<Frame, Event, State> {
+  /** Sparse authoritative observation, independent of terminal completion. Native exchanges only. */
+  readonly observation?: (previous: State, next: State) => Record<string, unknown> | undefined
   /** Schema for one decoded streaming event, decoded from a transport frame. */
   readonly event: Schema.Codec<Event, Frame>
   /** Initial parser state. Called once per response with the resolved request. */
   readonly initial: (request: LLMRequest) => State
   /** Translate one event into emitted `LLMEvent`s plus the next state. */
   readonly step: (state: State, event: Event) => Effect.Effect<readonly [State, ReadonlyArray<LLMEvent>], AIError>
+  /** Invoked only for an exchange's validated native terminal receipt. */
+  readonly interrupted?: (state: State, event: Event) => Effect.Effect<readonly [State, ReadonlyArray<LLMEvent>], AIError>
+  /** Public `response.steer` parent terminal. Invoked only on a typed steer exchange for a matching event. */
+  readonly steered?: {
+    readonly is: (event: Event) => boolean
+    readonly finish: (state: State, event: Event) => Effect.Effect<readonly [State, ReadonlyArray<LLMEvent>], AIError>
+  }
   /** Optional request-completion signal for transports that do not end naturally. */
   readonly terminal?: (event: Event) => boolean
   /** Optional effectful flush emitted when the framed stream ends. */

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
+import { constants } from "node:fs"
 import path from "path"
 import { Effect } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -185,6 +186,61 @@ describe("Ripgrep", () => {
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
+  )
+
+  it.live("preserves newlines in null-separated find results", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() => fs.writeFile(path.join(tmp.path, "split\nname.txt"), "included\n"))
+      const files = yield* (yield* Ripgrep.Service).find({
+        cwd: tmp.path,
+        pattern: "*",
+        limit: 10,
+        nullSeparated: true,
+        preservePath: true,
+        strict: true,
+      })
+      expect(files.map((item) => item.path)).toEqual([RelativePath.make("split\nname.txt")])
+    }),
+  )
+
+  it.live("fails a strict find once the limit truncates the enumeration", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() =>
+        Promise.all(["a.txt", "b.txt", "c.txt"].map((file) => fs.writeFile(path.join(tmp.path, file), "x\n"))),
+      )
+      const ripgrep = yield* Ripgrep.Service
+      const exit = yield* ripgrep.find({ cwd: tmp.path, pattern: "*", limit: 2, strict: true }).pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      const lenient = yield* ripgrep.find({ cwd: tmp.path, pattern: "*", limit: 2 })
+      expect(lenient).toHaveLength(2)
+    }),
+  )
+
+  it.live("searches an inherited read-only file descriptor without reopening its pathname", () =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+      const tmp = yield* tmpdirScoped()
+      const reviewed = path.join(tmp.path, "reviewed.txt")
+      const sibling = path.join(tmp.path, "sibling-secret.txt")
+      yield* Effect.promise(() => fs.writeFile(reviewed, "needle reviewed-value\n"))
+      yield* Effect.promise(() => fs.writeFile(sibling, "needle sibling-secret\n"))
+      const file = yield* Effect.acquireRelease(
+        Effect.promise(() => fs.open(reviewed, constants.O_RDONLY | constants.O_NOFOLLOW)),
+        (handle) => Effect.promise(() => handle.close()),
+      )
+      const matches = yield* (yield* Ripgrep.Service).grep({
+        cwd: tmp.path,
+        pattern: "needle",
+        file: "/proc/self/fd/3",
+        inheritedReadOnlyFds: [{ parent: file.fd, child: 3 }],
+        limit: 10,
+      })
+      expect(matches).toHaveLength(1)
+      expect(matches[0]?.text.trimEnd()).toBe("needle reviewed-value")
+      expect(matches[0]?.text).not.toContain("sibling-secret")
+    }),
   )
 })
 

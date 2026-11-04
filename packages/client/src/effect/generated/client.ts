@@ -49,6 +49,8 @@ import type {
   SessionCommandOutput,
   SessionSyntheticInput,
   SessionSyntheticOutput,
+  SessionAppendInput,
+  SessionAppendOutput,
   SessionShellInput,
   SessionShellOutput,
   SessionCompactInput,
@@ -73,6 +75,14 @@ import type {
   SessionGenerateOutput,
   SessionInterruptInput,
   SessionInterruptOutput,
+  SessionTaskStatusInput,
+  SessionTaskStatusOutput,
+  SessionTaskStopResponseInput,
+  SessionTaskStopResponseOutput,
+  SessionTaskResumeInput,
+  SessionTaskResumeOutput,
+  SessionTaskStopAllInput,
+  SessionTaskStopAllOutput,
   SessionBackgroundInput,
   SessionBackgroundOutput,
   SessionMessageGetInput,
@@ -101,6 +111,10 @@ import type {
   ExperimentalSessionSkillOutput,
   ExperimentalSessionWaitInput,
   ExperimentalSessionWaitOutput,
+  ExperimentalSessionNativeTestGetInput,
+  ExperimentalSessionNativeTestGetOutput,
+  ExperimentalSessionNativeTestPutInput,
+  ExperimentalSessionNativeTestPutOutput,
   ExperimentalSessionInstructionsEntryListInput,
   ExperimentalSessionInstructionsEntryListOutput,
   ExperimentalSessionInstructionsEntryPutInput,
@@ -512,6 +526,7 @@ const EndpointSessionUpdate = (raw: RawClient["server.session"]) => (input: Sess
         title: input["title"],
         metadata: input["metadata"],
         permissions: input["permissions"],
+        contextBudget: input["contextBudget"],
         archived: input["archived"],
       },
     }).pipe(Effect.mapError(mapClientError)),
@@ -571,6 +586,24 @@ const EndpointSessionSynthetic = (raw: RawClient["server.session"]) => (input: S
         metadata: input["metadata"],
         delivery: input["delivery"],
         resume: input["resume"],
+      },
+    }).pipe(
+      Effect.mapError(mapClientError),
+      Effect.map((value) => value.data),
+    ),
+  )
+
+const EndpointSessionAppend = (raw: RawClient["server.session"]) => (input: SessionAppendInput) =>
+  preserveEffect<SessionAppendOutput>()(
+    raw["session.append"]({
+      params: { sessionID: input["sessionID"] },
+      payload: {
+        id: input["id"],
+        text: input["text"],
+        final: input["final"],
+        agent: input["agent"],
+        model: input["model"],
+        metadata: input["metadata"],
       },
     }).pipe(
       Effect.mapError(mapClientError),
@@ -675,6 +708,28 @@ const EndpointSessionInterrupt = (raw: RawClient["server.session"]) => (input: S
     ),
   )
 
+const EndpointSessionTaskStatus = (raw: RawClient["server.session"]) => (input: SessionTaskStatusInput) =>
+  preserveEffect<SessionTaskStatusOutput>()(
+    raw["session.task.status"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
+  )
+
+const EndpointSessionTaskStopResponse = (raw: RawClient["server.session"]) => (input: SessionTaskStopResponseInput) =>
+  preserveEffect<SessionTaskStopResponseOutput>()(
+    raw["session.task.stopResponse"]({ params: { sessionID: input["sessionID"] } }).pipe(
+      Effect.mapError(mapClientError),
+    ),
+  )
+
+const EndpointSessionTaskResume = (raw: RawClient["server.session"]) => (input: SessionTaskResumeInput) =>
+  preserveEffect<SessionTaskResumeOutput>()(
+    raw["session.task.resume"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
+  )
+
+const EndpointSessionTaskStopAll = (raw: RawClient["server.session"]) => (input: SessionTaskStopAllInput) =>
+  preserveEffect<SessionTaskStopAllOutput>()(
+    raw["session.task.stopAll"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
+  )
+
 const EndpointSessionBackground = (raw: RawClient["server.session"]) => (input: SessionBackgroundInput) =>
   preserveEffect<SessionBackgroundOutput>()(
     raw["session.background"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
@@ -760,6 +815,7 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   prompt: EndpointSessionPrompt(raw),
   command: EndpointSessionCommand(raw),
   synthetic: EndpointSessionSynthetic(raw),
+  append: EndpointSessionAppend(raw),
   shell: EndpointSessionShell(raw),
   compact: EndpointSessionCompact(raw),
   revert: {
@@ -776,6 +832,12 @@ const adaptGroupSession = (raw: RawClient["server.session"]) => ({
   },
   generate: EndpointSessionGenerate(raw),
   interrupt: EndpointSessionInterrupt(raw),
+  task: {
+    status: EndpointSessionTaskStatus(raw),
+    stopResponse: EndpointSessionTaskStopResponse(raw),
+    resume: EndpointSessionTaskResume(raw),
+    stopAll: EndpointSessionTaskStopAll(raw),
+  },
   background: EndpointSessionBackground(raw),
   message: { get: EndpointSessionMessageGet(raw) },
   form: {
@@ -839,6 +901,27 @@ const EndpointExperimentalSessionWait = (raw: RawClient["server.session"]) => (i
     raw["session.wait"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
   )
 
+const EndpointExperimentalSessionNativeTestGet =
+  (raw: RawClient["server.session"]) => (input: ExperimentalSessionNativeTestGetInput) =>
+    preserveEffect<ExperimentalSessionNativeTestGetOutput>()(
+      raw["session.nativeTest.get"]({ params: { sessionID: input["sessionID"] } }).pipe(
+        Effect.mapError(mapClientError),
+        Effect.map((value) => value.data),
+      ),
+    )
+
+const EndpointExperimentalSessionNativeTestPut =
+  (raw: RawClient["server.session"]) => (input: ExperimentalSessionNativeTestPutInput) =>
+    preserveEffect<ExperimentalSessionNativeTestPutOutput>()(
+      raw["session.nativeTest.put"]({
+        params: { sessionID: input["sessionID"] },
+        payload: { nativeSteer: input["nativeSteer"], debug: input["debug"] },
+      }).pipe(
+        Effect.mapError(mapClientError),
+        Effect.map((value) => value.data),
+      ),
+    )
+
 const EndpointExperimentalSessionInstructionsEntryList =
   (raw: RawClient["server.session"]) => (input: ExperimentalSessionInstructionsEntryListInput) =>
     preserveEffect<ExperimentalSessionInstructionsEntryListOutput>()(
@@ -884,6 +967,10 @@ const adaptGroupExperimentalSession = (raw: RawClient["server.session"]) => ({
   export: EndpointExperimentalSessionExport(raw),
   skill: EndpointExperimentalSessionSkill(raw),
   wait: EndpointExperimentalSessionWait(raw),
+  nativeTest: {
+    get: EndpointExperimentalSessionNativeTestGet(raw),
+    put: EndpointExperimentalSessionNativeTestPut(raw),
+  },
   instructions: {
     entry: {
       list: EndpointExperimentalSessionInstructionsEntryList(raw),
@@ -924,7 +1011,9 @@ const adaptGroupModel = (raw: RawClient["server.model"]) => ({
 const EndpointExperimentalGenerateText =
   (raw: RawClient["server.generate"]) => (input: ExperimentalGenerateTextInput) =>
     preserveEffect<ExperimentalGenerateTextOutput>()(
-      raw["generate.text"]({ payload: { prompt: input["prompt"], model: input["model"] } }).pipe(
+      raw["generate.text"]({
+        payload: { prompt: input["prompt"], model: input["model"], responseSchema: input["responseSchema"] },
+      }).pipe(
         Effect.mapError(mapClientError),
         Effect.map((value) => value.data),
       ),
@@ -1999,6 +2088,13 @@ const adaptClient = (raw: RawClient) => {
       skill: client.experimental.session.skill,
       /** @deprecated Use `client.experimental.session.wait`. Removed in the next minor. */
       wait: client.experimental.session.wait,
+      /** @deprecated Use `client.experimental.session.nativeTest`. Removed in the next minor. */
+      nativeTest: {
+        /** @deprecated Use `client.experimental.session.nativeTest.get`. Removed in the next minor. */
+        get: client.experimental.session.nativeTest.get,
+        /** @deprecated Use `client.experimental.session.nativeTest.put`. Removed in the next minor. */
+        put: client.experimental.session.nativeTest.put,
+      },
       /** @deprecated Use `client.experimental.session.instructions`. Removed in the next minor. */
       instructions: {
         /** @deprecated Use `client.experimental.session.instructions.entry`. Removed in the next minor. */

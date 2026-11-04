@@ -45,6 +45,7 @@ import { ConfigExperimental } from "@opencode/schema/config/experimental"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 import { imagePassthrough } from "./lib/image"
+import { advance } from "./lib/clock"
 
 const enabledDirectory = "/enabled"
 const disabledDirectory = "/disabled"
@@ -59,6 +60,7 @@ const execution = Layer.succeed(
   SessionExecution.Service.of({
     active: Effect.sync(() => new Set()),
     isActive: () => Effect.succeed(false),
+    bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
     resume: () => Effect.void,
     interrupt: () => Effect.succeed(false),
     wake: (sessionID) =>
@@ -694,7 +696,7 @@ describe("Schedule", () => {
       yield* TestClock.adjust("9 seconds")
       expect(yield* pending).toEqual([])
       yield* TestClock.adjust("1 second")
-      yield* Effect.yieldNow
+      yield* advance(() => wakes.includes(sessionID))
       expect(yield* pending).toEqual([messageID(schedule, 1)])
       yield* Fiber.interrupt(fiber)
     }),

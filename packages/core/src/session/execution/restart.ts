@@ -194,28 +194,42 @@ export const layer = (options?: Options) =>
           return
         }
 
-        yield* jobs.start({
+        const handle = yield* jobs.acquire({
           id: background.id,
           type: "subagent",
           title: recovery.description,
           notificationID: background.notificationID,
           recovery,
           run: execution.resume(recovery.childSessionID).pipe(
-            Effect.andThen(store.context(recovery.childSessionID)),
-            Effect.map((messages) => {
-              const assistant = messages.findLast(
-                (message) =>
-                  message.type === "assistant" && message.time.completed !== undefined && message.error === undefined,
-              )
-              return SubagentCompletion.text(assistant)
+            Effect.andThen(execution.awaitIdle(recovery.childSessionID)),
+            Effect.andThen(
+              Effect.gen(function* () {
+                if ((yield* sessions.inbox(recovery.childSessionID)).some((item) => item.type === "user"))
+                  return yield* Effect.fail(new Error("Subagent continuation remains undelivered"))
+              }),
+            ),
+            Effect.andThen(
+              store.messages({ sessionID: recovery.childSessionID, type: "assistant", order: "desc", limit: 1 }),
+            ),
+            Effect.flatMap((messages) => {
+              const assistant = messages.findLast((message) => message.type === "assistant")
+              if (assistant?.type === "assistant" && assistant.interruption !== undefined) return Effect.interrupt
+              if (assistant?.type === "assistant" && assistant.error !== undefined)
+                return Effect.fail(new Error("Subagent response failed"))
+              if (assistant && assistant.time.completed === undefined)
+                return Effect.fail(new Error("Subagent continuation has no completed response"))
+              return Effect.succeed(SubagentCompletion.text(assistant))
             }),
           ),
         })
-        yield* jobs.background(background.id)
-        yield* jobs.wait({ id: background.id }).pipe(
-          Effect.flatMap((result) => (result.info ? notify(result.info) : Effect.void)),
-          Effect.forkIn(scope),
-        )
+        yield* handle.background
+        if (yield* handle.observe)
+          yield* handle.wait.pipe(
+            Effect.flatMap((info) =>
+              handle.claimBackground.pipe(Effect.flatMap((claimed) => (claimed ? notify(info) : Effect.void))),
+            ),
+            Effect.forkIn(scope),
+          )
       })
 
       return Service.of({

@@ -30,6 +30,8 @@ import { LocationServiceMap } from "@opencode/core/location-service-map"
 import { LocationActivity } from "@opencode/core/location-activity"
 import { ModelsDev } from "@opencode/core/models-dev"
 import { SessionRestart } from "@opencode/core/session/execution/restart"
+import { SessionTaskControl } from "@opencode/core/session/task-control"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { Schedule } from "@opencode/core/schedule"
 import { PluginUpdate } from "@opencode/core/plugin/update"
 import { SdkPlugins } from "@opencode/core/plugin/sdk"
@@ -80,6 +82,8 @@ const applicationServiceNodes = [
   LocationServiceMap.node,
   LocationActivity.node,
   SessionRestart.node,
+  SessionTaskControl.node,
+  SessionNativeTest.node,
   Schedule.node,
   Workspace.node,
   FileWatch.node,
@@ -137,9 +141,13 @@ function makeRoutes<AuthError, AuthServices>(
         claude: options.config?.claude,
         file: options.config?.file,
         content: options.config?.content,
+        globalAlias: options.config?.globalAlias,
       }),
     ),
-    InstructionDiscovery.node.replace(InstructionDiscovery.configured({ project: options.config?.project })),
+    InstructionDiscovery.node.replace(InstructionDiscovery.configured({
+      project: options.config?.project,
+      globalAlias: options.config?.globalAlias,
+    })),
     ShellSelect.node.replace(ShellSelect.configured({ gitbash: options.windows?.gitbash })),
     Mcp.node.replace(
       Mcp.configured({

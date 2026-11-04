@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Arbitrary, Duration, Effect, Schema } from "effect"
 import { ConfigNormalize } from "@opencode/core/config/normalize"
 import { Info } from "@opencode/schema/config"
+import { ConfigCompaction } from "@opencode/schema/config/compaction"
 
 const options = { errors: "all", onExcessProperty: "ignore" } as const
 
@@ -57,6 +58,95 @@ function withoutEmptyCompatibilityContainers(input: Record<string, unknown>) {
 }
 
 describe("ConfigNormalize", () => {
+  test("preserves global and named-model retention true, false and tokens-only through the native schema", () => {
+    for (const strict of [true, false]) {
+      const input = { compaction: { auto: false, keep: { tokens: 50_000, strict }, buffer: 14, models: {
+        "anthropic/claude-haiku-5-5": { keep: { tokens: 15_000, strict } },
+        "openai/gpt-6.1-sol": { keep: { tokens: 80_000, strict: false } },
+        "provider/tokens-only": { keep: { tokens: 0 } },
+      } } }
+      const encoded = Schema.encodeSync(Info)(Schema.decodeUnknownSync(Info)(input))
+      const result = normalized(encoded)
+      expect(result.diagnostics).toEqual([])
+      expect(Schema.decodeUnknownSync(Info)(result.encoded)).toEqual(Schema.decodeUnknownSync(Info)(encoded))
+    }
+  })
+
+  test("preserves schema-allowed empty model/keep records and selector keys without prototype mutation", () => {
+    const models = Object.fromEntries([
+      ["__proto__", { keep: { tokens: 1, strict: false } }],
+      ["constructor", { keep: {} }], ["", {}], ["\u0000", {}], ["*", {}], ["openai/*", {}],
+    ])
+    const result = normalized({ compaction: { models } })
+    expect(result.diagnostics).toEqual([])
+    expect(result.encoded.compaction).toEqual({ models })
+    const value = result.encoded.compaction as { models: Record<string, unknown> }
+    expect(Object.getPrototypeOf(value.models)).toBe(Object.prototype)
+    expect(Object.hasOwn(value.models, "__proto__")).toBe(true)
+    expect(Object.hasOwn(value.models, "constructor")).toBe(true)
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype)
+    expect(decoded({ compaction: { models: {} } }).compaction?.models).toEqual({})
+  })
+
+  test("retention composes native precedence and legacy token/buffer migration with existing diagnostics", () => {
+    const result = normalized({ compaction: {
+      preserve_recent_tokens: 1000, reserved: 2000,
+      keep: { tokens: 50_000, strict: false }, buffer: 14,
+      models: { "valid/model": { keep: { tokens: 15_000, strict: true } }, "bad/model": { keep: { strict: "yes" } } },
+      prune: true,
+    } })
+    expect(result.encoded.compaction).toEqual({ keep: { tokens: 50_000, strict: false }, buffer: 14, models: { "valid/model": { keep: { tokens: 15_000, strict: true } } } })
+    expect(result.diagnostics.map(item => [item.kind, item.path])).toEqual([
+      ["unsupported", ["compaction", "prune"]],
+      ["conflict", ["compaction", "keep", "tokens"]],
+      ["conflict", ["compaction", "buffer"]],
+      ["invalid", ["compaction", "models", "bad/model"]],
+    ])
+    expect(normalized({ compaction: { preserve_recent_tokens: 1000, keep: { strict: true } } }).encoded.compaction).toEqual({ keep: { tokens: 1000, strict: true } })
+    expect(normalized({ compaction: { keep: { strict: "yes" }, models: [] } }).diagnostics.map(item => item.path)).toEqual([["compaction", "keep", "strict"], ["compaction", "models"]])
+  })
+
+  test("preserves seeded arbitrary native compaction configuration", () => {
+    const result = Effect.runSync(Arbitrary.checkEffect(Arbitrary.schema(ConfigCompaction.Info), (compaction) => {
+      const source = JSON.parse(JSON.stringify(Schema.encodeSync(Info)(new Info({ compaction }))))
+      expect(decoded(source)).toEqual(Schema.decodeUnknownSync(Info)(withoutEmptyCompatibilityContainers(source)))
+      return true
+    }, { runs: 100, seed: 20261016 }))
+    expect(Arbitrary.formatCheckFailure(result)).toBeUndefined()
+  })
+
+  test("preserves native deprecated status without disabling the model; legacy deprecation still disables", () => {
+    const native = normalized({ providers: { custom: { models: { alias: { status: "deprecated" }, active: {} } } } })
+    expect(native.diagnostics).toEqual([])
+    expect(native.encoded).toEqual({
+      providers: { custom: { models: { alias: { status: "deprecated" }, active: {} } } },
+    })
+    expect(decoded(native.encoded).providers?.custom?.models?.alias).toMatchObject({ status: "deprecated" })
+    expect(decoded(native.encoded).providers?.custom?.models?.alias.disabled).toBeUndefined()
+    expect(decoded({ provider: { custom: { models: { alias: { status: "deprecated" } } } } }).providers?.custom?.models?.alias)
+      .toMatchObject({ disabled: true })
+  })
+
+  test("preserves continuation fields in fields-only documents", () => {
+    for (const key of ["task_continuation_agents", "task_continuation_eligible"]) {
+      for (const value of [["build", "God"], []]) {
+        const input = { experimental: { [key]: value } }
+        expect(normalized(input).diagnostics).toEqual([])
+        expect(decoded(input).experimental).toEqual(input.experimental)
+      }
+    }
+  })
+
+  test("omits invalid continuation fields with schema diagnostics, preserving valid siblings", () => {
+    for (const key of ["task_continuation_agents", "task_continuation_eligible"]) {
+      for (const value of [null, true, 1, "build,God", {}, ["build", 1]]) {
+        const result = normalized({ experimental: { [key]: value, subagent_depth: 2 } })
+        expect(result.encoded.experimental).toEqual({ subagent_depth: 2 })
+        expect(result.diagnostics).toMatchObject([{ kind: "invalid", path: ["experimental", key] }])
+      }
+    }
+  })
+
   test("accepts tool.use without losing statement order", () => {
     const policies = [
       { action: "tool.use", effect: "deny", resource: "shell:*" },

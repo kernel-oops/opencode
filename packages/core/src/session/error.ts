@@ -89,6 +89,15 @@ export class BusyError extends Schema.TaggedError<BusyError>()("Session.BusyErro
   sessionID: SessionSchema.ID,
 }) {}
 
+export class InvalidContextBudgetError extends Schema.TaggedError<InvalidContextBudgetError>()(
+  "Session.InvalidContextBudgetError",
+  {},
+) {
+  override get message() {
+    return "Context budget requires positive integer target and maximum, with target less than maximum"
+  }
+}
+
 export class InboxConflictError extends Schema.TaggedError<InboxConflictError>()("Session.InboxConflictError", {
   sessionID: SessionSchema.ID,
   inboxID: SessionMessage.ID,

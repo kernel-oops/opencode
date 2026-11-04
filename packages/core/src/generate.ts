@@ -1,9 +1,10 @@
 export * as Generate from "./generate.js"
 
-import { ai, AIError, DecisionClient, ImageClient, LLMClient, Media } from "@opencode/ai/effect"
+import { ai, LLMClient, LLMEvent, AIError, Usage, DecisionClient, ImageClient, Media } from "@opencode/ai/effect"
 import type { DecisionRequest, DecisionResult, ImageRequest, ImageResult } from "@opencode/schema/generate"
 import { Money } from "@opencode/schema/money"
 import { SessionID } from "@opencode/schema/session-id"
+import { Generate } from "@opencode/schema/generate"
 import { Context, Effect, Layer, Schema } from "effect"
 import { RequestExecutor } from "@opencode/ai/route"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -16,6 +17,7 @@ import { ModelRetry } from "./model-retry.js"
 export interface TextInput {
   readonly prompt: string
   readonly model?: Model.Ref
+  readonly responseSchema?: Generate.ResponseSchema
 }
 
 export class UnavailableError extends Schema.TaggedError<UnavailableError>()("Generate.UnavailableError", {
@@ -72,6 +74,7 @@ export type Error =
 
 export interface Interface {
   readonly text: (input: TextInput) => Effect.Effect<string, Error>
+  readonly result: (input: TextInput) => Effect.Effect<Generate.Result, Error>
   readonly image: (input: ImageRequest) => Effect.Effect<ImageResult, Error>
   readonly decisions: (input: DecisionRequest) => Effect.Effect<DecisionResult, Error>
 }
@@ -89,7 +92,7 @@ export const layer = Layer.effect(
     const images = yield* ImageClient.Service
     const decisionClient = yield* DecisionClient.Service
 
-    const runText = Effect.fn("Generate.text")(function* (input: TextInput) {
+    const runText = Effect.fn("Generate.result")(function* (input: TextInput) {
       const resolved = yield* resolver.resolve(input.model).pipe(
         Effect.catchTag(
           [
@@ -111,121 +114,111 @@ export const layer = Layer.effect(
       if (!resolved && input.model) return yield* missing(input.model, "chat")
       if (!resolved)
         return yield* new UnavailableError({ message: "No model specified and no supported model is available" })
+      const protocol = resolved.model.route.protocol
+      const schema = input.responseSchema
+      if (schema && protocol !== "openai-responses" && protocol !== "anthropic-messages")
+        return yield* new UnavailableError({
+          message: "Native schema generation is unsupported by the resolved protocol",
+          service: resolved.ref.providerID,
+        })
+      const body = !schema
+        ? undefined
+        : protocol === "openai-responses"
+          ? { text: { format: { type: "json_schema", name: schema.name, schema: schema.schema, strict: true } } }
+          : { output_config: { format: { type: "json_schema", schema: schema.schema } } }
       const response = yield* llm
         .generate(
           ai.request({
             model: resolved.model,
             prompt: input.prompt,
             // Gateways require session attribution even for a stateless call; no Session is stored.
-            http: { headers: { "x-opencode-session": SessionID.create() } },
+            http: { headers: { "x-opencode-session": SessionID.create() }, ...(body ? { body } : {}) },
           }),
         )
         .pipe(
           ModelRetry.retryOneShot,
           Effect.mapError((error) => providerError(resolved.ref, error)),
         )
-      return response.text
-    })
-
-    // A ref no model of this type has: another type's model (422) or no model at all (404).
-    const missing = Effect.fnUntraced(function* (ref: Model.Ref, type: Model.Type) {
-      const other = (yield* models.available(["chat", "image", "decision"])).find(
-        (model) => model.providerID === ref.providerID && model.id === ref.id,
+      if (
+        schema &&
+        (response.finishReason.normalized !== "stop" ||
+          response.toolCalls.length > 0 ||
+          response.events.some(LLMEvent.is.toolInputError))
       )
-      if (other)
-        return yield* new UnsupportedModelError({
-          providerID: ref.providerID,
-          modelID: ref.id,
-          capability: type,
-          message: `${ref.providerID}/${ref.id} is a ${other.type ?? "chat"} model, not a ${type} model`,
+        return yield* new UnavailableError({
+          message: "Native schema generation did not produce a complete non-refusal text response",
+          service: resolved.ref.providerID,
         })
-      return yield* new ModelNotFoundError({
-        providerID: ref.providerID,
-        modelID: ref.id,
-        message: `Model not found: ${ref.providerID}/${ref.id}`,
-      })
-    })
-
-    const image = Effect.fn("Generate.image")(function* (input: ImageRequest) {
-      const model = yield* resolver
-        .resolveImage(input.model)
-        .pipe(Effect.mapError((error) => resolutionError(input.model, "image", error)))
-      if (!model) return yield* missing(input.model, "image")
-      // `ai.image.generate` turns an invalid request into a typed error; building it with `ai.image.request` would throw.
-      const response = yield* ai.image.generate({
-        model,
-        prompt: input.prompt,
-        images: input.images?.map((file) => Media.base64(file.data, file.mime)),
-        n: input.n,
-        aspect: input.aspect,
-        resolution: input.resolution,
-      }).pipe(
-        Effect.provideService(ImageClient.Service, images),
-        ModelRetry.retryOneShot,
-        Effect.mapError((error) => providerError(input.model, error)),
-      )
-      // URL results are downloaded so every image comes back inline, like the request's own files.
-      // Materializing also detects the type of a downloaded image from its bytes when the URL didn't say.
-      const outputs = yield* Effect.forEach(response.images, (asset) =>
-        asset.materialize().pipe(
-          Effect.flatMap((image) =>
-            image.base64().pipe(Effect.map((data) => ({ type: "image" as const, data, mime: image.mediaType }))),
-          ),
-          Effect.provideService(RequestExecutor.Service, executor),
-          Effect.mapError((error) => providerError(input.model, error)),
-        ),
-      )
-      const usage = response.usage?.type === "tokens" ? response.usage : undefined
+      const usage = response.usage ? receiptUsage(response.usage) : undefined
       return {
-        images: outputs,
-        ...(usage?.input === undefined && usage?.output === undefined
-          ? {}
-          : { tokens: { input: usage.input, output: usage.output } }),
-        ...(response.providerMetadata ? { native: plainJson(response.providerMetadata) } : {}),
-      } satisfies ImageResult
+        text: response.text,
+        ...(schema ? { responseSchemaName: schema.name } : {}),
+        model: resolved.ref,
+        ...(usage ? { usage } : {}),
+      }
     })
 
-    const decisions = Effect.fn("Generate.decisions")(function* (input: DecisionRequest) {
-      const model = yield* resolver
-        .resolveDecision(input.model)
-        .pipe(Effect.mapError((error) => resolutionError(input.model, "decision", error)))
-      if (!model) return yield* missing(input.model, "decision")
-      const response = yield* ai.decision.generate({
-        model,
-        input: input.input.map((part) =>
-          part.type === "file"
-            ? { type: "media" as const, media: Media.base64(part.data, part.mime), filename: part.name }
-            : part,
-        ),
-        questions: input.questions,
-      }).pipe(
-        Effect.provideService(DecisionClient.Service, decisionClient),
-        ModelRetry.retryOneShot,
-        Effect.mapError((error) => providerError(input.model, error)),
-      )
-      const usage = response.usage
-      return {
-        answers: response.answers,
-        ...(usage?.cost === undefined ? {} : { cost: Money.USD.make(usage.cost) }),
-        ...(usage?.inputTokens === undefined && usage?.outputTokens === undefined
-          ? {}
-          : { tokens: { input: usage.inputTokens, output: usage.outputTokens } }),
-        ...(response.providerMetadata ? { native: plainJson(response.providerMetadata) } : {}),
-      } satisfies DecisionResult
-    })
-
-    const credentials = <A, E, R>(effect: Effect.Effect<A, E | Integration.AuthorizationError, R>) =>
-      effect.pipe(
+    const result: Interface["result"] = (input) =>
+      runText(input).pipe(
         Effect.catchTag(
           "Integration.Authorization",
           () => new UnavailableError({ message: "Generation credentials are unavailable" }),
         ),
       )
 
-    return Service.of({
-      text: (input) => credentials(runText(input)),
-      image: (input) => credentials(image(input)),
-      decisions: (input) => credentials(decisions(input)),
+    const missing = Effect.fnUntraced(function* (ref: Model.Ref, type: Model.Type) {
+      const other = (yield* models.available(["chat", "image", "decision"])).find(
+        (model) => model.providerID === ref.providerID && model.id === ref.id,
+      )
+      if (other) return yield* new UnsupportedModelError({
+        providerID: ref.providerID, modelID: ref.id, capability: type,
+        message: `${ref.providerID}/${ref.id} is a ${other.type ?? "chat"} model, not a ${type} model`,
+      })
+      return yield* new ModelNotFoundError({
+        providerID: ref.providerID, modelID: ref.id, message: `Model not found: ${ref.providerID}/${ref.id}`,
+      })
+    })
+    const image = Effect.fn("Generate.image")(function* (input: ImageRequest) {
+      const model = yield* resolver.resolveImage(input.model).pipe(Effect.mapError((error) => resolutionError(input.model, "image", error)))
+      if (!model) return yield* missing(input.model, "image")
+      const response = yield* ai.image.generate({
+        model, prompt: input.prompt, images: input.images?.map((file) => Media.base64(file.data, file.mime)),
+        n: input.n, aspect: input.aspect, resolution: input.resolution,
+      }).pipe(Effect.provideService(ImageClient.Service, images), ModelRetry.retryOneShot,
+        Effect.mapError((error) => providerError(input.model, error)))
+      const outputs = yield* Effect.forEach(response.images, (asset) => asset.materialize().pipe(
+        Effect.flatMap((image) => image.base64().pipe(Effect.map((data) => ({ type: "image" as const, data, mime: image.mediaType })))),
+        Effect.provideService(RequestExecutor.Service, executor), Effect.mapError((error) => providerError(input.model, error)),
+      ))
+      const usage = response.usage?.type === "tokens" ? response.usage : undefined
+      return {
+        images: outputs,
+        ...(usage?.input === undefined && usage?.output === undefined ? {} : { tokens: { input: usage.input, output: usage.output } }),
+        ...(response.providerMetadata ? { native: plainJson(response.providerMetadata) } : {}),
+      } satisfies ImageResult
+    })
+    const decisions = Effect.fn("Generate.decisions")(function* (input: DecisionRequest) {
+      const model = yield* resolver.resolveDecision(input.model).pipe(Effect.mapError((error) => resolutionError(input.model, "decision", error)))
+      if (!model) return yield* missing(input.model, "decision")
+      const response = yield* ai.decision.generate({
+        model,
+        input: input.input.map((part) => part.type === "file" ? { type: "media" as const, media: Media.base64(part.data, part.mime), filename: part.name } : part),
+        questions: input.questions,
+      }).pipe(Effect.provideService(DecisionClient.Service, decisionClient), ModelRetry.retryOneShot,
+        Effect.mapError((error) => providerError(input.model, error)))
+      const usage = response.usage
+      return {
+        answers: response.answers,
+        ...(usage?.cost === undefined ? {} : { cost: Money.USD.make(usage.cost) }),
+        ...(usage?.inputTokens === undefined && usage?.outputTokens === undefined ? {} : { tokens: { input: usage.inputTokens, output: usage.outputTokens } }),
+        ...(response.providerMetadata ? { native: plainJson(response.providerMetadata) } : {}),
+      } satisfies DecisionResult
+    })
+    const credentials = <A, E, R>(effect: Effect.Effect<A, E | Integration.AuthorizationError, R>) => effect.pipe(
+      Effect.catchTag("Integration.Authorization", () => new UnavailableError({ message: "Generation credentials are unavailable" })),
+    )
+    return Service.of({ result, text: (input) => result(input).pipe(Effect.map((result) => result.text)),
+      image: (input) => credentials(image(input)), decisions: (input) => credentials(decisions(input)),
     })
   }),
 ).pipe(Layer.provide([ImageClient.layer, DecisionClient.layer]))
@@ -279,3 +272,123 @@ export const node = makeLocationNode({
   layer,
   deps: [ModelResolver.node, Model.node, llmClient, requestExecutor],
 })
+
+function receiptUsage(usage: Usage): Generate.Usage | undefined {
+  const providerMetadata = usage.providerMetadata
+    ? Object.fromEntries(
+        Object.entries(usage.providerMetadata).flatMap(([provider, raw]) => {
+          const value = nativeUsage(raw)
+          return value && typeof value === "object" && Object.keys(value).length ? [[provider, value]] : []
+        }),
+      )
+    : undefined
+  const result = {
+    ...Object.fromEntries(
+      [
+        "contextTokens",
+        "inputTokens",
+        "outputTokens",
+        "nonCachedInputTokens",
+        "cacheReadInputTokens",
+        "cacheWriteInputTokens",
+        "reasoningTokens",
+        "totalTokens",
+      ].flatMap((key) => {
+        const value = usage[key as keyof Usage]
+        return typeof value === "number" && Number.isInteger(value) && value >= 0 ? [[key, value]] : []
+      }),
+    ),
+    ...(providerMetadata && Object.keys(providerMetadata).length ? { providerMetadata } : {}),
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
+// Usage metadata is an escape hatch upstream. Do not export arbitrary response
+// metadata, reasoning text or credentials through this stateless receipt.
+function nativeUsage(value: unknown): Schema.Json | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const counts = new Set([
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "thinking_tokens",
+    "reasoning_tokens",
+    "cached_tokens",
+    "audio_tokens",
+    "accepted_prediction_tokens",
+    "rejected_prediction_tokens",
+    "ephemeral_5m_input_tokens",
+    "ephemeral_1h_input_tokens",
+    "inputTokens",
+    "outputTokens",
+    "totalTokens",
+    "cacheReadInputTokens",
+    "cacheWriteInputTokens",
+    "promptTokenCount",
+    "candidatesTokenCount",
+    "totalTokenCount",
+    "cachedContentTokenCount",
+    "thoughtsTokenCount",
+    "toolUsePromptTokenCount",
+    "tokenCount",
+    "web_search_requests",
+    "web_fetch_requests",
+    "total_input_tokens",
+    "total_cached_tokens",
+    "total_output_tokens",
+    "total_thought_tokens",
+    "raw_prompt_token",
+    "num_cached_tokens",
+    "cache_write_tokens",
+    "prompt_cache_hit_tokens",
+    "cache_created_input_tokens",
+  ])
+  const records = new Set([
+    "cache_creation",
+    "output_tokens_details",
+    "input_tokens_details",
+    "prompt_tokens_details",
+    "completion_tokens_details",
+    "server_tool_use",
+    "tokens",
+    "billed_units",
+    "prompt_token_details",
+  ])
+  const arrays = new Set([
+    "iterations",
+    "promptTokensDetails",
+    "cacheTokensDetails",
+    "candidatesTokensDetails",
+    "toolUsePromptTokensDetails",
+  ])
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, item]) => {
+      // Raw finite values (even malformed counts) remain provenance, not validated
+      // accounting. Non-finite values cannot be represented faithfully in JSON.
+      if (counts.has(key) && ((typeof item === "number" && Number.isFinite(item)) || item === null))
+        return [[key, item]]
+      if (["type", "modality", "service_tier", "inference_geo"].includes(key) && typeof item === "string")
+        return [[key, item]]
+      if (records.has(key)) {
+        if (item === null) return [[key, null]]
+        const nested = nativeUsage(item)
+        return nested === undefined ? [] : [[key, nested]]
+      }
+      if (arrays.has(key) && Array.isArray(item))
+        return [
+          [
+            key,
+            item.flatMap((entry) => {
+              const nested = nativeUsage(entry)
+              return nested === undefined ? [] : [nested]
+            }),
+          ],
+        ]
+      return []
+    }),
+  )
+}

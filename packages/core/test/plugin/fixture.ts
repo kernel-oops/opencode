@@ -27,6 +27,9 @@ import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Provider } from "@opencode/core/provider"
 import { Session } from "@opencode/core/session"
+import { SessionStore } from "@opencode/core/session/store"
+import { SessionExecution } from "@opencode/core/session/execution"
+import { SubagentJob } from "@opencode/core/session/subagent-job"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { PersistentPty } from "@opencode/core/persistent-pty"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
@@ -60,10 +63,8 @@ const npmLayer = Layer.succeed(
 
 const generateLayer = Layer.succeed(
   Generate.Service,
-  Generate.Service.of({
-    text: () => Effect.succeed(""),
-    image: () => Effect.die("unused"),
-    decisions: () => Effect.die("unused"),
+  Generate.Service.of({ text: () => Effect.succeed(""), result: () => Effect.succeed({ text: "" }),
+    image: () => Effect.die("unused"), decisions: () => Effect.die("unused"),
   }),
 )
 
@@ -84,7 +85,10 @@ const permissionLayer = Layer.succeed(
   }),
 )
 
-export const makePluginTestLayer = (permission = permissionLayer, generate = generateLayer, realPermission = false) =>
+export const makePluginTestLayer = (
+  permission: Layer.Layer<Permission.Service> | null = permissionLayer,
+  generate = generateLayer,
+) =>
   AppNodeBuilder.build(
     LayerNode.group([
       AppProcess.node,
@@ -114,6 +118,9 @@ export const makePluginTestLayer = (permission = permissionLayer, generate = gen
       KV.node,
       Mcp.node,
       Session.node,
+      SessionStore.node,
+      SessionExecution.node,
+      SubagentJob.node,
       InstructionEntry.node,
       PersistentPty.node,
       LocationServiceMap.node,
@@ -136,7 +143,7 @@ export const makePluginTestLayer = (permission = permissionLayer, generate = gen
       Config.node.replace(configLayer),
       Mcp.node.replace(emptyMcpLayer),
       Generate.node.replace(generate),
-      ...(realPermission ? [] : [Permission.node.replace(permission)]),
+      ...(permission ? [Permission.node.replace(permission)] : []),
       offlineModels,
     ],
   ).pipe(Layer.provideMerge(configLayer))

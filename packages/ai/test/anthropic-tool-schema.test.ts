@@ -103,7 +103,7 @@ describe("Anthropic argument root projection", () => {
         ],
       }
       const tools = [
-        { name: "example_tool", description: "Native fixture", inputSchema: union },
+        { name: "new_session", description: "Native fixture", inputSchema: union },
         {
           name: "subagent",
           description: "Task fixture",
@@ -126,7 +126,7 @@ describe("Anthropic argument root projection", () => {
           cache: "none",
         }),
       )
-      expect(anthropic.body.tools?.map((tool) => tool.name)).toEqual(["example_tool", "subagent", "mcp_lookup"])
+      expect(anthropic.body.tools?.map((tool) => tool.name)).toEqual(["new_session", "subagent", "mcp_lookup"])
       expect(anthropic.body.tools?.map((tool) => tool.description)).toEqual([
         "Native fixture",
         "Task fixture",

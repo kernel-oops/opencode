@@ -1,4 +1,4 @@
-import { createEffect, createMemo } from "solid-js"
+import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { FormInfo, PermissionRequest } from "@opencode/client/promise"
 import { useParams } from "@solidjs/router"
@@ -24,25 +24,29 @@ export function createSessionRequestModel() {
     const id = params.id
 
     if (!id || serverSDK.connection.status() !== "connected") return
-    void Promise.all([data.shell.sync({ directory: sdk().directory }), data.session.permission.sync(id)]).catch(
-      () => undefined,
-    )
+    void data.shell.sync({ directory: sdk().directory }).catch(() => undefined)
   })
-
-  // Only a running Session can hold a pending form, and events keep loaded forms current. Comparing by value
-  // keeps every session update in a large subagent tree from re-requesting forms.
-  const formSessions = createMemo(
-    () =>
-      sessionTreeIDs(data.session.list(), params.id).filter(
-        (id) => id === params.id || data.session.status(id) === "running",
-      ),
-    [],
-    { equals: (a, b) => a.join() === b.join() },
-  )
-
+  // The route loads only the first page of direct children. Hydrate the whole selected tree, so a request waiting in
+  // a deeper or later-paged descendant is found; leaving this Session stops further traversal.
   createEffect(() => {
-    if (serverSDK.connection.status() !== "connected") return
-    void Promise.all(formSessions().map((sessionID) => data.session.form.sync(sessionID))).catch(() => undefined)
+    const id = params.id
+
+    if (!id || serverSDK.connection.status() !== "connected") return
+    const controller = new AbortController()
+    onCleanup(() => controller.abort())
+    void data.session.descendants.sync(id, { signal: controller.signal }).catch(() => undefined)
+  })
+  // A descendant may already be waiting when this view connects, so sync the whole tree, not only this Session.
+  createEffect(() => {
+    const id = params.id
+
+    if (!id || serverSDK.connection.status() !== "connected") return
+    void Promise.allSettled(
+      sessionTreeIDs(data.session.list(), id).flatMap((sessionID) => [
+        data.session.permission.sync(sessionID),
+        data.session.form.sync(sessionID),
+      ]),
+    )
   })
 
   const formRequest = createMemo((): FormInfo | undefined => {
@@ -109,9 +113,8 @@ export function createSessionRequestModel() {
 
     const project = projectSettingsKey(serverSDK.scope, id ? data.session.get(id)?.projectID : undefined)
 
-    if (settings.permissions.autoApproves(project)) return
-
-    return sessionPermissionRequest(data.session.list(), data.session.permission.list, id)
+    return sessionPermissionRequest(data.session.list(), data.session.permission.list, id,
+      (request) => !settings.permissions.autoApproves(project) || !!request.review)
   })
 
   const blocked = createMemo(() => {
@@ -170,24 +173,31 @@ export function createSessionRequestModel() {
     return store.responding === perm.id
   })
 
-  const decide = (response: "once" | "always" | "reject") => {
-    const perm = permissionRequest()
+  // Resolves true only once the server accepted the reply, so callers keep typed input on any failure.
+  const decide = async (
+    request: PermissionRequest,
+    response: "once" | "always" | "reject" | "review_once",
+    message?: string,
+  ) => {
+    if (permissionRequest()?.id !== request.id || store.responding === request.id) return false
 
-    if (!perm) return
+    setStore("responding", request.id)
 
-    if (store.responding === perm.id) return
+    return data.session.permission
+      .reply({ sessionID: request.sessionID, requestID: request.id, decision: response, message })
+      .then(
+        () => true,
+        (error) => {
+          showToast({
+            title: language.t("common.requestFailed"),
+            description: error instanceof Error ? error.message : String(error),
+          })
 
-    setStore("responding", perm.id)
-    serverSDK.api.permission
-      .reply({ sessionID: perm.sessionID, requestID: perm.id, decision: response })
-      .catch((error) => {
-        showToast({
-          title: language.t("common.requestFailed"),
-          description: error instanceof Error ? error.message : String(error),
-        })
-      })
+          return false
+        },
+      )
       .finally(() => {
-        setStore("responding", (id) => (id === perm.id ? undefined : id))
+        setStore("responding", (id) => (id === request.id ? undefined : id))
       })
   }
 

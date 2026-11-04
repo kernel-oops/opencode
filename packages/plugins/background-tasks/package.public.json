@@ -1,0 +1,25 @@
+{
+  "name": "@kernel-oops/opencode-background-tasks",
+  "version": "2.0.30",
+  "description": "Background task presentation for compatible OpenCode V2 fork hosts",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "bun": ">=1.4.2" },
+  "exports": {
+    "./tui": "./tui.js",
+    "./session": { "types": "./dist/session.d.ts", "default": "./dist/session.js" }
+  },
+  "files": ["dist/tui.js", "dist/session.js", "dist/session.d.ts", "tui.js", "README.md", "CHANGELOG.md", "LICENSE"],
+  "peerDependencies": {
+    "@opencode/plugin": "2.1.4",
+    "@opentui/core": "0.6.8",
+    "@opentui/solid": "0.6.8",
+    "solid-js": "1.9.15"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": { "optional": true },
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
+  }
+}

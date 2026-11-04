@@ -382,7 +382,13 @@ function normalizeCompaction(
         )
       : undefined
   const tokens = prefer(legacyTokens, nativeTokens, ["compaction", "keep", "tokens"], diagnostics)
-  if (tokens !== undefined) result.keep = { tokens }
+  const keep: Record<string, unknown> = {}
+  if (tokens !== undefined) keep.tokens = tokens
+  if (nativeKeep && own(nativeKeep, "strict")) {
+    const strict = decodeEncoded(ConfigCompaction.Keep.fields.strict, nativeKeep.strict, ["compaction", "keep", "strict"], diagnostics)
+    if (strict !== undefined) keep.strict = strict
+  }
+  if (Object.keys(keep).length) result.keep = keep
   const legacyBuffer = own(input.compaction, "reserved")
     ? decodeEncoded(
         ConfigCompaction.Info.fields.buffer,
@@ -396,6 +402,10 @@ function normalizeCompaction(
     : undefined
   const buffer = prefer(legacyBuffer, nativeBuffer, ["compaction", "buffer"], diagnostics)
   if (buffer !== undefined) result.buffer = buffer
+  if (own(input.compaction, "models")) {
+    const models = decodeMap(input.compaction.models, ConfigCompaction.Model, ["compaction", "models"], diagnostics, decodeEncoded)
+    if (isRecord(input.compaction.models)) result.models = models
+  }
   if (Object.keys(result).length || !Object.keys(input.compaction).length) encoded.compaction = result
 }
 
@@ -456,6 +466,16 @@ function normalizeExperimental(
     if (!isRecord(input.experimental)) invalid(["experimental"], diagnostics)
     if (isRecord(input.experimental)) {
       const experimental = input.experimental
+      for (const key of ["task_continuation_agents", "task_continuation_eligible"] as const) {
+        if (!own(experimental, key)) continue
+        const value = decodeEncoded(
+          ConfigExperimental.Info.fields[key],
+          experimental[key],
+          ["experimental", key],
+          diagnostics,
+        )
+        if (value !== undefined) result[key] = value
+      }
       unsupportedExperimental.forEach((key) =>
         unsupportedIfPresent(experimental, key, ["experimental", key], diagnostics),
       )

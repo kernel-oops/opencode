@@ -13,6 +13,7 @@ import { blobDataUrl, resolveBlobUrl } from "@/runtime/persistence/drafts"
 import { isAttachment } from "./prompt-parts"
 import type { ModelSelection } from "@/providers/models/selection"
 import { parseSlashCommand } from "./client-slash-command"
+import { ReviewApproval } from "@opencode/util/bound/review-approval"
 
 const submitting = new WeakSet<object>()
 
@@ -43,6 +44,8 @@ type ComposerSubmitInput = {
   closePopover: () => void
   delivery?: (alternate: boolean) => ComposerDelivery
   clientCommand?: (text: string) => (() => void | Promise<void>) | undefined
+  reviewApproval?: (requestID: string) => Promise<void>
+  invalidReviewApproval?: () => string
   notify: {
     missingSelection: () => void
     unqueueable: () => void
@@ -67,6 +70,22 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
 
     const prompt = clonePrompt(input.adapter.state.current())
     const text = submissionText(prompt)
+    const reviewID = input.mode() === "normal" ? ReviewApproval.requestID(text) : undefined
+    if (input.mode() === "normal" && ReviewApproval.commandInput(text)) {
+      if (submitting.has(input.adapter.state)) return
+      submitting.add(input.adapter.state)
+      try {
+        if (!reviewID || prompt.some((part) => part.type !== "text") || input.adapter.state.context.items().length || !input.reviewApproval)
+          throw new Error(input.invalidReviewApproval?.() ?? "Invalid permission approval")
+        await input.reviewApproval(reviewID)
+        clearClientCommand(input, prompt)
+      } catch (error) {
+        input.notify.failed("command", error)
+      } finally {
+        submitting.delete(input.adapter.state)
+      }
+      return
+    }
     const clientCommand = input.mode() === "normal" ? input.clientCommand?.(text) : undefined
 
     if (clientCommand) {
@@ -107,24 +126,16 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       }),
     })
 
-    const read = readSubmission(input, submission.prompt, submission.context, text, options?.alternate ?? false)
+    let read = readSubmission(input, submission.prompt, submission.context, text, options?.alternate ?? false)
 
-    // A cold Location lists its agents and models only after its plugins activate, so hold the send until then.
     if (read === "loading") {
       setHeld(true)
       const loaded = await whenLoaded(input, owner, held)
       setHeld(false)
-
-      if (loaded) await submit(event, options)
-
-      return
+      if (!loaded) return
+      read = readSubmission(input, submission.prompt, submission.context, text, options?.alternate ?? false)
     }
-
-    if (!read) {
-      if (input.adapter.working() && input.adapter.kind === "active-session") void input.adapter.interrupt()
-
-      return
-    }
+    if (!read || read === "empty" || read === "loading") return
 
     // Like the TUI, a shell command runs now or not at all; it cannot wait in the queue.
     if (read.mode === "shell" && read.delivery === "queue") {
@@ -333,15 +344,15 @@ function readSubmission(
   context: ComposerSubmission["context"],
   text: string,
   alternate: boolean,
-): ComposerSubmission | "loading" | undefined {
+): ComposerSubmission | "empty" | "loading" | undefined {
   const mode = input.mode()
 
-  if (mode === "shell" && !text.trim()) return
+  if (mode === "shell" && !text.trim()) return "empty"
   const images = prompt.filter((part): part is ImageAttachmentPart => part.type === "image")
   // Like the TUI's blank Enter, file chips alone send nothing; they wait for text.
   const comments = context.filter(isCommentItem).length
 
-  if (!text.trim() && !prompt.some(isAttachment) && comments === 0) return
+  if (!text.trim() && !prompt.some(isAttachment) && comments === 0) return "empty"
 
   const selection = currentSelection(input)
 

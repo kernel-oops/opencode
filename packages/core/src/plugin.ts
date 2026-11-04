@@ -13,6 +13,8 @@ import { KV } from "./kv.js"
 import { PluginHost } from "./plugin/host.js"
 import { type Failure, type Generation, Service } from "./plugin/service.js"
 import { State } from "./state.js"
+import { PluginHooks } from "./plugin/hooks.js"
+import { PluginModule } from "./plugin/module.js"
 
 export { awaitActivation, type Generation, type Interface, Service } from "./plugin/service.js"
 
@@ -21,10 +23,14 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const kv = yield* KV.Service
+    const hooks = yield* PluginHooks.Service
     const scope = yield* Scope.make()
     // One slot per requested definition in activation order, including ones whose setup failed, so
     // the prefix diff below stays index-aligned and a failed revision is not retried until it changes.
     const active = new Map<Plugin.ID, Slot>()
+    const sourceReviewers = new WeakSet<Generation>()
+    const modelReviewers = new WeakSet<Generation>()
+    const sourceAuthority = new WeakSet<Generation>()
     const lock = Semaphore.makeUnsafe(1)
     const ready = yield* Latch.make(true)
     const pending = new Set<object>()
@@ -54,8 +60,6 @@ const layer = Layer.effect(
     const gui = Effect.fn("Plugin.gui")(function* (id: Plugin.ID) {
       const gui = active.get(id)?.plugin.gui
       if (!gui) return undefined
-      // A plugin that resolved a `./gui-experimental` file but cannot read it now is a server fault, not a missing
-      // bundle.
       const code = yield* Effect.promise(() => readFile(fileURLToPath(gui.file), "utf8"))
       return { code, revision: gui.revision, options: gui.options } satisfies Plugin.GuiBundle
     })
@@ -64,10 +68,11 @@ const layer = Layer.effect(
       awaitActivation: ready.await,
       activating: () => !closed && pending.size > 0,
     })
-    const load = Effect.fnUntraced(function* (plugin: Generation) {
+    const load = Effect.fnUntraced(function* (plugin: Generation, reviewSource = true) {
       const activation: Activation = { plugin, scope: yield* Scope.fork(scope) }
       const inherit = yield* State.inherit()
       const grouped = State.group((failure, refresh) => {
+        sourceAuthority.delete(plugin)
         activation.failure = {
           error: `Plugin disabled after ${failure.state}.transform failed. Check server logs for details.`,
           ref: `err_${crypto.randomUUID().slice(0, 8)}`,
@@ -82,7 +87,17 @@ const layer = Layer.effect(
         })
       })
       const exit = yield* Effect.suspend(() =>
-        plugin.effect({ ...host, storage: PluginHost.storage(kv, plugin.id) }),
+        plugin.effect({
+          ...host,
+          permission: {
+            ...host.permission,
+            hook: (name, callback) =>
+              reviewSource && sourceReviewers.has(plugin) && name === "evaluate"
+                ? hooks.registerSourceReviewer(callback, () => !closed && sourceAuthority.has(plugin), modelReviewers.has(plugin))
+                : host.permission.hook(name, callback),
+          },
+          storage: PluginHost.storage(kv, plugin.id),
+        }),
       ).pipe(
         grouped,
         inherit,
@@ -98,7 +113,10 @@ const layer = Layer.effect(
         ),
         Effect.exit,
       )
-      if (activation.failure || Exit.isSuccess(exit)) return { activation } as const
+      if (activation.failure || Exit.isSuccess(exit)) {
+        if (!activation.failure && reviewSource && sourceReviewers.has(plugin)) sourceAuthority.add(plugin)
+        return { activation } as const
+      }
       yield* Effect.logWarning("failed to load plugin", {
         "plugin.id": plugin.id,
         cause: exit.cause,
@@ -110,7 +128,12 @@ const layer = Layer.effect(
       plugins: readonly Generation[],
       failures: readonly Failure[] = [],
     ) {
-      const definitions = plugins.map((plugin) => ({ ...plugin, id: Plugin.ID.make(plugin.id) }))
+      const definitions = plugins.map((plugin) => {
+        const definition = { ...plugin, id: Plugin.ID.make(plugin.id) }
+        if (PluginModule.isSourceReviewer(plugin)) sourceReviewers.add(definition)
+        if (PluginModule.isModelReviewer(plugin)) modelReviewers.add(definition)
+        return definition
+      })
       const ids = new Set<Plugin.ID>()
       for (const definition of definitions) {
         if (ids.has(definition.id)) yield* Effect.die(new Error(`Duplicate plugin ID: ${definition.id}`))
@@ -127,7 +150,11 @@ const layer = Layer.effect(
               const current = Array.from(active.values())
               const changed = definitions.findIndex((definition, index) => {
                 const entry = current[index]
-                return entry?.plugin.id !== definition.id || entry.plugin.revision !== definition.revision
+                return (
+                  entry?.plugin.id !== definition.id ||
+                  entry.plugin.revision !== definition.revision ||
+                  sourceReviewers.has(entry.plugin) !== sourceReviewers.has(definition)
+                )
               })
               const prefix = changed === -1 ? definitions.length : changed
               for (const definition of definitions.slice(0, prefix)) {
@@ -140,10 +167,16 @@ const layer = Layer.effect(
                 return
               }
 
+              const previous = new Map(Array.from(active.entries()).slice(prefix))
+              // Revoke before any awaited unload/setup, not merely when hook finalisers eventually run.
+              // A fallback may restore ordinary callbacks but must not resurrect obsolete authority.
+              for (const slot of previous.values()) {
+                sourceAuthority.delete(slot.plugin)
+                if (slot.activation) sourceAuthority.delete(slot.activation.plugin)
+              }
               yield* State.batch(
                 Effect.gen(function* () {
                   // Registrations are ordered by setup, so only the unchanged prefix can stay alive.
-                  const previous = new Map(Array.from(active.entries()).slice(prefix))
                   yield* Effect.forEach(
                     Array.from(previous.entries()).toReversed(),
                     ([id, slot]) =>
@@ -157,7 +190,11 @@ const layer = Layer.effect(
                   for (const definition of definitions.slice(prefix)) {
                     const slot = previous.get(definition.id)
                     // Reordering healthy registrations does not authorize retrying a failed revision.
-                    if (slot?.activation?.failure && slot.plugin.revision === definition.revision) {
+                    if (
+                      slot?.activation?.failure &&
+                      slot.plugin.revision === definition.revision &&
+                      sourceReviewers.has(slot.plugin) === sourceReviewers.has(definition)
+                    ) {
                       active.set(definition.id, { ...slot, plugin: definition })
                       continue
                     }
@@ -173,7 +210,7 @@ const layer = Layer.effect(
 
                     const fallback = slot?.activation
                     if (!fallback || fallback.failure) continue
-                    const restored = yield* load(fallback.plugin)
+                    const restored = yield* load(fallback.plugin, false)
                     if (restored.activation !== undefined) {
                       active.set(definition.id, {
                         plugin: definition,
@@ -259,6 +296,10 @@ const layer = Layer.effect(
           closed = true
           pending.clear()
           ready.openUnsafe()
+          for (const slot of active.values()) {
+            sourceAuthority.delete(slot.plugin)
+            if (slot.activation) sourceAuthority.delete(slot.activation.plugin)
+          }
           active.clear()
           yield* State.shutdown(Scope.close(scope, exit))
         }),

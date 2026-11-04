@@ -1,9 +1,10 @@
 import { describe, expect } from "bun:test"
 import { ToolDefinition } from "@opencode/ai/effect"
 import { OpenAIChat } from "@opencode/ai/protocols"
+import { Message } from "@opencode/ai/effect"
 import { Agent } from "@opencode/schema/agent"
 import { Money } from "@opencode/schema/money"
-import { Session } from "@opencode/schema/session"
+import { Session } from "@opencode/core/session"
 import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { Location } from "@opencode/core/location"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
@@ -12,6 +13,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { SessionContextBudget } from "@opencode/core/session/context-budget"
 import { DateTime, Effect, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { testEffect } from "./lib/effect"
@@ -35,8 +37,11 @@ const model = SessionRunnerModel.resolved(OpenAIChat.route.model({ id: "gpt-5.5"
   limit: { context: 200_000, output: 32_000 },
 })
 const transport = SessionModelTransport.Service.of({
+  steer: () => Effect.succeed(false),
+  hasPendingInput: () => false,
   bind: () => ({ execute: () => Effect.die("unused WebSocket execution") }),
   close: () => Effect.void,
+  retire: () => Effect.void,
   closeAll: Effect.void,
 })
 
@@ -78,6 +83,140 @@ describe("SessionModelRequest HTTP hooks", () => {
       }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
     )
 
+  for (const [channel, httpHook] of [["http", false], ["http", true], ["websocket", false]] as const)
+    it.effect(`late enable enforces current ${channel} policy (HTTP hook=${httpHook})`, () => Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const hooks = yield* PluginHooks.Service
+      const stored = yield* sessions.create({ location: session.location })
+      if (httpHook) yield* hooks.register("session", "http.request", () => Effect.void)
+      const wire = JSON.stringify({ max_tokens: 32_000, messages: [{ content: "x".repeat(1_600_000) }] })
+      let dispatched = false
+      const websocket = SessionModelTransport.Service.of({ ...transport, bind: (_id, interceptor) => ({ execute: () => Effect.gen(function* () {
+        yield* interceptor!.send!(wire)
+        dispatched = true
+        return { frames: Stream.empty, complete: Effect.void }
+      }) }) })
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer), Effect.provideService(SessionModelTransport.Service, websocket))
+      const prepared = yield* requests.primary({ session: stored, agent: Agent.ID.make("build"), model: { ...model, limit: { context: 1_000_000, output: 32_000 }, transport: channel }, system: [], messages: [], webSocket: "session" })
+      yield* sessions.setContextBudget({ sessionID: stored.id, contextBudget: { target: 400_000, maximum: 480_000 } })
+      const error = yield* (channel === "http"
+        ? prepared.options.http!(HttpClientRequest.post("https://example.test/request").pipe(HttpClientRequest.bodyText(wire)), (request) => {
+          dispatched = true
+          return Effect.succeed(HttpClientResponse.fromWeb(request, new Response("{}")))
+        }).pipe(Effect.asVoid)
+        : prepared.options.webSocket!.execute({} as never).pipe(Effect.asVoid)).pipe(Effect.flip)
+      expect(SessionContextBudget.isBlocked(error)).toBe(true)
+      expect(dispatched).toBe(false)
+    }))
+
+  it.effect("late enable cannot invent provenance for already-prepared encrypted reasoning", () => Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const stored = yield* sessions.create({ location: session.location })
+    const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+    const prepared = yield* requests.primary({
+      session: stored, agent: Agent.ID.make("build"), model, system: [],
+      messages: [new Message({ id: "msg_old", role: "assistant", content: [{ type: "reasoning", text: "Visible summary", providerMetadata: { test: { itemId: "rs_old", reasoningEncryptedContent: "unbound" } } }] })],
+    })
+    yield* sessions.setContextBudget({ sessionID: stored.id, contextBudget: { target: 400_000, maximum: 480_000 } })
+    const error = yield* prepared.options.http!(HttpClientRequest.post("https://example.test/request").pipe(HttpClientRequest.bodyText(JSON.stringify({ max_tokens: 32_000, input: [{ type: "reasoning", id: "rs_old", summary: [], encrypted_content: "unbound" }] }))), () => Effect.die("must not dispatch")).pipe(Effect.flip)
+    expect(SessionContextBudget.isBlocked(error)).toBe(true)
+    expect(error.message).toContain("matching completed source usage")
+  }).pipe(Effect.provideService(SessionModelTransport.Service, transport)))
+
+  it.effect("an unchanged unbudgeted no-hook request keeps its original HTTP body path", () => Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const stored = yield* sessions.create({ location: session.location })
+    const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+    const prepared = yield* requests.primary({ session: stored, agent: Agent.ID.make("build"), model, system: [], messages: [] })
+    const original = HttpClientRequest.post("https://example.test/request").pipe(HttpClientRequest.bodyUint8Array(new Uint8Array([255])))
+    yield* prepared.options.http!(original, (request) => {
+      expect(request).toBe(original)
+      return Effect.succeed(HttpClientResponse.fromWeb(request, new Response("{}")))
+    })
+  }).pipe(Effect.provideService(SessionModelTransport.Service, transport)))
+
+  for (const channel of ["http", "websocket"] as const) {
+    for (const expanded of [false, true])
+      it.effect(`budget checks final ${channel} hook payload (expanded=${expanded})`, () =>
+        Effect.gen(function* () {
+          const hooks = yield* PluginHooks.Service
+          const frame = JSON.stringify({
+            max_tokens: 32_000,
+            messages: [{ role: "user", content: "x".repeat(expanded ? 600_000 : 10) }],
+          })
+          let dispatched = false
+          yield* hooks.register("session", "http.request", (event) =>
+            Effect.sync(() => {
+              event.request = new Request(event.request, { body: frame })
+            }),
+          )
+          yield* hooks.register("session", "experimental.ws.send", (event) =>
+            Effect.sync(() => {
+              event.frame = frame
+            }),
+          )
+          const websocket = SessionModelTransport.Service.of({
+            ...transport,
+            bind: (_id, interceptor) => ({
+              execute: () =>
+                Effect.gen(function* () {
+                  yield* interceptor!.send!("original")
+                  dispatched = true
+                  return { frames: Stream.empty, complete: Effect.void }
+                }),
+            }),
+          })
+          const requests = yield* SessionModelRequest.Service.pipe(
+            Effect.provide(SessionModelRequest.layer),
+            Effect.provideService(SessionModelTransport.Service, websocket),
+          )
+          const prepared = yield* requests.primary({
+            session: Session.Info.make({ ...session, contextBudget: { target: 120_000, maximum: 160_000 } }),
+            agent: Agent.ID.make("build"),
+            model: { ...model, transport: channel },
+            system: [],
+            messages: [],
+            webSocket: "session",
+          })
+          const result = yield* (
+            channel === "http"
+              ? prepared.options.http!(
+                  HttpClientRequest.post("https://example.test/request").pipe(HttpClientRequest.bodyText("{}")),
+                  (request) => {
+                    dispatched = true
+                    return Effect.succeed(HttpClientResponse.fromWeb(request, new Response("{}")))
+                  },
+                ).pipe(Effect.asVoid)
+              : prepared.options.webSocket!.execute({} as never).pipe(Effect.asVoid)
+          ).pipe(Effect.exit)
+          expect(dispatched).toBe(!expanded)
+          expect(result._tag).toBe(expanded ? "Failure" : "Success")
+        }),
+      )
+  }
+
+  it.effect("a late target crossing is a typed runner recovery, not a provider retry or dispatch", () =>
+    Effect.gen(function* () {
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+      const prepared = yield* requests.primary({
+        session: Session.Info.make({ ...session, contextBudget: { target: 50_000, maximum: 160_000 } }),
+        agent: Agent.ID.make("build"),
+        model,
+        system: [],
+        messages: [],
+        budgetBinding: "fixture",
+      })
+      const error = yield* prepared.options.http!(
+        HttpClientRequest.post("https://example.test/request").pipe(
+          HttpClientRequest.bodyText(
+            JSON.stringify({ max_tokens: 32_000, messages: [{ content: "x".repeat(100_000) }] }),
+          ),
+        ),
+        () => Effect.die("must not dispatch"),
+      ).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(SessionContextBudget.TargetReached)
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
   it.effect("tags every Session request kind on http.request and http.response", () =>
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
@@ -228,6 +367,8 @@ describe("SessionModelRequest HTTP hooks", () => {
       const bound: Array<{ url: string; headers: Record<string, string> }> = []
       const frames: string[] = []
       const websocketTransport = SessionModelTransport.Service.of({
+        steer: () => Effect.succeed(false),
+        hasPendingInput: () => false,
         bind: (_sessionID, interceptor) => ({
           execute: () =>
             Effect.gen(function* () {
@@ -242,6 +383,7 @@ describe("SessionModelRequest HTTP hooks", () => {
             }),
         }),
         close: () => Effect.void,
+        retire: () => Effect.void,
         closeAll: Effect.void,
       })
       const requests = yield* SessionModelRequest.Service.pipe(

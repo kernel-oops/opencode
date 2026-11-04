@@ -5,6 +5,11 @@ import { NonNegativeInt, optional } from "../schema.js"
 
 export class Keep extends Schema.Class<Keep>("Config.Compaction.Keep")({
   tokens: NonNegativeInt.pipe(optional),
+  strict: Schema.Boolean.pipe(optional),
+}) {}
+
+export class Model extends Schema.Class<Model>("Config.Compaction.Model")({
+  keep: Keep.pipe(optional),
 }) {}
 
 /** A share of the model's window such as "20%" or "12.5%", from 1% up to but not including 100%. */
@@ -20,4 +25,6 @@ export class Info extends Schema.Class<Info>("Config.Compaction")({
     description:
       'Room kept free below the model\'s context window before automatic compaction, as a share of the window from "1%" to "99%", such as "20%" to compact at 80% full. A token count is also accepted.',
   }),
+  /** Exact provider/model references; variants use the underlying model reference. */
+  models: Schema.Record(Schema.String, Model).pipe(optional),
 }) {}

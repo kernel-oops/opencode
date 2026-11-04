@@ -15,6 +15,7 @@ import { Permission } from "./permission.js"
 import { TokenUsage } from "./token-usage.js"
 import { Revert } from "./session-revert.js"
 import { SessionFork } from "./session-fork.js"
+import { SessionContextBudget } from "./session-context-budget.js"
 
 export const ID = SessionID
 export type ID = SessionID
@@ -59,6 +60,9 @@ export const Info = Schema.Struct({
   metadata: Metadata.pipe(optional),
   /** Evaluated after the agent's rules; the last matching rule wins. */
   permissions: Permission.Ruleset.pipe(optional),
+  /** Explicitly session-scoped; never inherited by children or forks. */
+  contextBudget: SessionContextBudget.Policy.pipe(optional),
+  contextBudgetState: SessionContextBudget.State.pipe(optional),
   revert: Revert.pipe(optional),
 }).annotate({ identifier: "Session.Info" })
 

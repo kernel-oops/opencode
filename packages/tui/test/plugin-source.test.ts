@@ -98,6 +98,8 @@ test("a missing package dependency reloads when it is installed", async () => {
   })
   using _watcher = { [Symbol.dispose]: watcher.dispose }
   await using sources = await fixture(watcher.wait)
+  // Declare this fixture's install root; the encrypted TMPDIR has real package ancestors.
+  await Bun.write(new URL("package.json", sources.url), '{"type":"module"}')
   const entry = new URL("tui.ts", sources.url)
   await Bun.write(entry, 'export { default } from "example"')
   await expect(sources.read(entry.href)).rejects.toThrow("example")
@@ -324,6 +326,7 @@ test.each(["", "?mode=plugin", "?mode=plugin#section"])(
     const watched = []
     const sources = createPluginSources(async file => { watched.push(file) })
     try {
+      await writeFile(new URL("./package.json", import.meta.url), '{"type":"module"}')
       const library = new URL("./shared/index.mjs", import.meta.url)
       await mkdir(new URL("./shared", import.meta.url), { recursive: true })
       await writeFile(library, 'export default { shared: true }')

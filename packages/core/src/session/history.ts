@@ -12,6 +12,7 @@ import { InstructionState } from "./instruction-state.js"
 import { SessionBlob } from "./blob.js"
 import { SessionRecentText } from "./recent-text.js"
 import { SessionMessageTable, SessionPartTable } from "./sql.js"
+import { SessionStateEnvelope } from "./state-envelope.js"
 import { SessionStored } from "./stored.js"
 
 type DatabaseService = Database.Interface["db"]
@@ -59,7 +60,11 @@ const latestCompaction = Effect.fnUntraced(function* (
   before?: number,
 ) {
   return yield* db
-    .select({ seq: SessionMessageTable.seq })
+    .select({
+      seq: SessionMessageTable.seq,
+      id: SessionMessageTable.id,
+      summary: sql<unknown>`json_extract(${SessionMessageTable.data}, '$.summary')`,
+    })
     .from(SessionMessageTable)
     .where(
       and(
@@ -85,6 +90,57 @@ const latestCompaction = Effect.fnUntraced(function* (
     .limit(1)
     .get()
     .pipe(Effect.orDie)
+})
+
+/**
+ * The durable native binding of a completed compaction as core's controller-state checkpoint: the `checkpoint`
+ * provenance core projects onto the checkpoint message in its own commit, from the `Compaction.Ended` event. It
+ * survives a coherent reopen, a lost local receipt and an event-only replay alike. Text alone never binds.
+ * `undefined` when the message carries none; `false` when a present marker does not bind this session.
+ */
+export const checkpointBinding = Effect.fnUntraced(function* (db: DatabaseService, sessionID: string, compactionID: string) {
+  const row = yield* db
+    .select({
+      checkpoint: sql<unknown>`json_extract(${SessionMessageTable.data}, '$.checkpoint')`,
+      present: sql<string | null>`json_type(${SessionMessageTable.data}, '$.checkpoint')`,
+    })
+    .from(SessionMessageTable)
+    .where(and(eq(SessionMessageTable.session_id, sessionID as SessionSchema.ID), eq(SessionMessageTable.id, compactionID as SessionMessage.ID)))
+    .get()
+    .pipe(Effect.orDie)
+  if (!row?.present) return undefined
+  if (row.present !== "object") return false
+  const binding = decodeBinding(row.checkpoint)
+  // Present but not bound here, as in a fork's copy of a checkpoint: `false`, never an ordinary summary.
+  return Option.isSome(binding) && binding.value.sessionID === sessionID ? binding.value : false
+})
+const decodeBinding = Schema.decodeUnknownOption(Schema.fromJsonString(SessionMessage.CheckpointBinding))
+
+/**
+ * Where a completed compaction's window starts. A bound controller-state checkpoint covers only its reviewed prefix,
+ * so the original messages after its coverage stay, even those before its marker. Its envelope must decode against
+ * that binding and still match its covered row; otherwise it fails as recovery required. Unbound text is ordinary.
+ */
+const checkpointStart = Effect.fnUntraced(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  compaction: { readonly seq: number; readonly id: SessionMessage.ID; readonly summary: unknown },
+) {
+  const binding = yield* checkpointBinding(db, sessionID, compaction.id)
+  if (binding === undefined) return compaction.seq
+  const envelope =
+    binding && SessionStateEnvelope.decode(typeof compaction.summary === "string" ? compaction.summary : "", binding)
+  const covered = envelope
+    ? yield* db
+        .select({ id: SessionMessageTable.id })
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.seq, envelope.coverage.coveredSeq)))
+        .get()
+        .pipe(Effect.orDie)
+    : undefined
+  if (!envelope || covered?.id !== envelope.coverage.coveredMessageID)
+    return yield* new MessageDecodeError({ sessionID, messageID: compaction.id })
+  return Math.min(compaction.seq, envelope.coverage.coveredSeq + 1)
 })
 
 export const hasInlineContent = (data: typeof SessionMessageTable.$inferSelect.data): boolean =>
@@ -144,7 +200,7 @@ export const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =
   decode(rowInput(row)).pipe(Effect.mapError(decodeError(row)))
 
 /** Decodes a row without its blobs, so user files may stay refs. Only for readers that never use file bytes. */
-const decodeStoredRow = (
+export const decodeStoredRow = (
   row: typeof SessionMessageTable.$inferSelect,
 ): Effect.Effect<SessionMessage.Info | SessionStored.User, MessageDecodeError> =>
   row.type === "user" ? decodeStoredUser(rowInput(row)).pipe(Effect.mapError(decodeError(row))) : decodeMessageRow(row)
@@ -190,23 +246,28 @@ const messageEntries = Effect.fnUntraced(function* (
   MessageDecodeError
 > {
   const compaction = yield* latestCompaction(db, sessionID, boundary, before)
+  const from = compaction ? yield* checkpointStart(db, sessionID, compaction) : undefined
   const rows = yield* db
     .select()
     .from(SessionMessageTable)
     .where(
       and(
         eq(SessionMessageTable.session_id, sessionID),
-        compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
+        from === undefined ? undefined : gte(SessionMessageTable.seq, from),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))
     .all()
     .pipe(Effect.orDie)
-  const decoded = yield* Effect.forEach(
+  const all = yield* Effect.forEach(
     yield* SessionBlob.hydrate(db, yield* withParts(db, rows)),
     (row) => decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
     { concurrency: 1 },
   )
+  // The typed tail follows its checkpoint even where the running marker was inserted after part of it.
+  const decoded = compaction
+    ? [...all.filter((entry) => entry.seq === compaction.seq), ...all.filter((entry) => entry.seq !== compaction.seq)]
+    : all
   // A window that cannot replay leaves nothing to start from, so read from the compaction before it.
   const start = decoded[0]
   if (compaction && start && !replayable(start.message, boundary))
@@ -258,9 +319,8 @@ const withRecentText = Effect.fnUntraced(function* (
     .orderBy(asc(SessionMessageTable.seq))
     .all()
     .pipe(Effect.orDie)
-  // The recent text names attachments by mime and name only, so their bytes are never read.
   const kept = yield* Effect.forEach(yield* withParts(db, rows), decodeStoredRow, { concurrency: 1 })
-  const recent = kept.map(SessionRecentText.messageToText).filter(Boolean).join("\n\n")
+  const recent = kept.map((message) => SessionRecentText.messageToText(message, compaction.metadata?.keepStrict === true)).filter(Boolean).join("\n\n")
   return [{ ...first, message: { ...compaction, metadata: { ...compaction.metadata, recent } } }, ...entries.slice(1)]
 })
 
@@ -320,13 +380,14 @@ export const preview = Effect.fn("SessionHistory.preview")(function* (
 
 /**
  * The synthetic messages `load(db, sessionID, "latest")` would return, read without the rest of the transcript. Under
- * that boundary every row from the latest completed compaction on is kept, and synthetic rows carry no media.
+ * that boundary the checkpoint's retained tail is kept too, and synthetic rows carry no media.
  */
 export const synthetics = Effect.fn("SessionHistory.synthetics")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
 ) {
   const compaction = yield* latestCompaction(db, sessionID, "latest")
+  const from = compaction ? yield* checkpointStart(db, sessionID, compaction) : undefined
   const rows = yield* db
     .select()
     .from(SessionMessageTable)
@@ -334,7 +395,7 @@ export const synthetics = Effect.fn("SessionHistory.synthetics")(function* (
       and(
         eq(SessionMessageTable.session_id, sessionID),
         eq(SessionMessageTable.type, "synthetic"),
-        compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
+        from === undefined ? undefined : gte(SessionMessageTable.seq, from),
       ),
     )
     .orderBy(asc(SessionMessageTable.seq))

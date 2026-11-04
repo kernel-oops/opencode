@@ -39,6 +39,8 @@ describe("public import boundaries", () => {
     const effectService = await bundleInputs("@opencode/client/effect/service", "bun")
 
     expect(within(effectService.eager, effect).length).toBeGreaterThan(0)
+    // Service discovery now shares the protocol-independent registration decision.
+    expect(within(effectService.all, protocol)).toEqual([])
     expect(within(effectService.all, core)).toEqual([])
     expect(within(effectService.all, server)).toEqual([])
 

@@ -105,6 +105,10 @@ export interface MockServerConfig {
   permissions?: unknown[] | (() => unknown[])
   // Requests only listed by `/api/session/:id/permission`, keyed by session ID.
   sessionPermissions?: Record<string, unknown[]>
+  // Subagent jobs `/api/session/:id/task` reports, keyed by session ID; other sessions report none.
+  sessionTasks?: () => Record<string, unknown[]>
+  // Returning true fails the next `/api/session/:id/task` read with a 500.
+  sessionTaskFailures?: (sessionID: string) => boolean
   // Returning true fails the next `/api/permission/request` listing with a 500.
   permissionListFailures?: () => boolean
   // Without it, permission replies answer 501 MockUnsupported.
@@ -1183,6 +1187,16 @@ function mockHandlers(
         sessionFormCancel: () => noContent,
         sessionBackground: (ctx) =>
           Effect.sync(() => config.onBackground?.({ sessionID: ctx.params.sessionID })).pipe(Effect.andThen(noContent)),
+        sessionTask: (ctx) =>
+          Effect.suspend(() =>
+            config.sessionTaskFailures?.(ctx.params.sessionID)
+              ? Effect.fail(new MockInternal({ message: "Task status failed" }))
+              : Effect.succeed({
+                  paused: false,
+                  active: false,
+                  background: config.sessionTasks?.()[ctx.params.sessionID] ?? [],
+                }),
+          ),
         sessionInbox: (ctx) =>
           Effect.sync(() => ({
             data: resolve(config.inbox ?? []).filter(

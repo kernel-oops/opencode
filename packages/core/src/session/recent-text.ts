@@ -13,7 +13,7 @@ export const kept = (message: SessionMessage.CompactionCompleted) =>
   typeof message.metadata?.recent === "string" ? message.metadata.recent : ""
 
 /** One message as the recent, verbatim part of a summary shows it. Empty for messages that part leaves out. */
-export const messageToText = (message: SessionMessage.Info | SessionStored.User): string => {
+export const messageToText = (message: SessionMessage.Info | SessionStored.User, strict = false): string => {
   switch (message.type) {
     // Earlier summaries and instruction updates are handled outside the recent part.
     case "compaction":
@@ -47,7 +47,8 @@ export const messageToText = (message: SessionMessage.Info | SessionStored.User)
           const input = typeof part.state.input === "string" ? part.state.input : JSON.stringify(part.state.input)
           const call = `[Assistant tool call]: ${part.name}(${input})`
           if (part.state.status === "completed") {
-            return [call, `[Tool result]: ${truncateToolOutput(serializeToolContent(part.state.content))}`]
+            const output = serializeToolContent(part.state.content)
+            return [call, `[Tool result]: ${strict ? output : truncateToolOutput(output)}`]
           }
           if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error.message}`]
           return [call]
@@ -62,7 +63,7 @@ export const messageToText = (message: SessionMessage.Info | SessionStored.User)
 
     case "shell":
       if (message.metadata?.background === true) return ""
-      return `[Shell]: ${message.command}\n${truncateToolOutput(message.output?.output ?? "")}`
+      return `[Shell]: ${message.command}\n${strict ? (message.output?.output ?? "") : truncateToolOutput(message.output?.output ?? "")}`
 
     default:
       return ""

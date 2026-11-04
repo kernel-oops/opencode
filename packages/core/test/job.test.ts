@@ -4,6 +4,7 @@ import jobMigration from "@opencode/core/database/migration/20261030054400_job"
 import { Job } from "@opencode/core/job"
 import { JobTable } from "@opencode/core/job/sql"
 import { KVTable } from "@opencode/core/kv/sql"
+import { KV } from "@opencode/core/kv"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Integration } from "@opencode/core/integration"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -14,9 +15,184 @@ import { SessionMessage } from "@opencode/core/session/message"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { testEffect } from "./lib/effect"
 
-const it = testEffect(AppNodeBuilder.build(LayerNode.group([Job.node, Database.node, Global.node])))
+const it = testEffect(AppNodeBuilder.build(LayerNode.group([Job.node, Database.node, KV.node, Global.node])))
 
 describe("Job", () => {
+  for (const preserveBackground of [false, true]) {
+    for (const backgroundAgain of [false, true]) {
+      it.live(`acquires one generation and a fresh release (preserve background=${preserveBackground}, background again=${backgroundAgain})`, () =>
+        Effect.gen(function* () {
+          const jobs = yield* Job.Service
+          const parent = SessionSchema.ID.make("ses_acquire_parent")
+          const child = SessionSchema.ID.make("ses_acquire_child")
+          const first = yield* Deferred.make<string>()
+          const continued = yield* Deferred.make<string>()
+          const entered = yield* Deferred.make<void>()
+          let runs = 0
+          const recovery = {
+            kind: "subagent" as const,
+            parentSessionID: parent,
+            childSessionID: child,
+            agent: "reviewer",
+            description: "acquired",
+          }
+          const original = yield* jobs.acquire({
+            id: child,
+            type: "subagent",
+            recovery,
+            run: Effect.sync(() => {
+              runs++
+            }).pipe(Effect.andThen(Deferred.await(first))),
+          })
+          yield* original.background
+          expect(yield* original.observe).toBe(true)
+          const joined = yield* jobs.acquire(
+            {
+              id: child,
+              type: "subagent",
+              recovery,
+              preserveBackground,
+              run: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(continued))),
+            },
+            parent,
+          )
+          expect(joined.info.started_at).toBe(original.info.started_at)
+          expect(joined.info.notificationID).toBeDefined()
+          expect(yield* joined.observe).toBe(false)
+          expect(yield* jobs.runningBackground).toEqual(preserveBackground ? [recovery] : [])
+          const waiter = yield* joined.block.pipe(Effect.forkScoped)
+          // Finish the old drain at a deterministic barrier: the joined work must still hold done.
+          yield* Deferred.succeed(first, "old answer")
+          yield* Deferred.await(entered)
+          expect(yield* jobs.get(child)).toMatchObject({ status: "running" })
+          expect(runs).toBe(1)
+          if (preserveBackground) {
+            expect(yield* Fiber.join(waiter)).toMatchObject({ type: "backgrounded", info: { id: child } })
+            expect(yield* jobs.backgroundAll({ sessionID: parent })).toEqual([])
+          } else if (backgroundAgain) {
+            expect(yield* jobs.backgroundAll({ sessionID: parent })).toMatchObject([{ id: child }])
+            expect(yield* Fiber.join(waiter)).toMatchObject({ type: "backgrounded", info: { id: child } })
+            expect(yield* jobs.backgroundAll({ sessionID: parent })).toEqual([])
+          }
+          yield* Deferred.succeed(continued, "new answer")
+          const result = yield* original.wait
+          expect(result.output).toBe("new answer")
+          expect(yield* original.claimBackground).toBe(preserveBackground || backgroundAgain)
+          expect(yield* joined.claimBackground).toBe(false)
+          if (!preserveBackground && !backgroundAgain)
+            expect(yield* Fiber.join(waiter)).toMatchObject({
+              type: "finished",
+              info: { status: "completed", output: "new answer" },
+            })
+          if (result.notificationID) yield* jobs.completeBackground(result.notificationID)
+          expect(yield* jobs.pendingBackground).toEqual([])
+        }),
+      )
+    }
+  }
+
+  it.live("concurrent acquired waiters and stale cancellation cannot affect a successor", () =>
+    Effect.gen(function* () {
+      const jobs = yield* Job.Service
+      const parent = SessionSchema.ID.make("ses_acquire_concurrent")
+      const first = yield* Deferred.make<string>()
+      const final = yield* Deferred.make<string>()
+      const entered = yield* Deferred.make<void>()
+      const input = { id: "concurrent_acquired", type: "test", run: Deferred.await(first) }
+      const original = yield* jobs.acquire(input)
+      yield* original.background
+      const one = yield* jobs.acquire({ ...input, run: Effect.succeed("intermediate") }, parent)
+      const two = yield* jobs.acquire(
+        { ...input, run: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(final))) },
+        parent,
+      )
+      const waiterOne = yield* one.block.pipe(Effect.forkScoped)
+      const waiterTwo = yield* two.block.pipe(Effect.forkScoped)
+      yield* Deferred.succeed(first, "old")
+      yield* Deferred.await(entered)
+      yield* Deferred.succeed(final, "joined result")
+      expect(yield* Fiber.join(waiterOne)).toMatchObject({ type: "finished", info: { output: "joined result" } })
+      expect(yield* Fiber.join(waiterTwo)).toMatchObject({ type: "finished", info: { output: "joined result" } })
+      const successorGate = yield* Deferred.make<string>()
+      const successor = yield* jobs.acquire({ ...input, run: Deferred.await(successorGate) }, parent)
+      let staleAcceptance = 0
+      expect(
+        yield* one.cancel(
+          undefined,
+          Effect.sync(() => {
+            staleAcceptance++
+          }),
+        ),
+      ).toBeUndefined()
+      expect(staleAcceptance).toBe(0)
+      expect(yield* two.background).toBeUndefined()
+      expect(yield* jobs.get(input.id)).toMatchObject({ status: "running" })
+      expect(yield* jobs.backgroundAll({ sessionID: parent })).toMatchObject([{ id: input.id }])
+      yield* Deferred.succeed(successorGate, "successor")
+      expect((yield* successor.wait).output).toBe("successor")
+    }),
+  )
+
+  it.live("acquiring under an admission mask never makes the run uninterruptible", () =>
+    Effect.gen(function* () {
+      const jobs = yield* Job.Service
+      const started = yield* Deferred.make<void>()
+      const stopped = yield* Deferred.make<void>()
+      const handle = yield* jobs
+        .acquire({
+          id: "masked_acquire",
+          type: "test",
+          run: Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.ensuring(Deferred.succeed(stopped, undefined)),
+          ),
+        })
+        .pipe(Effect.uninterruptible)
+      yield* Deferred.await(started)
+      expect(yield* handle.cancel()).toMatchObject({ status: "cancelled" })
+      yield* Deferred.await(stopped)
+    }),
+  )
+
+  it.live("durably pauses and unpauses completion delivery per Session", () =>
+    Effect.gen(function* () {
+      const jobs = yield* Job.Service
+      const sessionID = SessionSchema.ID.make("ses_pause_test")
+      expect(yield* jobs.paused(sessionID)).toBe(false)
+      yield* jobs.pause(sessionID)
+      expect(yield* jobs.paused(sessionID)).toBe(true)
+      yield* jobs.unpause(sessionID)
+      expect(yield* jobs.paused(sessionID)).toBe(false)
+    }),
+  )
+
+  it.live("suppressed cancellation drops the durable notification marker and lists recovery", () =>
+    Effect.gen(function* () {
+      const jobs = yield* Job.Service
+      const latch = yield* Deferred.make<void>()
+      const recovery = {
+        kind: "subagent" as const,
+        parentSessionID: SessionSchema.ID.make("ses_parent_suppress"),
+        childSessionID: SessionSchema.ID.make("ses_child_suppress"),
+        agent: "reviewer",
+        description: "suppressed",
+      }
+      const job = yield* jobs.start({
+        id: recovery.childSessionID,
+        type: "subagent",
+        recovery,
+        run: Deferred.await(latch).pipe(Effect.as("done")),
+      })
+      yield* jobs.background(job.id)
+      expect((yield* jobs.pendingBackground).map((item) => item.id)).toContain(job.id)
+      expect((yield* jobs.list).find((item) => item.id === job.id)?.recovery).toEqual(recovery)
+
+      const cancelled = yield* jobs.cancel(job.id, { suppress: true })
+      expect(cancelled).toMatchObject({ status: "cancelled", metadata: { suppressed: true } })
+      expect((yield* jobs.pendingBackground).map((item) => item.id)).not.toContain(job.id)
+    }),
+  )
+
   it.live("tracks process-local work through explicit observation", () =>
     Effect.gen(function* () {
       const jobs = yield* Job.Service

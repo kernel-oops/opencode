@@ -84,7 +84,9 @@ const resolve = Effect.fn("PluginSupervisor.resolve")(function* (
       // The new revision never became a generation, so the one already running keeps its place.
       const retained = packages.get(operation.target) ?? running.get(operation.target)
       if (!retained) continue
-      packages.set(operation.target, retained)
+      // Retain ordinary behaviour, not loader authority for the failed desired generation.
+      // An un-enrolled copy forces the registry to revoke privileged registrations.
+      packages.set(operation.target, { ...retained })
       enabled.add(retained.id)
       continue
     }
@@ -170,7 +172,9 @@ export const layer = Layer.effectDiscard(
           : source
       const apply = (resolved: typeof immediate) =>
         registry.activate(
-          resolved.plugins.map((plugin) => (plugin.source ? { ...plugin, source: source(plugin.source) } : plugin)),
+          resolved.plugins.map((plugin) =>
+            plugin.source?.type === "package" ? { ...plugin, source: source(plugin.source) } : plugin,
+          ),
           resolved.failures.map((failure) => ({ ...failure, source: source(failure.source) })),
         )
       yield* apply(immediate)

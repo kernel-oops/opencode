@@ -29,6 +29,7 @@ export interface Options {
   readonly url?: (url: string) => string
   readonly headers?: (headers: Headers.Headers) => Headers.Headers
   readonly continuation?: OpenResponsesContinuation.Shape
+  readonly nativeSteer?: boolean
 }
 
 export interface Prepared {
@@ -87,11 +88,7 @@ const driver = (options: Options, body: string): OpenResponsesContinuation.BaseD
     if (event.type === "response.created") {
       const created = event.response?.id
       if (responseID)
-        return yield* ProviderShared.eventError(
-          options.id,
-          `${options.name} emitted duplicate response.created`,
-          frame,
-        )
+        return yield* ProviderShared.eventError(options.id, `${options.name} emitted duplicate response.created`, frame)
       if (!created)
         return yield* ProviderShared.eventError(
           options.id,
@@ -110,11 +107,7 @@ const driver = (options: Options, body: string): OpenResponsesContinuation.BaseD
         frame,
       )
     if (event.response?.id && event.response.id !== responseID)
-      return yield* ProviderShared.eventError(
-        options.id,
-        `${options.name} response ID changed during execution`,
-        frame,
-      )
+      return yield* ProviderShared.eventError(options.id, `${options.name} response ID changed during execution`, frame)
     if (event.type === "response.completed") {
       terminal = true
       return { type: "completed", frame }
@@ -156,18 +149,26 @@ export const transport = <Body>(options: Options): Transport<Body, Prepared, str
             ? yield* Effect.gen(function* () {
                 const create = yield* message(parts.jsonBody)
                 const base = driver(options, create.message)
+                const continued = OpenResponsesContinuation.driver({
+                  id: options.id,
+                  name: options.name,
+                  request: create.request,
+                  message: create.message,
+                  base,
+                  continuation: options.continuation,
+                  steering:
+                    options.nativeSteer === true &&
+                    options.id === "openai-responses" &&
+                    typeof create.request.model === "string" &&
+                    /^gpt-6(?:[.-]|$)/.test(create.request.model) &&
+                    create.request.context_management === undefined &&
+                    create.request.conversation === undefined,
+                })
                 return {
                   url: yield* WebSocketTransport.toWebSocketUrl(options.url?.(parts.url) ?? parts.url),
                   headers,
                   rotateAfterMs: options.rotateAfterMs,
-                  driver: OpenResponsesContinuation.driver({
-                    id: options.id,
-                    name: options.name,
-                    request: create.request,
-                    message: create.message,
-                    base,
-                    continuation: options.continuation,
-                  }),
+                  driver: continued,
                 }
               })
             : undefined

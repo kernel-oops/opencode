@@ -40,6 +40,7 @@ export const makeSchedule = Effect.gen(function* () {
           "Schedule.DisabledError": () => Effect.fail(disabled()),
           "Permission.BlockedError": (error) => Effect.fail(new ForbiddenError({ message: error.message })),
           "Permission.CorrectedError": (error) => Effect.fail(new ForbiddenError({ message: error.feedback })),
+          "Permission.ReviewStaleError": (error) => Effect.fail(new ForbiddenError({ message: error.message })),
           "Session.NotFoundError": (error) => Effect.fail(missingSession(error)),
         }),
       ),
