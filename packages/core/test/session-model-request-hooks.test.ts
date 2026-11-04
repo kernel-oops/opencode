@@ -41,6 +41,43 @@ const transport = SessionModelTransport.Service.of({
 })
 
 describe("SessionModelRequest HTTP hooks", () => {
+  for (const kind of KINDS)
+    it.effect(`unchanged long legacy cache identity retains upstream behaviour (${kind})`, () =>
+      Effect.gen(function* () {
+        const hooks = yield* PluginHooks.Service
+        yield* hooks.register("session", "model.request", () => Effect.void)
+        const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+        const long = Session.Info.make({ ...session, id: Session.ID.make(`ses_${"legacy_".repeat(10)}`) })
+        const prepared = yield* requests[kind]({ session: long, agent: Agent.ID.make("build"), model, system: [], messages: [] })
+        expect(prepared.request.promptCacheKey).toBe(long.id)
+      }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+    )
+  for (const kind of KINDS)
+    for (const cacheKey of [undefined, "shared-root", "😀".repeat(64)])
+      it.effect(`model.request cacheKey reaches ${kind} (${cacheKey === undefined ? "disabled" : cacheKey.length})`, () =>
+        Effect.gen(function* () {
+          const hooks = yield* PluginHooks.Service
+          yield* hooks.register("session", "model.request", (event) => Effect.sync(() => {
+            expect(event.cacheKey).toBe(session.id)
+            event.cacheKey = cacheKey
+          }))
+          const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+          const prepared = yield* requests[kind]({ session, agent: Agent.ID.make("build"), model, system: [], messages: [] })
+          expect(prepared.request.promptCacheKey).toBe(cacheKey)
+        }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+      )
+
+  for (const cacheKey of ["", "x".repeat(65), 42])
+    it.effect(`rejects invalid cacheKey (${String(cacheKey).length})`, () =>
+      Effect.gen(function* () {
+        const hooks = yield* PluginHooks.Service
+        yield* hooks.register("session", "model.request", (event) => Effect.sync(() => { event.cacheKey = cacheKey as string }))
+        const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+        const result = yield* requests.primary({ session, agent: Agent.ID.make("build"), model, system: [], messages: [] }).pipe(Effect.exit)
+        expect(result._tag).toBe("Failure")
+      }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+    )
+
   it.effect("tags every Session request kind on http.request and http.response", () =>
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service

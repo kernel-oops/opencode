@@ -72,6 +72,8 @@ export interface SessionModelRequest {
   readonly kind: SessionRequestKind
   baseURL?: string
   headers: Record<string, string>
+  /** Provider prompt-cache identity; undefined disables it. Overrides must be non-empty and at most 64 Unicode characters; unchanged defaults retain provider handling. */
+  cacheKey?: string
 }
 
 export interface SessionHttpRequest {

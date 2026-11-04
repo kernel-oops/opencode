@@ -319,12 +319,16 @@ export const layer = Layer.effect(
         ...scope,
         baseURL,
         headers: { ...base.http?.headers },
+        cacheKey: base.promptCacheKey,
       })
+      if (modelHook.cacheKey !== base.promptCacheKey && modelHook.cacheKey !== undefined && (typeof modelHook.cacheKey !== "string" || modelHook.cacheKey.length === 0 || Array.from(modelHook.cacheKey).length > 64))
+        return yield* Effect.die(new Error("model.request cacheKey must be undefined or a non-empty string of at most 64 characters"))
       const route =
         modelHook.baseURL !== undefined && modelHook.baseURL !== baseURL
           ? base.model.route.with({ endpoint: { baseURL: modelHook.baseURL } })
           : base.model.route
       const request = LLMRequest.update(base, {
+        promptCacheKey: modelHook.cacheKey,
         model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
         http: new HttpOptions({
           ...base.http,
