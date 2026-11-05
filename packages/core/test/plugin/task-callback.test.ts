@@ -26,7 +26,7 @@ const assistant = () => ({ type: "assistant", id: SessionMessage.ID.create(), co
 describe("TaskCallbackPlugin", () => {
   test("detects a callback turn from the most recent human or completion input", () => {
     expect(TaskCallbackPlugin.isCallbackTurn([synthetic("subagent"), assistant(), user()])).toBe(true)
-    expect(TaskCallbackPlugin.isCallbackTurn([synthetic("shell"), synthetic("subagent"), user()])).toBe(true)
+    expect(TaskCallbackPlugin.isCallbackTurn([synthetic("shell"), synthetic("subagent"), user()])).toBe(false)
     expect(TaskCallbackPlugin.isCallbackTurn([user(), synthetic("subagent")])).toBe(false)
     expect(TaskCallbackPlugin.isCallbackTurn([synthetic("shell"), user()])).toBe(false)
     expect(TaskCallbackPlugin.isCallbackTurn([])).toBe(false)

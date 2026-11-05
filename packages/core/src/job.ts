@@ -114,11 +114,14 @@ export type StartInput = {
   notificationID?: SessionMessage.ID
   /** An unflagged follow-up must not reclaim a running background generation. */
   preserveBackground?: boolean
+  /** Automatic follow-ups only create a background generation; never alter an existing owner. */
+  onlyIfIdle?: boolean
   run: Effect.Effect<string, unknown>
 }
 
 /** Captures one run generation; operations never look up a successor by child ID. */
 export type Acquired = {
+  readonly created: boolean
   readonly info: Info
   readonly wait: Effect.Effect<Info>
   readonly block: Effect.Effect<BlockResult>
@@ -356,6 +359,7 @@ export const make = Effect.gen(function* () {
           Effect.fnUntraced(function* (jobs): Effect.fn.Return<readonly [StartResult, Map<string, Active>]> {
             const existing = jobs.get(input.id)
             if (existing?.info.status === "running") {
+              if (input.onlyIfIdle) return [{ job: existing }, jobs]
               const reclaim = foreground && !(input.preserveBackground && existing.isBackgrounded)
               if (reclaim) existing.delivery.owner = "foreground"
               const updated = reclaim
@@ -390,9 +394,11 @@ export const make = Effect.gen(function* () {
               delivery: { observed: false, owner: foreground ? ("foreground" as const) : undefined },
               revision: 0,
             }
-            return [{ job, scope }, new Map(jobs).set(input.id, job)]
+            const active = input.onlyIfIdle ? yield* markBackground(job) : job
+            return [{ job: active, scope }, new Map(jobs).set(input.id, active)]
           }),
         )
+        if (result.scope && input.onlyIfIdle) yield* Deferred.succeed(backgrounded, snapshot(result.job))
         if (result.scope) {
           const scope = result.scope
           yield* Effect.gen(function* () {
@@ -410,6 +416,7 @@ export const make = Effect.gen(function* () {
         const job = result.job
         const info = snapshot(job)
         return {
+          created: result.scope !== undefined,
           info,
           wait: Deferred.await(job.done),
           block: Effect.raceFirst(

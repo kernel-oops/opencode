@@ -15,6 +15,8 @@ export type StartOptions = {
   readonly admitOnly?: boolean
   readonly foreground?: Session.ID
   readonly preserveBackground?: boolean
+  /** Admission owns the generation before waking execution; do not observe the old idle yet. */
+  readonly ready?: Effect.Effect<void>
 }
 
 export interface Interface {
@@ -85,6 +87,7 @@ const make: Effect.Effect<Interface, never, Session.Service | Job.Service | Scop
             recovery,
             preserveBackground: options?.preserveBackground,
             run: Effect.gen(function* () {
+              if (options?.ready) yield* options.ready
               if (options?.admitOnly !== false) yield* sessions.resume(recovery.childSessionID)
               yield* sessions.wait(recovery.childSessionID)
               return yield* lastText(recovery.childSessionID, options?.admissionID)

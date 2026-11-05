@@ -3,7 +3,7 @@ export * as SubagentTool from "./subagent.js"
 import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
-import { Effect, Predicate, Schema } from "effect"
+import { Deferred, Effect, Predicate, Schema } from "effect"
 import { Agent } from "../../agent.js"
 import { Config } from "../../config.js"
 import { Job } from "../../job.js"
@@ -224,6 +224,7 @@ export const Plugin = {
               let handle: Job.Acquired | undefined
               let interrupt: SessionExecution.Interrupt | undefined
               const admissionID = SessionMessage.ID.create()
+              const ready = yield* Deferred.make<void>()
               const recovery = {
                 kind: "subagent" as const,
                 parentSessionID: context.sessionID,
@@ -259,6 +260,7 @@ export const Plugin = {
                             handle = yield* subagents.start(recovery, {
                               admissionID: id,
                               admitOnly: background && existing === undefined,
+                              ready: Deferred.await(ready),
                               preserveBackground: input.background === undefined,
                               ...(!background ? { foreground: context.sessionID } : {}),
                             })
@@ -270,6 +272,9 @@ export const Plugin = {
 
                   if (!handle)
                     return yield* Effect.die(new Error("Subagent admission did not acquire its Job generation"))
+
+                  yield* Deferred.succeed(ready, undefined)
+                  interrupt = yield* execution.bindInterrupt(child.id)
 
                   if (background) {
                     yield* subagents.background(recovery, handle)

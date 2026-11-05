@@ -18,6 +18,46 @@ import { testEffect } from "./lib/effect"
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Job.node, Database.node, KV.node, Global.node])))
 
 describe("Job", () => {
+  it.effect("an unflagged continuation of an automatic background generation releases immediately and claims once", () => Effect.gen(function* () {
+    const jobs = yield* Job.Service
+    const parent = SessionSchema.ID.make("ses_auto_parent")
+    const child = SessionSchema.ID.make("ses_auto_child")
+    const done = yield* Deferred.make<string>()
+    const recovery = { kind: "subagent" as const, parentSessionID: parent, childSessionID: child,
+      agent: "reviewer", description: "follow-up" }
+    const automatic = yield* jobs.acquire({ id: child, type: "subagent", recovery, onlyIfIdle: true, run: Deferred.await(done) })
+    expect(automatic.created).toBe(true)
+    expect(yield* automatic.observe).toBe(true)
+    const joined = yield* jobs.acquire({ id: child, type: "subagent", recovery, preserveBackground: true,
+      run: Effect.succeed("Continued answer") }, parent)
+    expect(yield* joined.block).toMatchObject({ type: "backgrounded" })
+    expect(yield* joined.observe).toBe(false)
+    yield* Deferred.succeed(done, "First answer")
+    expect(yield* automatic.wait).toMatchObject({ status: "completed", output: "Continued answer" })
+    expect(yield* automatic.claimBackground).toBe(true)
+    expect(yield* joined.claimBackground).toBe(false)
+  }))
+
+  for (const background of [false, true]) {
+    it.effect(`an automatic follow-up cannot replace an existing owner (background=${background})`, () => Effect.gen(function* () {
+      const jobs = yield* Job.Service
+      const done = yield* Deferred.make<string>()
+      const parent = SessionSchema.ID.make("ses_followup_parent")
+      const child = SessionSchema.ID.make("ses_followup_child")
+      const recovery = { kind: "subagent" as const, parentSessionID: parent, childSessionID: child,
+        agent: "reviewer", description: "explicit continuation" }
+      const original = yield* jobs.acquire({ id: child, type: "subagent", recovery, run: Deferred.await(done) }, parent)
+      if (background) yield* original.background
+      const joined = yield* jobs.acquire({ id: child, type: "subagent", recovery, onlyIfIdle: true,
+        run: Effect.die("Automatic tracking must not run a second continuation") })
+      expect(joined.created).toBe(false)
+      expect(yield* jobs.runningBackground).toEqual(background ? [recovery] : [])
+      yield* Deferred.succeed(done, "Explicit answer")
+      expect(yield* original.wait).toMatchObject({ status: "completed", output: "Explicit answer" })
+      expect(yield* joined.wait).toMatchObject({ status: "completed", output: "Explicit answer" })
+    }))
+  }
+
   for (const preserveBackground of [false, true]) {
     for (const backgroundAgain of [false, true]) {
       it.live(`acquires one generation and a fresh release (preserve background=${preserveBackground}, background again=${backgroundAgain})`, () =>

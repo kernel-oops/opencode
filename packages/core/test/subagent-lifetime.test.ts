@@ -28,6 +28,9 @@ import { offlineModels } from "./fixture/models"
 import { tmpdirScoped } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 import { executeTool, toolIdentity } from "./lib/tool"
+import { Database } from "@opencode/core/database/database"
+import { SessionTable } from "@opencode/core/session/sql"
+import { eq } from "drizzle-orm"
 
 const llmLayer = TestLLM.testLayer({ fallback: TestLLM.text("Review complete", "review") })
 const it = testEffect(
@@ -41,6 +44,7 @@ const it = testEffect(
         Bus.node,
         SubagentJob.node,
         SessionExecution.node,
+        Database.node,
       ]),
       [
         Global.node.replace(tempGlobalLayer),
@@ -68,6 +72,137 @@ const it = testEffect(
 )
 
 describe("subagent observer lifetime", () => {
+  const until = (condition: Effect.Effect<boolean>) => Effect.gen(function* () {
+    while (!(yield* condition)) yield* Effect.sleep("1 millis")
+  }).pipe(Effect.timeout("10 seconds"))
+  for (const wake of ["shell", "reviewer", "parent message", "peer message", "nested", "continuation", "missing parent", "compaction"] as const) {
+    it.live(`re-tracks a finished native child (${wake})`, () => Effect.gen(function* () {
+      const directory = yield* tmpdirScoped()
+      yield* Effect.promise(() => Bun.write(`${directory.path}/opencode.json`, JSON.stringify({
+        agents: { reviewer: { mode: "subagent" } },
+        experimental: { subagent_depth: 3 },
+        permissions: [{ action: "*", resource: "*", effect: "allow" }],
+      })))
+      const sessions = yield* Session.Service
+      const locations = yield* LocationServiceMap.Service
+      const jobs = yield* Job.Service
+      const llm = yield* TestLLM.Test
+      const bus = yield* Bus.Service
+      const root = yield* sessions.create({
+        location: { directory: AbsolutePath.make(directory.path) },
+        agent: Agent.ID.make("build"),
+        model: Model.Ref.make({ id: Model.ID.make("parent"), providerID: Provider.ID.make("test") }),
+      })
+      const parent = wake === "nested"
+        ? yield* sessions.create({ parentID: root.id, agent: Agent.ID.make("reviewer") })
+        : root
+      const child = yield* sessions.create({ parentID: parent.id, agent: Agent.ID.make("reviewer") })
+      const notices: SessionEvent.InboxEnqueued[] = []
+      const remove = yield* bus.listen((event) => Effect.sync(() => {
+        if (event.type !== SessionEvent.InboxEnqueued.type) return
+        const admitted = event as SessionEvent.InboxEnqueued
+        if (admitted.data.item.type === "synthetic" && admitted.data.item.payload.metadata?.childID)
+          notices.push(admitted)
+      }))
+      yield* Effect.addFinalizer(() => remove)
+      yield* jobs.pause(root.id)
+      yield* jobs.pause(parent.id)
+      yield* Plugin.Service.use((plugins) => plugins.awaitActivation).pipe(Effect.provide(locations.get(root.location)))
+      const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(root.location)))
+      const call = (owner: Session.ID, existing?: Session.ID, background = true) => executeTool(registry, {
+        sessionID: owner, ...toolIdentity,
+        call: { type: "tool-call", id: `call-${notices.length}-${owner}`, name: "subagent", input: {
+          agent: "reviewer", ...(existing ? { sessionID: existing } : {}), description: "Late result fixture", prompt: "Do the fixture", background,
+        } },
+      })
+      if (wake === "nested") {
+        yield* llm.push(TestLLM.text("Earlier parent answer", "earlier-parent"))
+        expect((yield* call(root.id, parent.id)).status).toBe("completed")
+        yield* until(Effect.sync(() => notices.length === 1))
+        yield* sessions.wait(parent.id)
+        notices.length = 0
+      }
+      yield* llm.push(TestLLM.text("Initial answer", "initial"))
+      expect((yield* call(parent.id, child.id)).status).toBe("completed")
+      yield* until(Effect.sync(() => notices.length === 1))
+      yield* sessions.wait(child.id)
+      expect(notices[0]?.data.item).toMatchObject({ type: "synthetic", payload: { metadata: { state: "completed" } } })
+      if (wake === "compaction") {
+        const before = yield* sessions.messages({ sessionID: child.id, type: "assistant" })
+        yield* llm.push(TestLLM.text("Compacted fixture summary", "summary"))
+        yield* sessions.compact({ sessionID: child.id })
+        yield* sessions.wait(child.id)
+        yield* jobs.wait({ id: child.id })
+        yield* until(jobs.pendingBackground.pipe(Effect.map((pending) => pending.length === 0)))
+        expect(yield* sessions.messages({ sessionID: child.id, type: "assistant" })).toEqual(before)
+        expect((yield* sessions.messages({ sessionID: child.id })).some((message) => message.type === "compaction")).toBe(true)
+        expect(notices).toHaveLength(1)
+        return
+      }
+      if (wake === "missing parent") {
+        const database = yield* Database.Service
+        yield* database.db.update(SessionTable).set({ parent_id: Session.ID.create() })
+          .where(eq(SessionTable.id, child.id)).run().pipe(Effect.orDie)
+      }
+      yield* llm.push(
+        ...(wake === "reviewer" ? [TestLLM.text("Reviewer verdict", "verdict")] : []),
+        TestLLM.text("Late answer", "late"),
+        ...(wake === "nested" ? [TestLLM.text("Consolidated late answer", "consolidated")] : []),
+      )
+      if (wake === "continuation") {
+        const result = yield* call(parent.id, child.id, false)
+        expect(result.status).toBe("completed")
+        expect(result.content).toEqual([{ type: "text", text: `<subagent sessionID="${child.id}" state="completed">\nLate answer\n</subagent>` }])
+        expect(notices).toHaveLength(1)
+        expect(yield* jobs.pendingBackground).toEqual([])
+        return
+      }
+      if (wake === "nested") yield* jobs.unpause(parent.id)
+      if (wake === "reviewer") {
+        expect(yield* call(child.id)).toMatchObject({ status: "completed" })
+      } else if (wake === "parent message" || wake === "peer message") {
+        const sender = wake === "parent message" ? parent : yield* sessions.create({ location: root.location })
+        // The meta plugin delivers parent and peer steers through this same prompt boundary.
+        yield* sessions.prompt({ sessionID: child.id, text: "[cross-session message] Follow up",
+          metadata: { crossSession: { from: sender.id, priority: "normal" } } })
+      } else {
+        if (wake === "shell") yield* sessions.synthetic({ sessionID: child.id, text: "Earlier review",
+          metadata: { source: "subagent" }, resume: false })
+        yield* sessions.synthetic({ sessionID: child.id, text: "Own background shell completed",
+          metadata: { source: "shell" } })
+      }
+      if (wake === "missing parent") {
+        yield* sessions.wait(child.id)
+        yield* jobs.wait({ id: child.id })
+        yield* until(jobs.pendingBackground.pipe(Effect.map((pending) => pending.length === 0)))
+        expect(notices).toHaveLength(1)
+        expect((yield* sessions.messages({ sessionID: child.id, type: "assistant", order: "desc", limit: 1 }))[0])
+          .toMatchObject({ content: [{ type: "text", text: "Late answer" }] })
+        return
+      }
+      const expected = wake === "reviewer" ? 3 : wake === "nested" ? 3 : 2
+      yield* until(Effect.sync(() => notices.length === expected))
+      yield* sessions.wait(child.id)
+      yield* sessions.wait(parent.id)
+      const late = notices.find((notice) => notice.data.sessionID === parent.id &&
+        notice.data.item.type === "synthetic" && notice.data.item.payload.metadata?.followup === true)
+      expect(late?.data.item).toMatchObject({ type: "synthetic", payload: {
+        description: expect.stringContaining("Follow-up completion"), text: expect.stringContaining("Late answer"),
+        metadata: { childID: child.id, state: "completed", followup: true },
+      } })
+      const requests = yield* llm.requests()
+      expect(requests[wake === "reviewer" || wake === "nested" ? 2 : 1]?.tools?.length === 0).toBe(wake === "reviewer")
+      if (wake === "nested") {
+        expect(requests[3]?.tools).toEqual([])
+        expect(notices[2]?.data).toMatchObject({ sessionID: root.id, item: { payload: {
+          text: expect.stringContaining("Consolidated late answer"), metadata: { childID: parent.id, followup: true },
+        } } })
+      }
+      expect(notices).toHaveLength(expected)
+      yield* until(jobs.pendingBackground.pipe(Effect.map((pending) => pending.length === 0)))
+    }))
+  }
+
   for (const mode of [
     "complete",
     "cancel",

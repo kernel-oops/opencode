@@ -42,12 +42,13 @@ export function parseEnvironment(value: string | undefined): ReadonlyArray<strin
 
 /**
  * Whether the next turn is a callback turn: the most recent human or subagent-completion
- * input is a subagent completion. Other inputs (shell results, restart notices, skills)
+ * input is a subagent completion. Own shell results restore normal tools; other inputs (restart notices, skills)
  * are skipped; a genuine user prompt after the completion makes the turn human.
  */
 export function isCallbackTurn(messages: ReadonlyArray<SessionMessage.Info>): boolean {
   for (const message of messages) {
     if (message.type === "user") return false
+    if (message.type === "synthetic" && message.metadata?.source === "shell") return false
     if (message.type === "synthetic" && message.metadata?.source === "subagent") return true
   }
   return false

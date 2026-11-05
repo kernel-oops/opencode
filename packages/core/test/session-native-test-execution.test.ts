@@ -14,6 +14,7 @@ import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionStore } from "@opencode/core/session/store"
+import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { SessionNativeTest as Contract } from "@opencode/schema/session-native-test"
 import { Project } from "@opencode/core/project"
@@ -23,7 +24,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { testEffect } from "./lib/effect"
 
 const on = { nativeSteer: "response.steer", debug: "metadata" } as const
-const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, Job.node, SessionStore.node, SessionNativeTest.node])))
+const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, Job.node, SessionStore.node, SessionInbox.node, SessionNativeTest.node])))
 
 /** Real SessionExecution ownership with a barrier-controlled runner and a transport that records retirements. */
 const harness = (ids: ReadonlyArray<Session.ID>) =>

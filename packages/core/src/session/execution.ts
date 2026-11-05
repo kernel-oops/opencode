@@ -18,6 +18,7 @@ import { SessionStateCheckpoint } from "./state-checkpoint.js"
 import { SessionNativeTest } from "./native-test.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionContextBudget } from "./context-budget.js"
+import { SubagentFollowup } from "./subagent-followup.js"
 
 export type Interrupt = (
   reason?: "user" | "inactivity",
@@ -129,7 +130,7 @@ export const layer = Layer.effect(
         Reloaded: (result) => drain(sessionID, result.force, result.continuation, promotable, result.stepped),
       })
     })
-    const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({
+    const coordinator: SessionRunCoordinator.Coordinator<SessionSchema.ID, SessionRunner.RunError, InterruptReason> = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({
       canStart: (sessionID) =>
         Effect.gen(function* () {
           const session = yield* store.get(sessionID)
@@ -143,7 +144,7 @@ export const layer = Layer.effect(
       // The native test lane snapshot is taken before any model work and kept for the whole busy period.
       // A changed policy generation retires the previous channel here, whatever transport the new execution uses.
       started: (sessionID) =>
-        nativeTest.start(sessionID).pipe(
+        followup(sessionID).pipe(Effect.andThen(nativeTest.start(sessionID)),
           Effect.andThen(Effect.suspend(() => modelTransport.retire(sessionID, nativeTest.generation(sessionID)))),
           Effect.andThen(reportLifecycle(
             sessionID,
@@ -183,6 +184,8 @@ export const layer = Layer.effect(
         ))),
     })
 
+    const followup = yield* SubagentFollowup.make({ awaitIdle: coordinator.awaitIdle, wake: coordinator.wake })
+
     return Service.of({
       active: coordinator.active,
       isActive: coordinator.isActive,
@@ -216,7 +219,7 @@ export const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionNativeTest.node, SessionModelTransport.node],
+  deps: [SessionStore.node, SessionInbox.node, Instance.node, Bus.node, Database.node, Job.node, SessionNativeTest.node, SessionModelTransport.node],
 })
 
 /** Low-level compatibility layer for callers that only need durable Session recording. */
