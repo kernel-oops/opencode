@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Deferred, Effect, Fiber, Layer, LayerMap } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer, LayerMap } from "effect"
 import { eq } from "drizzle-orm"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -118,6 +118,13 @@ const fixtureLocation = Layer.effect(
     return { ...value, project: { ...value.project, id: Project.ID.make(id) } }
   }),
 ).pipe(Layer.provide(tempLocationLayer))
+const nonGitLocation = Layer.effect(
+  Location.Service,
+  Effect.gen(function* () {
+    const value = yield* Location.Service
+    return { ...value, project: { ...value.project, id: Project.ID.make(Hash.fast(`directory:${value.directory}`)) } }
+  }),
+).pipe(Layer.provide(tempLocationLayer))
 const linkedDirectory = (canonical: string, directory: string) =>
   Effect.promise(() => gitCommand("git", ["-C", canonical, "worktree", "add", "--quiet", "--detach", directory]))
 let nativeDrains = 0
@@ -160,6 +167,7 @@ const nativeLocations = makeGlobalNode({
                 Effect.succeed([
                   Model.Info.make({ ...effortModel(), id: model.id, providerID: model.providerID }),
                   Model.Info.make({ ...effortModel("alternate"), providerID: Provider.ID.make("other") }),
+                  effortModel("disabled", false),
                 ]),
             }),
           ).pipe(Layer.orDie) as Layer.Layer<LocationServices, FileSystem.DirectoryNotFoundError>,
@@ -284,7 +292,7 @@ const fakeSessions = makeGlobalNode({
     }),
   ),
 })
-const it = testEffect(
+const testLayer = (locationLayer = fixtureLocation) =>
   AppNodeBuilder.build(
     LayerNode.group([
       Database.node,
@@ -300,16 +308,19 @@ const it = testEffect(
       SessionProjector.node,
       PluginHooks.node,
       Git.node,
+      LocationServiceMap.node,
     ]),
     [
       Global.node.replace(tempGlobalLayer),
-      Location.node.replace(fixtureLocation),
+      Location.node.replace(locationLayer),
+      LocationServiceMap.node.replace(nativeLocations),
       Bus.node.replace(Bus.configured({ persist: true })),
       Session.node.replace(fakeSessions),
       SessionExecution.node.replace(fakeExecution),
     ],
-  ),
-)
+  )
+const it = testEffect(testLayer())
+const nonGitIt = testEffect(testLayer(nonGitLocation))
 
 const setup = Effect.gen(function* () {
   wakes = creates = prompts = notifications = 0
@@ -360,7 +371,9 @@ const setup = Effect.gen(function* () {
   yield* registerToolPlugin(NewSessionTool.Plugin)
   const tools = yield* Tool.Service
   const workdir = `${location.directory}/write-worktree`
-  yield* linkedDirectory(location.directory, workdir)
+  const git = yield* Git.Service
+  if (yield* git.repo.discover(location.directory)) yield* linkedDirectory(location.directory, workdir)
+  else yield* Effect.promise(() => mkdir(workdir))
   const input: NewSessionTool.Input = {
     operation: "launch",
     launch_key: "one",
@@ -385,6 +398,336 @@ const setup = Effect.gen(function* () {
 })
 
 describe("native new_session with fake execution only", () => {
+  for (const canonical of [false, true]) {
+    nonGitIt.effect(`non-Git ${canonical ? "canonical" : "host-local"} owner launches, reconciles and closes`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup
+        const input = { ...f.input, workdir: canonical ? f.location.directory : f.input.workdir }
+        const launched = yield* f.call(input)
+        expect(launched.status).toBe("completed")
+        expect((yield* (yield* SessionStore.Service).get(launched.output.sessionID))?.model).toEqual({
+          ...model,
+          variant: Model.VariantID.make("default"),
+        })
+        expect(
+          (yield* f.permission.ask({
+            sessionID: launched.output.sessionID,
+            agent: Agent.ID.make("build"),
+            action: "edit",
+            resources: ["fixture"],
+          })).effect,
+        ).toBe("allow")
+        yield* registerToolPlugin(NewSessionTool.Plugin)
+        expect((yield* f.call(input)).output.sessionID).toBe(launched.output.sessionID)
+        const bus = yield* Bus.Service
+        yield* bus.publish(SessionEvent.InboxDelivered, {
+          sessionID: launched.output.sessionID,
+          inboxID: launched.output.promptMessageID,
+        })
+        yield* bus.publish(SessionEvent.Execution.Succeeded, { sessionID: launched.output.sessionID })
+        expect((yield* f.call({ operation: "status", launch_key: "one" })).output.terminal).toBe("succeeded")
+        expect(
+          (yield* f.call({ operation: "close", launch_key: "one", evidence: "Disposable non-Git fixture verified" }))
+            .output.accepted,
+        ).toBe(true)
+        expect([creates, prompts, wakes]).toEqual([1, 1, 1])
+      }),
+    )
+  }
+  nonGitIt.effect(
+    "non-Git rejects Syncthing, missing directories, aliases and unrelated host directories without effects",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* setup
+        const alias = `${f.location.directory}/alias`
+        yield* Effect.promise(() => symlink(f.input.workdir, alias))
+        for (const workdir of [
+          "/mnt/crypt/home/syncthing/Development/another",
+          `${f.input.workdir}/missing`,
+          alias,
+          "/var",
+        ])
+          expect((yield* f.call({ ...f.input, workdir })).status).toBe("error")
+        expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+        expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+      }),
+  )
+  nonGitIt.effect("non-Git creator cannot target an unrelated Git checkout, linked worktree or nested directory", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      yield* Effect.promise(async () => {
+        await gitCommand("git", ["init", "--quiet", f.input.workdir])
+        await gitCommand("git", [
+          "-C",
+          f.input.workdir,
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@invalid",
+          "commit",
+          "--quiet",
+          "--allow-empty",
+          "-m",
+          "Unrelated fixture",
+        ])
+      })
+      const linked = `${f.location.directory}/unrelated-linked`
+      yield* linkedDirectory(f.input.workdir, linked)
+      yield* Effect.promise(() => mkdir(`${linked}/nested`))
+      for (const workdir of [f.input.workdir, linked, `${linked}/nested`])
+        expect((yield* f.call({ ...f.input, workdir })).status).toBe("error")
+      expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+      expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+  nonGitIt.effect("git init during approval invalidates non-Git work-directory authority before reservation", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      const hooks = yield* PluginHooks.Service
+      yield* hooks.register("permission", "evaluate", (event) =>
+        event.action === "new_session"
+          ? Effect.promise(() => gitCommand("git", ["init", "--quiet", f.input.workdir])).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      expect((yield* f.call(f.input)).status).toBe("error")
+      expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+      expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
+  for (const canonical of [false, true]) {
+    nonGitIt.effect(
+      `broken Git metadata in ${canonical ? "canonical" : "write"} directory cannot masquerade as non-Git`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup
+          const directory = canonical ? f.location.directory : f.input.workdir
+          yield* Effect.promise(() => writeFile(`${directory}/.git`, "gitdir: /missing/new-session-fixture-gitdir\n"))
+          const nested = `${directory}/nested`
+          yield* Effect.promise(() => mkdir(nested))
+          for (const workdir of [f.input.workdir, nested])
+            expect((yield* f.call({ ...f.input, workdir })).status).toBe("error")
+          expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+          expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+        }),
+    )
+    nonGitIt.effect(
+      `later broken Git metadata in ${canonical ? "canonical" : "write"} directory fences owner permissions`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup
+          const launched = yield* f.call(f.input)
+          expect(launched.status).toBe("completed")
+          const check = {
+            sessionID: launched.output.sessionID,
+            agent: Agent.ID.make("build"),
+            action: "edit",
+            resources: ["fixture"],
+          }
+          expect((yield* f.permission.ask(check)).effect).toBe("allow")
+          yield* Effect.promise(() =>
+            writeFile(
+              `${canonical ? f.location.directory : f.input.workdir}/.git`,
+              "gitdir: /missing/new-session-fixture-gitdir\n",
+            ),
+          )
+          expect((yield* f.permission.ask(check)).effect).toBe("deny")
+        }),
+    )
+  }
+  for (const canonical of [false, true]) {
+    nonGitIt.effect(
+      `later git init in non-Git ${canonical ? "canonical" : "write"} directory fences owner permissions`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup
+          const launched = yield* f.call(f.input)
+          expect(launched.status).toBe("completed")
+          const check = {
+            sessionID: launched.output.sessionID,
+            agent: Agent.ID.make("build"),
+            action: "edit",
+            resources: ["fixture"],
+          }
+          expect((yield* f.permission.ask(check)).effect).toBe("allow")
+          yield* Effect.promise(() =>
+            gitCommand("git", ["init", "--quiet", canonical ? f.location.directory : f.input.workdir]),
+          )
+          expect((yield* f.permission.ask(check)).effect).toBe("deny")
+        }),
+    )
+  }
+  for (const reverse of [false, true]) {
+    nonGitIt.effect(`non-Git overlap and ownership reservations (${reverse ? "child" : "parent"} first)`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup
+        const nested = `${f.input.workdir}/nested`
+        const sibling = `${f.input.workdir}-sibling`
+        yield* Effect.promise(() => Promise.all([mkdir(nested), mkdir(sibling)]))
+        expect((yield* f.call({ ...f.input, workdir: reverse ? nested : f.input.workdir })).status).toBe("completed")
+        expect(
+          (yield* f.call({
+            ...f.input,
+            launch_key: "overlap",
+            ownership_key: "other",
+            workdir: reverse ? f.input.workdir : nested,
+          })).status,
+        ).toBe("error")
+        expect((yield* f.call({ ...f.input, launch_key: "key", workdir: sibling })).status).toBe("error")
+        expect(
+          (yield* f.call({ ...f.input, launch_key: "disjoint", ownership_key: "other", workdir: sibling })).status,
+        ).toBe("completed")
+        expect([creates, prompts, wakes]).toEqual([2, 2, 2])
+      }),
+    )
+  }
+  for (const canonical of [false, true]) {
+    nonGitIt.effect(
+      `non-Git replaced ${canonical ? "canonical" : "write"} directory during approval refuses launch`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* setup
+          const directory = canonical ? f.location.directory : f.input.workdir
+          const hooks = yield* PluginHooks.Service
+          yield* hooks.register("permission", "evaluate", (event) =>
+            event.action !== "new_session"
+              ? Effect.void
+              : Effect.promise(async () => {
+                  await rename(directory, `${directory}-original`)
+                  await mkdir(directory)
+                  // Keep disposable fixture cleanup responsible for the moved directory too.
+                  await rename(`${directory}-original`, `${directory}/original`)
+                }).pipe(Effect.asVoid),
+          )
+          expect((yield* f.call(f.input)).status).toBe("error")
+          expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+          expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+        }),
+    )
+    nonGitIt.effect(`non-Git replaced ${canonical ? "canonical" : "write"} directory fences existing owner`, () =>
+      Effect.gen(function* () {
+        const f = yield* setup
+        const launched = yield* f.call(f.input)
+        expect(launched.status).toBe("completed")
+        const directory = canonical ? f.location.directory : f.input.workdir
+        yield* Effect.promise(async () => {
+          await rename(directory, `${directory}-original`)
+          await mkdir(directory)
+          await rename(`${directory}-original`, `${directory}/original`)
+        })
+        expect(
+          (yield* f.permission.ask({
+            sessionID: launched.output.sessionID,
+            agent: Agent.ID.make("build"),
+            action: "edit",
+            resources: ["fixture"],
+          })).effect,
+        ).toBe("deny")
+      }),
+    )
+  }
+  it.effect("model selection validates enabled catalogue models and variants before launch effects", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      for (const selected of [
+        "invalid",
+        "fake/missing",
+        "fixture/disabled",
+        "other/alternate#missing",
+        "other/alternate#wire#medium",
+      ])
+        expect((yield* f.call({ ...f.input, model: selected })).status).toBe("error")
+      expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+      expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+      const launched = yield* f.call({ ...f.input, model: "other/alternate#wire" })
+      const chosen = Model.Ref.make({
+        providerID: Provider.ID.make("other"),
+        id: Model.ID.make("alternate"),
+        variant: Model.VariantID.make("wire"),
+      })
+      expect(launched.status).toBe("completed")
+      expect((yield* (yield* SessionStore.Service).get(launched.output.sessionID))?.model).toEqual(chosen)
+      expect((yield* SessionDelegation.get(f.db, launched.output.sessionID))?.target_model).toEqual(chosen)
+      expect((yield* f.call({ ...f.input, model: "other/alternate#medium" })).status).toBe("error")
+      expect([creates, prompts, wakes]).toEqual([1, 1, 1])
+    }),
+  )
+  it.effect("model selection waits for creator Location plugin readiness before reading its catalogue", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      const locations = yield* LocationServiceMap.Service
+      const waiting = yield* Deferred.make<void>()
+      const ready = yield* Deferred.make<void>()
+      let activated = false
+      let reads = 0
+      const gated = {
+        ...locations,
+        contextEffect: (ref: Location.Ref) =>
+          locations.contextEffect(ref).pipe(
+            Effect.map((context) => {
+              const plugins = Context.get(context, Plugin.Service)
+              const models = Context.get(context, Model.Service)
+              return context.pipe(
+                Context.add(Plugin.Service, {
+                  ...plugins,
+                  awaitActivation: Deferred.succeed(waiting, undefined).pipe(Effect.andThen(Deferred.await(ready))),
+                }),
+                Context.add(Model.Service, {
+                  ...models,
+                  available: (types) =>
+                    Effect.gen(function* () {
+                      expect(activated).toBe(true)
+                      reads++
+                      return yield* models.available(types)
+                    }),
+                }),
+              )
+            }),
+          ),
+      }
+      yield* registerToolPlugin(NewSessionTool.Plugin).pipe(Effect.provideService(LocationServiceMap.Service, gated))
+      const launched = yield* f.call({ ...f.input, model: "other/alternate#wire" }).pipe(Effect.forkScoped)
+      yield* Deferred.await(waiting)
+      expect(reads).toBe(0)
+      expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+      activated = true
+      yield* Deferred.succeed(ready, undefined)
+      expect((yield* Fiber.join(launched)).status).toBe("completed")
+      expect(reads).toBe(2)
+    }),
+  )
+  it.effect("model disabled during permission evaluation is rejected before reservation", () =>
+    Effect.gen(function* () {
+      const f = yield* setup
+      const locations = yield* LocationServiceMap.Service
+      let enabled = true
+      const changing = {
+        ...locations,
+        contextEffect: (ref: Location.Ref) =>
+          locations.contextEffect(ref).pipe(
+            Effect.map((context) => {
+              const models = Context.get(context, Model.Service)
+              return Context.add(context, Model.Service, {
+                ...models,
+                available: (types) =>
+                  models
+                    .available(types)
+                    .pipe(Effect.map((items) => items.map((item) => Model.Info.make({ ...item, enabled })))),
+              })
+            }),
+          ),
+      }
+      yield* registerToolPlugin(NewSessionTool.Plugin).pipe(Effect.provideService(LocationServiceMap.Service, changing))
+      const hooks = yield* PluginHooks.Service
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          if (event.action === "new_session") enabled = false
+        }),
+      )
+      expect((yield* f.call({ ...f.input, model: "other/alternate" })).status).toBe("error")
+      expect([creates, prompts, wakes]).toEqual([0, 0, 0])
+      expect(yield* f.db.select().from(NewSessionTable).all().pipe(Effect.orDie)).toEqual([])
+    }),
+  )
   it.effect("fresh canonical writes are rejected without reservation, creation, admission or wake", () =>
     Effect.gen(function* () {
       const f = yield* setup
@@ -555,7 +898,7 @@ describe("native new_session with fake execution only", () => {
       expect((yield* f.call(legacy)).output.accepted).toBe(true)
     }),
   )
-  it.effect("V1 rejects non-Git directory hashes, global/unknown identities and excluded roots", () =>
+  it.effect("non-Git authority accepts directory hashes but rejects global/unknown identities and excluded roots", () =>
     Effect.gen(function* () {
       const directory = yield* Effect.acquireRelease(
         Effect.promise(() => tmpdir("new-session-non-git-")),
@@ -563,7 +906,10 @@ describe("native new_session with fake execution only", () => {
       )
       const git = yield* Git.Service
       expect(yield* git.repo.discover(AbsolutePath.make(directory.path))).toBeUndefined()
-      for (const id of [Hash.fast(`directory:${directory.path}`), "global", "unknown"])
+      expect(
+        yield* verifyProjectAuthority(git, Hash.fast(`directory:${directory.path}`), directory.path, directory.path),
+      ).toBe(true)
+      for (const id of ["global", "unknown"])
         expect(yield* verifyProjectAuthority(git, id, directory.path, directory.path)).toBe(false)
       for (const leaf of ["private", ".config", ".opencode"]) {
         const excluded = `${directory.path}/${leaf}`
@@ -1255,121 +1601,144 @@ for (const delivered of [false, true]) {
     )
   })
 }
-test.each([false, true])("native model baseline: status/close across reopen (%s)", async (closeBeforeReopen) => {
-  await Effect.runPromise(
-    Effect.gen(function* () {
-      const location = yield* Location.Service
-      const filename = `${location.directory}/effort.db`
-      const retained = yield* Effect.gen(function* () {
-        const f = yield* setup
-        const launched = yield* f.call(f.input)
-        expect(launched.status).toBe("completed")
-        const sessionID = launched.output.sessionID
-        const sessions = yield* Session.Service
-        const store = yield* SessionStore.Service
-        const owner = yield* store.get(sessionID)
-        const locations = yield* LocationServiceMap.Service
-        yield* locations.contextEffect(owner!.location)
-        yield* SessionClientModel.select({
-          sessionID,
-          model: {
-            id: Model.ID.make("alternate"),
-            providerID: Provider.ID.make("other"),
-            variant: Model.VariantID.make("wire"),
-          },
-        })
-        yield* sessions.switchModel({
-          sessionID,
-          model: {
-            id: Model.ID.make("alternate"),
-            providerID: Provider.ID.make("other"),
-            variant: Model.VariantID.make("wire-medium"),
-          },
-        })
-        yield* (yield* Bus.Service).publish(SessionEvent.InboxDelivered, {
-          sessionID,
-          inboxID: launched.output.promptMessageID,
-        })
-        yield* (yield* Bus.Service).publish(SessionEvent.Execution.Succeeded, { sessionID })
-        const before = wakes
-        expect((yield* f.call({ operation: "status", launch_key: "one" })).status).toBe("completed")
-        expect((yield* sessions.inbox(f.creator)).filter((item) => item.type === "synthetic")).toHaveLength(1)
-        const notified = wakes
-        if (closeBeforeReopen)
-          expect(
-            (yield* f.call({ operation: "close", launch_key: "one", evidence: "Fixture verified" })).output.accepted,
-          ).toBe(true)
-        expect(wakes).toBe(notified)
-        expect(notified - before).toBeLessThanOrEqual(1)
-        return { sessionID, creator: f.creator }
-      }).pipe(Effect.provide(nativeLayer(filename, location, false)), Effect.scoped)
-      yield* Effect.gen(function* () {
-        const agents = yield* Agent.Service
-        yield* agents.transform((editor) =>
-          editor.update(Agent.ID.make("build"), (agent) => {
-            agent.model = model
-            agent.permissions = [
-              { action: "*", resource: "*", effect: "allow" },
-              ...["John", "Luke", "Mark", "Matthew", "Judas", "Gabriel", "Spaghetti Monster"].map((resource) => ({
-                action: "subagent",
-                resource,
-                effect: "deny" as const,
-              })),
-            ]
-          }),
-        )
-        yield* registerToolPlugin(NewSessionTool.Plugin)
-        const store = yield* SessionStore.Service
-        const owner = yield* store.get(retained.sessionID)
-        expect(owner?.model).toEqual({
-          id: Model.ID.make("alternate"),
-          providerID: Provider.ID.make("other"),
-          variant: Model.VariantID.make("wire-medium"),
-        })
-        expect((yield* SessionDelegation.get((yield* Database.Service).db, retained.sessionID))?.target_model).toEqual(
-          model,
-        )
-        const locations = yield* LocationServiceMap.Service
-        yield* locations.contextEffect(owner!.location)
-        const tools = yield* Tool.Service
-        const before = wakes
-        const status = yield* executeTool(tools, {
-          ...toolIdentity,
-          agent: Agent.ID.make("build"),
-          sessionID: retained.creator,
-          call: {
-            type: "tool-call",
-            id: "call_effort_status",
-            name: "new_session",
-            input: { operation: "status", launch_key: "one" },
-          },
-        })
-        expect(status.output.accepted).toBe(closeBeforeReopen)
-        if (!closeBeforeReopen) {
-          const closed = yield* executeTool(tools, {
-            ...toolIdentity,
-            agent: Agent.ID.make("build"),
-            sessionID: retained.creator,
-            call: {
-              type: "tool-call",
-              id: "call_model_close",
-              name: "new_session",
-              input: { operation: "close", launch_key: "one", evidence: "Reopened fixture verified" },
-            },
-          })
-          expect(closed.output.accepted).toBe(true)
-        }
-        const inbox = yield* SessionInbox.Service
-        expect((yield* inbox.list(retained.creator)).filter((item) => item.type === "synthetic")).toHaveLength(1)
-        expect(wakes).toBe(before)
-        const sessions = yield* Session.Service
-        expect((yield* sessions.switchModel({ sessionID: retained.sessionID, model }).pipe(Effect.exit))._tag).toBe(
-          "Failure",
-        )
-      }).pipe(Effect.provide(nativeLayer(filename, location, false)), Effect.scoped)
-    }).pipe(Effect.provide(fixtureLocation), Effect.scoped),
+for (const selected of [undefined, "other/alternate#wire"]) {
+  test.each([false, true])(
+    `native model baseline ${selected ?? "default"}: status/close across reopen (%s)`,
+    async (closeBeforeReopen) => {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const location = yield* Location.Service
+          const filename = `${location.directory}/effort.db`
+          const retained = yield* Effect.gen(function* () {
+            const f = yield* setup
+            const launched = yield* f.call({ ...f.input, ...(selected ? { model: selected } : {}) })
+            expect(launched.status).toBe("completed")
+            const sessionID = launched.output.sessionID
+            const sessions = yield* Session.Service
+            const store = yield* SessionStore.Service
+            const owner = yield* store.get(sessionID)
+            expect(owner?.model).toEqual(
+              selected
+                ? {
+                    providerID: Provider.ID.make("other"),
+                    id: Model.ID.make("alternate"),
+                    variant: Model.VariantID.make("wire"),
+                  }
+                : { ...model, variant: Model.VariantID.make("default") },
+            )
+            const locations = yield* LocationServiceMap.Service
+            yield* locations.contextEffect(owner!.location)
+            yield* SessionClientModel.select({
+              sessionID,
+              model: {
+                id: Model.ID.make("alternate"),
+                providerID: Provider.ID.make("other"),
+                variant: Model.VariantID.make("wire"),
+              },
+            })
+            yield* sessions.switchModel({
+              sessionID,
+              model: {
+                id: Model.ID.make("alternate"),
+                providerID: Provider.ID.make("other"),
+                variant: Model.VariantID.make("wire-medium"),
+              },
+            })
+            yield* (yield* Bus.Service).publish(SessionEvent.InboxDelivered, {
+              sessionID,
+              inboxID: launched.output.promptMessageID,
+            })
+            yield* (yield* Bus.Service).publish(SessionEvent.Execution.Succeeded, { sessionID })
+            const before = wakes
+            expect((yield* f.call({ operation: "status", launch_key: "one" })).status).toBe("completed")
+            expect((yield* sessions.inbox(f.creator)).filter((item) => item.type === "synthetic")).toHaveLength(1)
+            const notified = wakes
+            if (closeBeforeReopen)
+              expect(
+                (yield* f.call({ operation: "close", launch_key: "one", evidence: "Fixture verified" })).output
+                  .accepted,
+              ).toBe(true)
+            expect(wakes).toBe(notified)
+            expect(notified - before).toBeLessThanOrEqual(1)
+            return { sessionID, creator: f.creator }
+          }).pipe(Effect.provide(nativeLayer(filename, location, false)), Effect.scoped)
+          yield* Effect.gen(function* () {
+            const agents = yield* Agent.Service
+            yield* agents.transform((editor) =>
+              editor.update(Agent.ID.make("build"), (agent) => {
+                agent.model = model
+                agent.permissions = [
+                  { action: "*", resource: "*", effect: "allow" },
+                  ...["John", "Luke", "Mark", "Matthew", "Judas", "Gabriel", "Spaghetti Monster"].map((resource) => ({
+                    action: "subagent",
+                    resource,
+                    effect: "deny" as const,
+                  })),
+                ]
+              }),
+            )
+            yield* registerToolPlugin(NewSessionTool.Plugin)
+            const store = yield* SessionStore.Service
+            const owner = yield* store.get(retained.sessionID)
+            expect(owner?.model).toEqual({
+              id: Model.ID.make("alternate"),
+              providerID: Provider.ID.make("other"),
+              variant: Model.VariantID.make("wire-medium"),
+            })
+            expect(
+              (yield* SessionDelegation.get((yield* Database.Service).db, retained.sessionID))?.target_model,
+            ).toEqual(
+              selected
+                ? {
+                    providerID: Provider.ID.make("other"),
+                    id: Model.ID.make("alternate"),
+                    variant: Model.VariantID.make("wire"),
+                  }
+                : model,
+            )
+            const locations = yield* LocationServiceMap.Service
+            yield* locations.contextEffect(owner!.location)
+            const tools = yield* Tool.Service
+            const before = wakes
+            const status = yield* executeTool(tools, {
+              ...toolIdentity,
+              agent: Agent.ID.make("build"),
+              sessionID: retained.creator,
+              call: {
+                type: "tool-call",
+                id: "call_effort_status",
+                name: "new_session",
+                input: { operation: "status", launch_key: "one" },
+              },
+            })
+            expect(status.output.accepted).toBe(closeBeforeReopen)
+            if (!closeBeforeReopen) {
+              const closed = yield* executeTool(tools, {
+                ...toolIdentity,
+                agent: Agent.ID.make("build"),
+                sessionID: retained.creator,
+                call: {
+                  type: "tool-call",
+                  id: "call_model_close",
+                  name: "new_session",
+                  input: { operation: "close", launch_key: "one", evidence: "Reopened fixture verified" },
+                },
+              })
+              expect(closed.output.accepted).toBe(true)
+            }
+            const inbox = yield* SessionInbox.Service
+            expect((yield* inbox.list(retained.creator)).filter((item) => item.type === "synthetic")).toHaveLength(1)
+            expect(wakes).toBe(before)
+            const sessions = yield* Session.Service
+            expect((yield* sessions.switchModel({ sessionID: retained.sessionID, model }).pipe(Effect.exit))._tag).toBe(
+              "Failure",
+            )
+          }).pipe(Effect.provide(nativeLayer(filename, location, false)), Effect.scoped)
+        }).pipe(Effect.provide(fixtureLocation), Effect.scoped),
+      )
+    },
   )
-})
+}
 test("native execution coordinator delivers the initial prompt through a fake runner exactly once", async () => {
   await Effect.runPromise(
     Effect.gen(function* () {

@@ -4,7 +4,8 @@ import { Event } from "@opencode/schema/config"
 import { Cause, Effect, Layer, Queue, Stream } from "effect"
 import path from "path"
 import { ConfigPluginSource } from "../config/plugin/source.js"
-import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { makeLocationNode, Node } from "@opencode/util/effect/app-node"
+import type { LayerNode } from "@opencode/util/effect/layer-node"
 import { Bus } from "../bus.js"
 import { Npm } from "@opencode/util/npm"
 import { Plugin } from "../plugin.js"
@@ -14,6 +15,8 @@ import { PluginModule } from "./module.js"
 import { SdkPlugins } from "./sdk.js"
 import { PluginUpdate } from "./update.js"
 import { Watcher } from "../filesystem/watcher.js"
+import type { FileSystem } from "../filesystem.js"
+import type { PersistentPty } from "../persistent-pty.js"
 
 const resolve = Effect.fn("PluginSupervisor.resolve")(function* (
   modules: Effect.Success<ReturnType<typeof PluginModule.make>>,
@@ -266,4 +269,9 @@ function pluginSource(target: string): Plugin.Source {
   return { type: "package", target }
 }
 
-export const node = makeLocationNode({ name: "plugin-supervisor", layer, deps: nodeDeps })
+// Keep Location's output type independent of this layer's captured LocationServiceMap.
+export const node: LayerNode.Provider<
+  never,
+  FileSystem.DirectoryAccessDeniedError | FileSystem.DirectoryNotFoundError | PersistentPty.UnavailableError,
+  typeof Node.tags.values.location
+> = makeLocationNode({ name: "plugin-supervisor", layer, deps: nodeDeps })

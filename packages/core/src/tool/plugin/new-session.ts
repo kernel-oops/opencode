@@ -1,8 +1,8 @@
 export * as NewSessionTool from "./new-session.js"
 
 import { ToolFailure } from "@opencode/ai/effect"
-import type { Context } from "@opencode/plugin/effect/plugin"
-import { Effect, Schema, Stream, type Scope } from "effect"
+import type { Context as PluginContext } from "@opencode/plugin/effect/plugin"
+import { Context, Effect, Schema, Stream, type Scope } from "effect"
 import { and, eq, ne, inArray, isNull } from "drizzle-orm"
 import { z } from "zod"
 import { createHash } from "node:crypto"
@@ -14,6 +14,11 @@ import { Database } from "../../database/database.js"
 import { Git } from "../../git.js"
 import { verify as verifyProjectAuthority } from "../../session/project-authority.js"
 import { Location } from "../../location.js"
+import { LocationServiceMap } from "../../location-service-map.js"
+import { Model } from "../../model.js"
+import { ModelResolver } from "../../model-resolver.js"
+import { awaitActivation } from "../../plugin/service.js"
+import { AbsolutePath } from "../../schema.js"
 import { Permission } from "../../permission.js"
 import { ProjectTable } from "../../project/sql.js"
 import { Session } from "../../session.js"
@@ -63,6 +68,10 @@ export const Input = z.discriminatedUnion("operation", [
       acceptance: z.array(z.string().min(1).max(2000)).min(1).max(20),
       ownership_key: key,
       workdir: z.string().min(1).max(4096),
+      model: z
+        .string()
+        .regex(/^[^\s/#]+\/[^\s#]+(?:#[^\s#]+)?$/, "Use providerID/modelID or providerID/modelID#variant")
+        .optional(),
     })
     .strict(),
   z.object({ operation: z.literal("status"), launch_key: key }).strict(),
@@ -103,6 +112,8 @@ export function payloadHash(input: Launch) {
         input.acceptance,
         input.ownership_key,
         input.workdir,
+        // Preserve hashes of launches made before model selection was available.
+        ...(input.model === undefined ? [] : [input.model]),
       ]),
     )
     .digest("hex")
@@ -121,7 +132,10 @@ export const directoryIdentity = (directory: string) =>
       if (!info.isDirectory()) throw new Error("Work directory is not a directory")
       return `${info.dev}:${info.ino}`
     },
-    catch: (error) => new ToolFailure({ message: error instanceof Error ? error.message : String(error) }),
+    catch: (error) =>
+      new ToolFailure({
+        message: `Cannot verify work directory ${directory}; pass an existing absolute directory without symlink aliases: ${error instanceof Error ? error.message : String(error)}`,
+      }),
   })
 
 export function delegationPrompt(input: Launch, creatorID: string, canonical: string) {
@@ -146,7 +160,7 @@ export function delegationPrompt(input: Launch, creatorID: string, canonical: st
 export const Plugin = {
   id: "opencode.tool.new-session",
   effect: Effect.fn("NewSessionTool.Plugin")(function* (
-    ctx: Context,
+    ctx: PluginContext,
   ): Effect.fn.Return<
     void,
     never,
@@ -159,6 +173,7 @@ export const Plugin = {
     | Bus.Service
     | Database.Service
     | Git.Service
+    | LocationServiceMap.Service
     | Scope.Scope
   > {
     const sessions = yield* Session.Service
@@ -170,6 +185,7 @@ export const Plugin = {
     const bus = yield* Bus.Service
     const db = (yield* Database.Service).db
     const git = yield* Git.Service
+    const locations = yield* LocationServiceMap.Service
     const read = (creatorID: SessionSchema.ID, launchKey: string) =>
       db
         .select()
@@ -307,9 +323,10 @@ export const Plugin = {
       accepted: row.stage === "accepted",
       created: ["created", "admitted", "starting", "running", "execution-ended", "accepted"].includes(row.stage),
       admitted: ["admitted", "starting", "running", "execution-ended", "accepted"].includes(row.stage),
-      progress: row.stage === "starting"
-        ? "Session created; start requested. Execution is not yet confirmed. Check status using this launch key; do not create a duplicate or manually wake it."
-        : "",
+      progress:
+        row.stage === "starting"
+          ? "Session created; start requested. Execution is not yet confirmed. Check status using this launch key; do not create a duplicate or manually wake it."
+          : "",
       blocked: ["reserved", "creating", "created", "admitted"].includes(row.stage)
         ? "Launch boundary requires reconciliation; start outcome may be ambiguous, do not retry or wake"
         : "",
@@ -324,7 +341,7 @@ export const Plugin = {
           input: Input,
           output: Output,
           description:
-            "Create a durable independent restricted build owner registered in the canonical project with a distinct existing host-local linked write worktree. All assigned writes must use absolute paths in workdir; pass its exact path and restrictions to workers and reviewers. This is not a filesystem sandbox: relative paths and shell defaults remain canonical, and normal permissions still apply. Use subagents for tightly coupled short work. A launch is not acceptance, deployment authority or a transfer of existing jobs. Status never restarts work; close acknowledges evidence and releases ownership only when the owner and descendants are idle.",
+            "Create a durable independent restricted build owner registered in the canonical project. Git projects require a distinct existing same-project linked worktree under /mnt/crypt/home/opencode/worktrees/. Non-Git projects may use an existing host-local non-Git directory there or their canonical directory; no Git repository may contain the write directory. Optional model selects an enabled creator-Location model as providerID/modelID or providerID/modelID#variant; otherwise build's configured model is used. The agent remains build and all restricted ceilings remain in force. All assigned writes must use absolute paths in workdir; pass its exact path and restrictions to workers and reviewers. This is not a filesystem sandbox: relative paths and shell defaults remain canonical, and normal permissions still apply. Use subagents for tightly coupled short work. A launch is not acceptance, deployment authority or a transfer of existing jobs. Status never restarts work; close acknowledges evidence and releases ownership only when the owner and descendants are idle.",
           execute: (input, context) =>
             Effect.gen(function* () {
               const caller = yield* sessions.get(context.sessionID)
@@ -365,6 +382,16 @@ export const Plugin = {
                 })
               const canonical = project.worktree
               const canonicalIdentity = yield* directoryIdentity(canonical)
+              const verifyAuthority = () =>
+                Effect.gen(function* () {
+                  if (canonicalIdentity !== (yield* directoryIdentity(canonical))) return false
+                  return yield* verifyProjectAuthority(
+                    git,
+                    caller.projectID,
+                    canonical,
+                    input.operation === "launch" ? input.workdir : canonical,
+                  )
+                })
               if (canonical === "/mnt/crypt/home/syncthing/Development/planefolio")
                 return yield* new ToolFailure({ message: "PlaneFolio publication mirror is not authoritative" })
               const existing = yield* read(caller.id, input.launch_key)
@@ -428,7 +455,8 @@ export const Plugin = {
                   return yield* new ToolFailure({ message: "Launch key already has a different immutable payload" })
                 return output(yield* reconcile(existing))
               }
-              if (input.workdir === canonical)
+              const repository = yield* git.repo.discover(AbsolutePath.make(canonical))
+              if (repository && input.workdir === canonical)
                 return yield* new ToolFailure({
                   message:
                     "Fresh launches require a distinct write worktree; create a linked Git worktree under /mnt/crypt/home/opencode/worktrees and pass its absolute top-level path",
@@ -436,24 +464,73 @@ export const Plugin = {
               const excluded =
                 input.workdir.startsWith("/tmp/") ||
                 input.workdir === "/tmp" ||
-                (input.workdir.includes("/syncthing/") && input.workdir !== canonical) ||
+                (/\/syncthing\//i.test(input.workdir) && input.workdir !== canonical) ||
                 /\/(private|\.config|\.opencode)(\/|$)/.test(input.workdir) ||
                 input.workdir === "/mnt/crypt/home/syncthing/Development/planefolio"
               if (excluded)
                 return yield* new ToolFailure({
-                  message: "Work directory is explicitly excluded from independent development",
+                  message:
+                    "Work directory is excluded (temporary, Syncthing or private/configuration path); use an existing host-local directory under /mnt/crypt/home/opencode/worktrees/ or, for non-Git projects, the canonical directory",
                 })
               const identity = yield* directoryIdentity(input.workdir)
-              if (!(yield* verifyProjectAuthority(git, caller.projectID, canonical, input.workdir)))
-                return yield* new ToolFailure({
-                  message: "Current canonical repository identity or linked worktree association is not verified",
-                })
-              if (!input.workdir.startsWith("/mnt/crypt/home/opencode/worktrees/"))
+              if (
+                !input.workdir.startsWith("/mnt/crypt/home/opencode/worktrees/") &&
+                (repository || input.workdir !== canonical)
+              )
                 return yield* new ToolFailure({
                   message:
-                    "Work directory must be an existing same-project linked worktree under /mnt/crypt/home/opencode/worktrees",
+                    "Work directory must be under /mnt/crypt/home/opencode/worktrees/ (a same-project linked worktree for Git), or the canonical directory for a non-Git project",
                 })
-              if (!agent.model)
+              if (!(yield* verifyAuthority()))
+                return yield* new ToolFailure({
+                  message: repository
+                    ? "Canonical Git identity or same-project linked worktree association is not verified; create a linked worktree from the canonical repository"
+                    : "Non-Git project identity or write-directory association is not verified; use its canonical Location and directory project ID, and a write directory with no Git repository at it or in any parent",
+                })
+              const resolveModel = () =>
+                Effect.gen(function* () {
+                  if (input.model === undefined) return agent.model
+                  const context = yield* locations.contextEffect(caller.location)
+                  yield* awaitActivation.pipe(Effect.provide(context))
+                  const models = Context.get(context, Model.Service)
+                  const [name, variant] = input.model!.split("#")
+                  const parsed = Model.parse(name)
+                  const catalogue = yield* models.available(["chat"])
+                  const found = catalogue.find(
+                    (item) => item.providerID === parsed.providerID && item.id === parsed.modelID && item.enabled,
+                  )
+                  if (!found)
+                    return yield* new ToolFailure({
+                      message: `Model ${name} is not enabled in the creator Location; choose an enabled catalogue model`,
+                    })
+                  const ref = Model.Ref.make({
+                    providerID: found.providerID,
+                    id: found.id,
+                    ...(variant ? { variant: Model.VariantID.make(variant) } : {}),
+                  })
+                  yield* ModelResolver.withVariant(found, ref.variant).pipe(
+                    Effect.mapError(
+                      () =>
+                        new ToolFailure({
+                          message: `Variant ${variant} is unavailable for ${name}; choose a configured variant`,
+                        }),
+                    ),
+                  )
+                  return ref
+                }).pipe(
+                  Effect.scoped,
+                  Effect.mapError((error) =>
+                    error instanceof ToolFailure
+                      ? error
+                      : new ToolFailure({
+                          message:
+                            "Creator Location model catalogue is unavailable; restore its plugins and model configuration before launching",
+                          error,
+                        }),
+                  ),
+                )
+              const selectedModel = yield* resolveModel()
+              if (!selectedModel)
                 return yield* new ToolFailure({ message: "Restricted build has no fixed configured model" })
               yield* permission.assert({
                 action: name,
@@ -473,7 +550,8 @@ export const Plugin = {
                 currentAgent.hidden ||
                 JSON.stringify(currentAgent.permissions) !== JSON.stringify(agent.permissions) ||
                 JSON.stringify(currentCaller.permissions) !== JSON.stringify(caller.permissions) ||
-                modelIdentity(currentAgent.model) !== modelIdentity(agent.model) ||
+                (input.model === undefined && modelIdentity(currentAgent.model) !== modelIdentity(selectedModel)) ||
+                (input.model !== undefined && modelIdentity(yield* resolveModel()) !== modelIdentity(selectedModel)) ||
                 canonicalIdentity !== (yield* directoryIdentity(canonical))
               )
                 return yield* new ToolFailure({
@@ -482,8 +560,11 @@ export const Plugin = {
                 })
               if (identity !== (yield* directoryIdentity(input.workdir)))
                 return yield* new ToolFailure({ message: "Work directory identity changed before reservation" })
-              if (!(yield* verifyProjectAuthority(git, caller.projectID, canonical, input.workdir)))
-                return yield* new ToolFailure({ message: "Repository authority changed during permission evaluation" })
+              if (!(yield* verifyAuthority()))
+                return yield* new ToolFailure({
+                  message:
+                    "Project authority changed during permission evaluation; verify the canonical directory and write directory before a new launch",
+                })
               const row = yield* db
                 .transaction((tx) =>
                   Effect.gen(function* () {
@@ -572,7 +653,7 @@ export const Plugin = {
                         session_rules: caller.permissions ?? [],
                         source_directory_identity: canonicalIdentity,
                         target_agent: agent.id,
-                        target_model: agent.model!,
+                        target_model: selectedModel,
                       })
                       .run()
                     return row
@@ -607,15 +688,15 @@ export const Plugin = {
                 return yield* new ToolFailure({
                   message: "Directory identity changed before creation; reservation retained",
                 })
-              if (!(yield* verifyProjectAuthority(git, caller.projectID, canonical, input.workdir)))
+              if (!(yield* verifyAuthority()))
                 return yield* new ToolFailure({
-                  message: "Repository authority changed before creation; reservation retained",
+                  message: "Project authority changed before creation; reservation retained",
                 })
               const created = yield* sessions.create({
                 id: row.session_id,
                 title: input.title,
                 agent: agent.id,
-                model: agent.model,
+                model: selectedModel,
                 location: Location.Ref.make({ directory: canonical, workspaceID: caller.location.workspaceID }),
               })
               if (
@@ -623,7 +704,7 @@ export const Plugin = {
                 created.projectID !== caller.projectID ||
                 created.location.directory !== canonical ||
                 created.agent !== agent.id ||
-                modelIdentity(created.model) !== modelIdentity(agent.model)
+                modelIdentity(created.model) !== modelIdentity(selectedModel)
               )
                 return yield* new ToolFailure({
                   message: "Recorded Session identity does not match the reserved owner",
@@ -633,9 +714,9 @@ export const Plugin = {
                 return yield* new ToolFailure({
                   message: "Directory identity changed before admission; reservation retained",
                 })
-              if (!(yield* verifyProjectAuthority(git, caller.projectID, canonical, input.workdir)))
+              if (!(yield* verifyAuthority()))
                 return yield* new ToolFailure({
-                  message: "Repository authority changed before admission; reservation retained",
+                  message: "Project authority changed before admission; reservation retained",
                 })
               yield* sessions.prompt({
                 id: row.prompt_id,

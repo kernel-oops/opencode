@@ -2,9 +2,23 @@ import { Effect } from "effect"
 import { Git } from "../git.js"
 import { Hash } from "@opencode/util/hash"
 import { AbsolutePath } from "../schema.js"
-import { realpath } from "node:fs/promises"
+import { lstat, realpath } from "node:fs/promises"
+import path from "node:path"
 
-/** Read current repository identity, without resolving/persisting project inventory. */
+// Discovery also returns nothing for broken or unreadable Git metadata; that is not proof of a non-Git tree.
+const hasGitEntry = (directory: string) =>
+  Effect.promise(async () => {
+    for (let current = directory; ; current = path.dirname(current)) {
+      const found = await lstat(path.join(current, ".git")).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => error.code !== "ENOENT",
+      )
+      if (found) return true
+      if (current === path.dirname(current)) return false
+    }
+  })
+
+/** Read current project identity, without resolving/persisting project inventory. */
 export const verify = Effect.fn("SessionProjectAuthority.verify")(function* (
   git: Git.Interface,
   projectID: string,
@@ -12,7 +26,16 @@ export const verify = Effect.fn("SessionProjectAuthority.verify")(function* (
   workdir: string,
 ) {
   const repo = yield* git.repo.discover(AbsolutePath.make(canonical))
-  if (!repo) return false
+  if (!repo)
+    return (
+      projectID === Hash.fast(`directory:${canonical}`) &&
+      (workdir === canonical || workdir.startsWith("/mnt/crypt/home/opencode/worktrees/")) &&
+      (workdir === canonical || !/\/syncthing\//i.test(workdir)) &&
+      !/\/(private|\.config|\.opencode)(\/|$)/.test(workdir) &&
+      canonical !== "/mnt/crypt/home/syncthing/Development/planefolio" &&
+      !(yield* hasGitEntry(canonical)) &&
+      !(yield* hasGitEntry(workdir))
+    )
   if (repo.worktree !== canonical || repo.gitDirectory !== repo.commonDirectory) return false
   const origin = yield* git.remote.get(repo)
   let remoteID: string | undefined

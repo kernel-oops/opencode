@@ -52,6 +52,7 @@ import { Integration } from "../integration.js"
 import { Job } from "../job.js"
 import { KV } from "../kv.js"
 import { Location } from "../location.js"
+import { LocationServiceMap } from "../location-service-map.js"
 import { ModelsDev } from "../models-dev.js"
 import { Mcp } from "../mcp/index.js"
 import { Npm } from "@opencode/util/npm"
@@ -148,6 +149,7 @@ const services = [
   KV.Service,
   LLMClient.Service,
   Location.Service,
+  LocationServiceMap.Service,
   ModelsDev.Service,
   Mcp.Service,
   Npm.Service,
@@ -209,6 +211,7 @@ export const requirements = LayerNode.group([
   KV.node,
   llmClient,
   Location.node,
+  LocationServiceMap.node,
   ModelsDev.node,
   Mcp.node,
   Npm.node,

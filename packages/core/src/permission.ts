@@ -354,7 +354,7 @@ const layer = Layer.effect(
         if (source && source.location.directory !== delegation.source_directory) failures.push(`creator session ${delegation.creator_id} directory changed`)
         if (location.directory !== delegation.source_directory) failures.push(`current directory ${location.directory} differs from ${delegation.source_directory}`)
         if (directoryIdentity !== delegation.source_directory_identity) failures.push(`source directory ${delegation.source_directory} missing or replaced (expected dev:ino ${delegation.source_directory_identity}, found ${directoryIdentity ?? "missing"})`)
-        if (!repositoryIdentity) failures.push(`repository identity for ${delegation.source_directory} is invalid`)
+        if (!repositoryIdentity) failures.push(`project identity or write-directory association for ${delegation.source_directory} is invalid`)
         if (workdirIdentity !== origin?.directoryIdentity) failures.push(`workdir ${origin?.workdir} missing or replaced (expected dev:ino ${origin?.directoryIdentity}, found ${workdirIdentity ?? "missing"})`)
         if (!origin) failures.push(`launch for session ${delegation.origin_id} no longer exists`)
         if (origin && origin.sessionID !== delegation.origin_id) failures.push(`launch session does not match ${delegation.origin_id}`)
