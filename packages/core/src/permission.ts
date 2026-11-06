@@ -600,7 +600,10 @@ const layer = Layer.effect(
         if (allowed) return { effect: "allow" as const, rules: all }
         return {
           effect: "deny" as const,
-          message: `Permission ${input.action} needs approval, and nobody is present to give it`,
+          message: [
+            `Permission ${input.action} needs approval, and nobody is present to give it`,
+            reviewed?.event.effect === "ask" ? (reviewed.event.message ?? event.message) : event.message,
+          ].filter(Boolean).join(". "),
           rules: all,
           reason,
           staleReasons,

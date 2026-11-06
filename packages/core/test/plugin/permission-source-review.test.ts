@@ -400,7 +400,7 @@ for (const change of ["failed-replacement", "tightening"] as const) {
 // permission service, enrolment, session services and hook chain are the real ones. Skipped when unset.
 const lunaModule = process.env.OPENCODE_LUNA_REVIEWER_MODULE
 // The script is inlined in the module source: the host's config service is already loaded, so new options would not apply.
-const contextualWrapper = (script: unknown) => `import Real from "./real/index.ts"
+const contextualWrapper = (script: unknown, humanReview = "deny") => `import Real from "./real/index.ts"
 const LUNA = { id: "gpt-6-luna", modelID: "gpt-6-luna", providerID: "openai" }
 const SOL = { id: "gpt-6.1-sol", modelID: "gpt-6.1-sol", providerID: "openai" }
 export default {
@@ -411,10 +411,14 @@ export default {
     return Real.setup({
       permission: ctx.permission, session: ctx.session, location: ctx.location, tool: ctx.tool,
       options: { mode: "enforce", model: "openai/gpt-6-luna", policy: "exceptional-risk-only-v1", automatic_allow: "policy-gated",
-        automatic_rewrite: "once-per-turn", human_review: "deny", standing_rules_file: "" },
+        automatic_rewrite: "once-per-turn", human_review: ${JSON.stringify(humanReview)}, standing_rules_file: "" },
       model: { list: async () => ({ data: [LUNA, SOL] }) },
-      generate: { text: async ({ model }) => {
-        if (model.id === LUNA.id) { calls.luna++; return { text: JSON.stringify(script.luna) } }
+      generate: { text: async ({ model, responseSchema }) => {
+        if (model.id === LUNA.id) {
+          calls.luna++
+          const value = script.luna.outcome ? { decision: [script.luna.outcome, script.luna.reason_code, script.luna.safer_alternative].join(":") } : script.luna
+          return { responseSchemaName: responseSchema?.name, text: JSON.stringify(value) }
+        }
         calls.sol++
         if (script.sol === "fail") throw new Error("contextual model unavailable")
         return { text: JSON.stringify({ decision: script.sol }) }
@@ -423,7 +427,7 @@ export default {
   },
 }`
 const contextualCalls = () => (globalThis as unknown as { __contextualCalls: { luna: number; sol: number } }).__contextualCalls
-const installContextual = (script: unknown) =>
+const installContextual = (script: unknown, humanReview = "deny") =>
   Effect.gen(function* () {
     const global = yield* Global.Service
     yield* Effect.promise(async () => {
@@ -432,7 +436,7 @@ const installContextual = (script: unknown) =>
       for (const file of await readdir(lunaModule!))
         if (file.endsWith(".ts") && !file.endsWith(".test.ts") && file !== "test-setup.ts")
           await Bun.write(path.join(target, "real", file), Bun.file(path.join(lunaModule!, file)))
-      await Bun.write(path.join(target, "index.ts"), contextualWrapper(script))
+      await Bun.write(path.join(target, "index.ts"), contextualWrapper(script, humanReview))
     })
     const plugins = yield* Plugin.Service
     yield* plugins.activate([yield* loadGeneration()])
@@ -441,10 +445,71 @@ const boundRead = {
   metadata: { action: { identity: "read", complete: true, arguments: { path: "/synthetic" }, cwd: "/project" } },
   source: { type: "tool" as const, messageID: "msg_fixture", id: "call_fixture" },
 }
+it.live("unattended delegated messages use ordinary source precedence and fallbacks", () =>
+  inInstance(() => Effect.gen(function* () {
+    const global = yield* Global.Service
+    const plugins = yield* Plugin.Service
+    const permission = yield* Permission.Service
+    for (const [target, source, selected] of [
+      ["target explanation", "source explanation", "source explanation"],
+      ["target explanation", undefined, "target explanation"],
+      ["target explanation", "", ""],
+      [undefined, undefined, undefined],
+    ]) {
+      yield* Effect.promise(() => Bun.write(path.join(global.config, "plugins/luna-permission-reviewer/index.ts"), `export default {
+        id: "opencode-luna-permission-reviewer",
+        async setup(ctx) {
+          let calls = 0
+          await ctx.permission.hook("evaluate", event => {
+            event.message = (++calls % 2 ? ${JSON.stringify(target)} : ${JSON.stringify(source)})
+          })
+        }
+      }`))
+      yield* plugins.activate([yield* loadGeneration()])
+      const ordinary = yield* permission.ask(assertion())
+      expect(ordinary.effect).toBe("ask")
+      const [request] = yield* permission.list()
+      expect(request?.message).toBe(selected)
+      yield* permission.reply({ requestID: ordinary.id, reply: "reject" })
+      const blocked = yield* permission.assert(assertion()).pipe(
+        Effect.provideService(Permission.Unattended, []), Effect.flip,
+      )
+      expect(blocked).toBeInstanceOf(Permission.BlockedError)
+      expect(blocked.message).toBe([
+        "Permission read needs approval, and nobody is present to give it", selected,
+      ].filter(Boolean).join(". "))
+      expect(yield* permission.list()).toEqual([])
+    }
+  })),
+)
 const humanReview = { outcome: "human_review", reason_code: "comparable_exceptional_harm", safer_alternative: "request_specific_authorisation" }
 const rewrite = { outcome: "rewrite", reason_code: "destructive_or_irreversible", safer_alternative: "use_dry_run" }
 
 if (lunaModule) {
+  it.live("actual module: unattended human review retains the blocker without a pending request", () =>
+    inInstance(() => Effect.gen(function* () {
+      yield* installContextual({ luna: { decision: "human_review:high_impact_identity_auth_or_security_change:request_specific_authorisation" }, sol: "fail" }, "ask")
+      const permission = yield* Permission.Service
+      const blocked = yield* permission.assert(assertion(boundRead)).pipe(
+        Effect.provideService(Permission.Unattended, []), Effect.flip,
+      )
+      expect(blocked).toBeInstanceOf(Permission.BlockedError)
+      expect(blocked.message).toContain("nobody is present to give it")
+      expect(blocked.message).toContain("Permission blocker: Marc's review is required")
+      expect(blocked.message).toContain("parent/controller")
+      expect(yield* permission.list()).toEqual([])
+      const { db } = yield* Database.Service
+      yield* db.update(SessionTable)
+        .set({ permission: [{ action: "read", resource: "*", effect: "deny" }] })
+        .where(eq(SessionTable.id, Session.ID.make("ses_test"))).run().pipe(Effect.orDie)
+      const hard = yield* permission.assert(assertion(boundRead)).pipe(
+        Effect.provideService(Permission.Unattended, []), Effect.flip,
+      )
+      expect(hard).toBeInstanceOf(Permission.BlockedError)
+      expect(hard.message).not.toContain("Permission blocker: Marc's review is required")
+      expect(yield* permission.list()).toEqual([])
+    })),
+  )
   it.live("actual module: a rewrite whose contextual review fails waits as an ordinary ask that a human reply settles", () =>
     inInstance(() => Effect.gen(function* () {
       yield* installContextual({ luna: rewrite, sol: "fail" })
