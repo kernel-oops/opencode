@@ -53,7 +53,7 @@ export const Plugin = {
       ctx.event,
       Effect.andThen(ctx.tool.reload(), ctx.command.reload()),
     )
-    const enabled = () => Config.latest(loaded.entries, "experimental")?.schedules === true
+    const enabled = () => Config.experimental(loaded.entries, "schedules") === true
 
     // A request keeps the tools it started with after config reloads, so each call rechecks the flag.
     const allowed = (sessionID: Session.ID) =>

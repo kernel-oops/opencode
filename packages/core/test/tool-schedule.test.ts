@@ -76,7 +76,7 @@ const memory = () => {
   return { rows, flag, service }
 }
 
-const setup = (experimental: ConfigExperimental.Info | undefined) =>
+const setup = (experimental: ConfigExperimental.Info | undefined, later: Entry[] = []) =>
   Effect.gen(function* () {
     const schedules = memory()
     const commands: CommandDefinition[] = []
@@ -94,7 +94,7 @@ const setup = (experimental: ConfigExperimental.Info | undefined) =>
       },
       session: { prompt: (input) => Effect.sync(() => prompts.push(input)).pipe(Effect.as(undefined as never)) },
     }).pipe(
-      Effect.provide(Layer.mock(Config.Service)({ entries: () => Effect.succeed([document(experimental)]) })),
+      Effect.provide(Layer.mock(Config.Service)({ entries: () => Effect.succeed([document(experimental), ...later]) })),
       Effect.provide(Layer.succeed(Schedule.Service, schedules.service)),
       Effect.provide(permissionLayer({ assert: () => Effect.void })),
     )
@@ -149,6 +149,22 @@ describe("ScheduleTools", () => {
       expect(yield* paths(off.registry)).not.toContain(names[0])
       expect(off.commands).toEqual([])
       const on = yield* setup(new ConfigExperimental.Info({ schedules: true }))
+      expect(yield* paths(on.registry)).toEqual(expect.arrayContaining(names))
+      expect(on.commands.map((command) => command.name)).toEqual(["schedule"])
+    }),
+  )
+
+  it.effect("stay exposed when a later document's experimental block omits schedules", () =>
+    Effect.gen(function* () {
+      // A later document that sets the flag itself still wins.
+      const off = yield* setup(new ConfigExperimental.Info({ schedules: true }), [
+        document(new ConfigExperimental.Info({ schedules: false })),
+      ])
+      expect(yield* paths(off.registry)).not.toContain(names[0])
+      expect(off.commands).toEqual([])
+      // The live shape: opencode.json enables schedules, OPENCODE_CONFIG_CONTENT sets only other experimental flags.
+      const content = document(new ConfigExperimental.Info({ subagent_depth: 2 }))
+      const on = yield* setup(new ConfigExperimental.Info({ schedules: true }), [content])
       expect(yield* paths(on.registry)).toEqual(expect.arrayContaining(names))
       expect(on.commands.map((command) => command.name)).toEqual(["schedule"])
     }),

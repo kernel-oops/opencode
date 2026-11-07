@@ -67,10 +67,11 @@ export const Plugin = define({
           .pipe(Effect.orElseSucceed(() => []))
         if (!isCallbackTurn(recent)) return
         const session = yield* sessions.get(event.sessionID).pipe(Effect.orElseSucceed(() => undefined))
-        const experimental = Config.latest(yield* config.entries(), "experimental")
-        const eligible = new Set(experimental?.task_continuation_eligible ?? DEFAULT_ELIGIBLE)
+        const entries = yield* config.entries()
+        const eligible = new Set(Config.experimental(entries, "task_continuation_eligible") ?? DEFAULT_ELIGIBLE)
         const allowed = continuationAgents(
-          experimental?.task_continuation_agents ?? parseEnvironment(process.env.OPENCODE_TASK_CONTINUATION_AGENTS),
+          Config.experimental(entries, "task_continuation_agents") ??
+            parseEnvironment(process.env.OPENCODE_TASK_CONTINUATION_AGENTS),
           eligible,
         )
         // Only a root controller may continue; nested controllers stay report-only.

@@ -264,7 +264,7 @@ const layer = Layer.effect(
 
     const isEnabled = Effect.fn("Artifact.enabled")(function* () {
       const entries = yield* config.entries()
-      return Config.latest(entries, "experimental")?.artifacts === true
+      return Config.experimental(entries, "artifacts") === true
     })
 
     const requireEnabled = () =>

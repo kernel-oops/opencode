@@ -30,6 +30,19 @@ export function latest<K extends keyof Info>(entries: readonly Entry[], key: K):
     ?.info[key]
 }
 
+type Experimental = NonNullable<Info["experimental"]>
+
+/** Each experimental flag comes from the highest-priority document that sets it, so a later document's
+ * experimental block (such as OPENCODE_CONFIG_CONTENT) does not hide flags it leaves out. */
+export function experimental<K extends keyof Experimental>(
+  entries: readonly Entry[],
+  key: K,
+): Experimental[K] | undefined {
+  return entries.findLast(
+    (entry): entry is Document => entry.type === "document" && entry.info.experimental?.[key] !== undefined,
+  )?.info.experimental?.[key]
+}
+
 export interface Interface {
   /** Returns location config documents and discovery sources from lowest to highest priority. */
   readonly entries: () => Effect.Effect<Entry[]>

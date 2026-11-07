@@ -81,6 +81,11 @@ const enabledEntries = [
       experimental: new ConfigExperimental.Info({ schedules: true }),
     }),
   }),
+  // A later document setting only other experimental flags (as OPENCODE_CONFIG_CONTENT does live) must not hide it.
+  new Document({
+    type: "document",
+    info: new Info({ experimental: new ConfigExperimental.Info({ subagent_depth: 2 }) }),
+  }),
 ]
 const disabledEntries = [
   new Document({
