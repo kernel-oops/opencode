@@ -12,9 +12,18 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
   name: "Data",
   init: (props: { directory: string }) => {
     const client = useClient()
+    // Task observations fence stale replies by client identity.
+    let source = client.api
+    let media = withMediaRefs(source)
     const data = createData({
       // Only the transcript store reads stored media as `media:<hash>` refs; plugins and other callers keep inline bytes.
-      api: () => withMediaRefs(client.api),
+      api: () => {
+        if (source !== client.api) {
+          source = client.api
+          media = withMediaRefs(source)
+        }
+        return media
+      },
       event: client.event,
       connection: client.connection,
       directory: props.directory,
