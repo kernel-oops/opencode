@@ -21,11 +21,18 @@ test("a paused controller appears in the row and palette through the real TUI da
   const sessionID = "ses_paused"
   const events = createEventStream()
   const status = Promise.withResolvers<Response>()
-  const calls = createFetch((url) => url.pathname === `/api/session/${sessionID}/task`
-    ? status.promise : undefined, events)
+  const calls = createFetch(
+    (url) => (url.pathname === `/api/session/${sessionID}/task` ? status.promise : undefined),
+    events,
+  )
   const nextEvents = createEventStream()
-  const nextCalls = createFetch((url) => url.pathname === `/api/session/${sessionID}/task`
-    ? json({ paused: false, active: true, background: [] }) : undefined, nextEvents)
+  const nextCalls = createFetch(
+    (url) =>
+      url.pathname === `/api/session/${sessionID}/task`
+        ? json({ paused: false, active: true, background: [] })
+        : undefined,
+    nextEvents,
+  )
   const nextApi = createApi(nextCalls.fetch)
   const ready = Promise.withResolvers<void>()
   let data!: ReturnType<typeof useData>
@@ -44,23 +51,33 @@ test("a paused controller appears in the row and palette through the real TUI da
     return <TaskControls controls={controls} />
   }
 
-  const app = await testRender(() => (
-    <TestTuiContexts>
-      <ConfigProvider config={createTuiResolvedConfig()}>
-        <Keymap.Provider>
-          <ClientProvider api={createApi(calls.fetch)} service={{ reconnect: async () => ({ api: nextApi }), restart: async () => {} }}>
-            <DataProvider directory="/project">
-              <RouteProvider initialRoute={{ type: "session", sessionID }}>
-                <ThemeProvider mode="dark" source={emptyThemeSource}>
-                  <ToastProvider><DialogProvider><Content /></DialogProvider></ToastProvider>
-                </ThemeProvider>
-              </RouteProvider>
-            </DataProvider>
-          </ClientProvider>
-        </Keymap.Provider>
-      </ConfigProvider>
-    </TestTuiContexts>
-  ), { width: 120, height: 24, kittyKeyboard: true })
+  const app = await testRender(
+    () => (
+      <TestTuiContexts>
+        <ConfigProvider config={createTuiResolvedConfig()}>
+          <Keymap.Provider>
+            <ClientProvider
+              api={createApi(calls.fetch)}
+              service={{ reconnect: async () => ({ api: nextApi }), restart: async () => {} }}
+            >
+              <DataProvider directory="/project">
+                <RouteProvider initialRoute={{ type: "session", sessionID }}>
+                  <ThemeProvider mode="dark" source={emptyThemeSource}>
+                    <ToastProvider>
+                      <DialogProvider>
+                        <Content />
+                      </DialogProvider>
+                    </ToastProvider>
+                  </ThemeProvider>
+                </RouteProvider>
+              </DataProvider>
+            </ClientProvider>
+          </Keymap.Provider>
+        </ConfigProvider>
+      </TestTuiContexts>
+    ),
+    { width: 120, height: 24, kittyKeyboard: true },
+  )
   try {
     await ready.promise
     const pending = data.session.task.sync(sessionID)
