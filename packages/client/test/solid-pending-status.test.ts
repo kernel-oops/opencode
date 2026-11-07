@@ -43,6 +43,15 @@ function fixture() {
       dispose,
       enqueue: (id: string, delivery: "steer" | "queue" = "steer") =>
         emit("session.inbox.enqueued", { inboxID: id, item: { type: "user", delivery, payload: { text: id } } }),
+      completion: (id: string) =>
+        emit("session.inbox.enqueued", {
+          inboxID: id,
+          item: {
+            type: "synthetic",
+            delivery: "steer",
+            payload: { text: "review", metadata: { source: "subagent", state: "completed" } },
+          },
+        }),
       deliver: (id: string) => emit("session.inbox.delivered", { inboxID: id }),
       started: () => emit("session.execution.started"),
       settled: (outcome: "succeeded" | "failed" | "interrupted") =>
@@ -60,6 +69,28 @@ function fixture() {
     }
   })
 }
+
+test("a finished child remains pending until its inbox delivery event", () => {
+  const setup = fixture()
+  try {
+    setup.completion("msg_report")
+    expect(setup.data.session.pending.list(sessionID).map((item) => item.id)).toEqual(["msg_report"])
+    expect(setup.data.session.message.get(sessionID, "msg_report")).toMatchObject({
+      type: "synthetic",
+      text: "review",
+    })
+    setup.started()
+    expect(setup.data.session.pending.list(sessionID)).toHaveLength(1)
+    setup.deliver("msg_report")
+    expect(setup.data.session.pending.list(sessionID)).toEqual([])
+    expect(setup.data.session.message.get(sessionID, "msg_report")).toMatchObject({
+      type: "synthetic",
+      text: "review",
+    })
+  } finally {
+    setup.dispose()
+  }
+})
 
 test("an idle send is starting from optimistic admission until delivery", async () => {
   const setup = fixture()

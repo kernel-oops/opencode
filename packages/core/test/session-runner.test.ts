@@ -5307,6 +5307,71 @@ describe("SessionRunnerLLM", () => {
     })
   }
 
+  scenario("native completion wakes an idle parent and promotes exactly once", function* (s) {
+    const jobs = yield* Job.Service
+    const notificationID = SessionMessage.ID.create()
+    const recovery = {
+      kind: "subagent" as const,
+      parentSessionID: sessionID,
+      childSessionID: otherSessionID,
+      agent: "reviewer",
+      description: "review",
+    }
+    yield* s.llm.push(TestLLM.text("Handled", "completion-handled"))
+    const completion = { status: "completed" as const, output: "Review ready", notificationID, recovery }
+    yield* SubagentCompletion.deliver(s.session, jobs, completion)
+    yield* s.session.wait(sessionID)
+    expect(yield* s.inbox).toEqual([])
+    expect((yield* s.context).filter((message) => message.type === "synthetic")).toMatchObject([
+      { id: notificationID, metadata: { source: "subagent", childID: otherSessionID, state: "completed" } },
+    ])
+    expect(s.requests).toHaveLength(1)
+    expect(userTexts(s.requests[0]).some((text) => text.includes("Review ready"))).toBe(true)
+    yield* SubagentCompletion.deliver(s.session, jobs, completion)
+    yield* s.session.wait(sessionID)
+    expect((yield* s.context).filter((message) => message.type === "synthetic")).toHaveLength(1)
+  })
+
+  scenario("native completion burst stays pending during a tool and promotes together at its boundary", function* (s) {
+    const jobs = yield* Job.Service
+    const tools = yield* s.blockTools()
+    yield* s.admit("Run a tool")
+    yield* s.llm.push(TestLLM.toolCall("owned", "echo", { text: "owned" }), TestLLM.text("Handled", "handled"))
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* tools.started
+    const ids = [SessionMessage.ID.create(), SessionMessage.ID.create(), SessionMessage.ID.create()]
+    for (const [index, status] of (["completed", "error", "cancelled"] as const).entries()) {
+      yield* SubagentCompletion.deliver(s.session, jobs, {
+        status,
+        output: "done",
+        error: "failed",
+        notificationID: ids[index],
+        recovery: {
+          kind: "subagent",
+          parentSessionID: sessionID,
+          childSessionID: otherSessionID,
+          agent: "reviewer",
+          description: status,
+        },
+      })
+    }
+    expect((yield* s.inbox).map((item) => item.id)).toEqual(ids)
+    expect((yield* s.context).filter((message) => message.type === "synthetic")).toEqual([])
+    expect(s.requests).toHaveLength(1)
+    yield* tools.release
+    yield* Fiber.join(run)
+    expect(yield* s.inbox).toEqual([])
+    expect((yield* s.context).filter((message) => message.type === "synthetic").map((message) => message.id)).toEqual(
+      ids,
+    )
+    expect(s.requests).toHaveLength(2)
+    const texts = userTexts(s.requests[1])
+    expect(texts.some((text) => text.includes('state="completed"'))).toBe(true)
+    expect(texts.some((text) => text.includes('state="error"'))).toBe(true)
+    expect(texts.some((text) => text.includes('state="cancelled"'))).toBe(true)
+    expect(s.executions).toEqual(["owned"])
+  })
+
   scenario("steering preserves already-owned tools and the generation until ordinary settlement", function* (s) {
     const cancelled = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
