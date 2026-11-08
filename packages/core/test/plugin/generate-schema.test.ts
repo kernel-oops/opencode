@@ -26,7 +26,7 @@ const it = testEffect(makePluginTestLayer(undefined, generate))
 
 it.live("native schema request and acknowledgement survive the Effect host and Promise codecs", () =>
   Effect.gen(function* () {
-    const host = yield* PluginHost.make(yield* Plugin.Service)
+    const host = yield* PluginHost.make(yield* Plugin.Service, "test")
     yield* PluginPromise.fromPromise({
       id: "schema-receipt",
       async setup(context) {

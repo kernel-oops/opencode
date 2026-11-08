@@ -102,7 +102,6 @@ export const Plugin = {
           output: Output,
           execute: (input, context) =>
             Effect.gen(function* () {
-              const source = { type: "tool" as const, messageID: context.messageID, id: context.id }
               const initial = yield* access.resolve({ path: input.path ?? "." })
 
               // A root-owned ancestor alias (a home directory mounted elsewhere) is reviewed by its canonical name.
@@ -231,9 +230,7 @@ export const Plugin = {
                           complete: Boolean(boundArguments),
                         }),
                       },
-                      sessionID: context.sessionID,
-                      agent: context.agent,
-                      source,
+                      ...Permission.invocation(context),
                     })
                     const verifyBindings = Effect.gen(function* () {
                       yield* BoundExternal.verify(bindings.scope).pipe(Effect.mapError(pinnedFailure))

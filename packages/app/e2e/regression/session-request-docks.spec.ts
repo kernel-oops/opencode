@@ -1,6 +1,6 @@
 import type { OpenCodeEvent } from "@opencode/client/promise"
 import { expect, test, type Page } from "@playwright/test"
-import { SERVER, sessionHref } from "../utils/app"
+import { SERVER, holdRoute, sessionHref } from "../utils/app"
 import { installSseTransport } from "../utils/sse-transport"
 import { expectSessionTitle } from "../utils/waits"
 import { mockWorkspace, type WorkspaceInput } from "../utils/workspace"
@@ -171,6 +171,80 @@ test("replies with predefined choices and the edited custom multiselect answer",
   expect(cancellations).toEqual([])
 })
 
+test("keeps a choice when a custom answer with its value is turned off, and replies once", async ({ page }) => {
+  const form = {
+    id: "frm_question_once",
+    sessionID,
+    title: "Questions",
+    metadata: { kind: "question" },
+    fields: [
+      {
+        key: "q0",
+        type: "multiselect",
+        title: "Include",
+        description: "Which supporting surfaces should remain visible?",
+        options: [
+          { value: "files", label: "Changed files" },
+          { value: "terminal", label: "Terminal" },
+        ],
+        custom: true,
+      },
+    ],
+  }
+
+  const replies: unknown[] = []
+  const transport = await installSseTransport(page, { server: SERVER, retry: 20 })
+  await mockServer(page, { forms: () => (replies.length > 0 ? [] : [form]) })
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === `/api/session/${sessionID}/form/frm_question_once/reply`
+    )
+      replies.push(request.postDataJSON())
+  })
+  await page.goto(sessionHref(sessionID))
+  await transport.waitForConnection()
+  await expectSessionTitle(page, title)
+
+  const question = page.locator('[data-component="dock-prompt"][data-kind="question"]')
+  const files = question.getByRole("checkbox", { name: "Changed files", exact: true })
+  const custom = question.getByRole("checkbox", { name: "Type your own answer…", exact: true })
+  const input = question.getByRole("textbox", { name: "Type your own answer…", exact: true })
+  const submit = question.getByRole("button", { name: "Submit", exact: true })
+  const dismiss = question.getByRole("button", { name: "Dismiss", exact: true })
+
+  await files.click()
+  await input.fill("files")
+  await expect(custom).toBeChecked()
+  await custom.click()
+  await expect(custom).not.toBeChecked()
+  await expect(files).toBeChecked()
+
+  const reply = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === `/api/session/${sessionID}/form/frm_question_once/reply`,
+  )
+
+  await submit.click()
+  expect((await reply).request().postDataJSON()).toEqual({ answer: { q0: ["files"] } })
+
+  // The server has the answer but has not announced the form settled yet, so nothing can send it again.
+  await expect(submit).toBeDisabled()
+  await expect(dismiss).toBeDisabled()
+  await expect(files).toHaveAttribute("aria-disabled", "true")
+
+  await transport.send({
+    id: "evt_form_replied_once",
+    created: 1700000003000,
+    type: "form.replied",
+    location: { directory },
+    data: { sessionID, id: "frm_question_once", answer: { q0: ["files"] } },
+  })
+  await expect(question).toHaveCount(0)
+  expect(replies).toEqual([{ answer: { q0: ["files"] } }])
+})
+
 test("shows a pending permission dock", async ({ page }) => {
   const replies: { sessionID: string; permissionID: string; body: unknown }[] = []
   await mockServer(page, {
@@ -209,6 +283,213 @@ test("shows a pending permission dock", async ({ page }) => {
   expect(replies).toEqual([{ sessionID, permissionID: "permission-request", body: { decision: "once" } }])
   await expect(permission).toHaveCount(0)
   await expect(page.locator('[data-component="composer"]')).toBeVisible()
+})
+
+test("sends one permission reply and closes the dock when it lands, before permission.replied", async ({ page }) => {
+  await mockServer(page, {
+    sessionPermissions: {
+      [sessionID]: [
+        // A save scope, so all three actions are offered and each must lock while the reply is in flight.
+        { id: "permission-request", sessionID, action: "shell", resources: ["git status"], save: ["git status"] },
+      ],
+    },
+  })
+  const replies: unknown[] = []
+  const released = Promise.withResolvers<void>()
+  // Answers without the `permission.replied` event the server also publishes, so only the reply can close the dock.
+  await page.route(/\/api\/session\/ses_request_docks\/permission\/permission-request\/reply/, async (route) => {
+    if (route.request().method() !== "POST") return route.fallback()
+    replies.push(route.request().postDataJSON())
+    await released.promise
+    await route.fulfill({ status: 204 })
+  })
+
+  await page.goto(sessionHref(sessionID))
+  await expectSessionTitle(page, title)
+
+  const permission = page.locator('[data-component="dock-prompt"][data-kind="permission"]')
+  const actions = permission.locator('[data-slot="permission-footer-actions"]')
+  await permission.getByRole("button", { name: "Allow once" }).dblclick()
+  await expect.poll(() => replies.length).toBe(1)
+
+  for (const name of ["Deny", "Allow always", "Allow once"])
+    await expect(actions.getByRole("button", { name, exact: true })).toBeDisabled()
+
+  released.resolve()
+  await expect(permission).toHaveCount(0)
+  await expect(page.locator('[data-component="composer"]')).toBeVisible()
+  await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0)
+  expect(replies).toEqual([{ decision: "once" }])
+})
+
+test("shows an auto-accepted permission in the dock once its replies stop answering", async ({ page }) => {
+  const permissionID = "permission-hung"
+  const attempts = { count: 0 }
+  await page.clock.install()
+  await mockWorkspace(page, {
+    name: "RequestDocks",
+    directory,
+    sessions: [{ id: sessionID, title }],
+    sessionPermissions: {
+      [sessionID]: [
+        { id: permissionID, sessionID, action: "shell", resources: ["git status"], metadata: {}, save: [] },
+      ],
+    },
+    seed: { settings: { permissions: { autoApprove: true } } },
+  })
+  // Every reply reaches the server and never answers.
+  await page.route(new RegExp(`/api/session/${sessionID}/permission/${permissionID}/reply(\\?|$)`), (route) => {
+    if (route.request().method() !== "POST") return route.fallback()
+    attempts.count++
+  })
+
+  await page.goto(sessionHref(sessionID))
+  await expectSessionTitle(page, title)
+  const permission = page.locator('[data-component="dock-prompt"][data-kind="permission"]')
+
+  // Each reply times out, then the next one starts after its retry delay.
+  await expect.poll(() => attempts.count).toBe(1)
+  await page.clock.fastForward(15_000)
+  await page.clock.fastForward(1_000)
+  await expect.poll(() => attempts.count).toBe(2)
+  await page.clock.fastForward(15_000)
+  await page.clock.fastForward(2_000)
+  await expect.poll(() => attempts.count).toBe(3)
+  await expect(permission).toHaveCount(0)
+
+  await page.clock.fastForward(15_000)
+  await expect(permission.getByText("git status")).toBeVisible()
+  expect(attempts.count).toBe(3)
+})
+
+test("keeps a typed MCP elicitation answer across a session switch and submits it once", async ({ page }) => {
+  const other = { id: "ses_request_docks_other", title: "Other request session" }
+
+  const form = {
+    id: "frm_mcp_draft",
+    sessionID,
+    title: "Deploy",
+    metadata: { kind: "mcp-elicitation", server: "release" },
+    fields: [{ key: "env", type: "string", title: "Environment" }],
+  }
+
+  const replies: unknown[] = []
+  await mockWorkspace(page, {
+    name: "RequestDocks",
+    directory,
+    sessions: [{ id: sessionID, title }, other],
+    forms: () => (replies.length > 0 ? [] : [form]),
+    onFormReply: (reply) => replies.push(reply.body),
+    seed: { tabs: [sessionID, other.id] },
+  })
+
+  await page.goto(sessionHref(sessionID))
+  await expectSessionTitle(page, title)
+  const dock = page.locator('[data-component="session-elicitation-dock"]')
+  const input = dock.getByRole("textbox", { name: "Environment", exact: true })
+  await input.fill("staging")
+
+  await page.locator(`[data-titlebar-tab-slot]:has(a[href="${sessionHref(other.id)}"])`).click()
+  await expectSessionTitle(page, other.title)
+  await expect(dock).toHaveCount(0)
+  await page.locator(`[data-titlebar-tab-slot]:has(a[href="${sessionHref(sessionID)}"])`).click()
+  await expectSessionTitle(page, title)
+  await expect(input).toHaveValue("staging")
+
+  await dock.getByRole("button", { name: "Submit", exact: true }).dblclick()
+  await expect(dock).toHaveCount(0)
+  await expect(page.locator('[data-component="composer"]')).toBeVisible()
+  expect(replies).toEqual([{ answer: { env: "staging" } }])
+})
+
+test("gives a Location elicitation's hung reply back after 30 s and closes it on form.replied", async ({ page }) => {
+  const form = {
+    id: "frm_mcp_global",
+    sessionID: "global",
+    title: "Deploy",
+    metadata: { kind: "mcp-elicitation", server: "release" },
+    fields: [{ key: "env", type: "string", title: "Environment" }],
+  }
+
+  const replies: { body: unknown; directory: string | undefined }[] = []
+  const transport = await installSseTransport(page, { server: SERVER, retry: 20 })
+  await page.clock.install()
+  await mockServer(page, { forms: [form] })
+  // The server takes the reply and never answers it.
+  await page.route(/\/api\/session\/global\/form\/frm_mcp_global\/reply(\?|$)/, (route) => {
+    if (route.request().method() !== "POST") return route.fallback()
+    replies.push({ body: route.request().postDataJSON(), directory: route.request().headers()["x-opencode-directory"] })
+  })
+
+  await page.goto(sessionHref(sessionID))
+  await transport.waitForConnection()
+  await expectSessionTitle(page, title)
+  const dock = page.locator('[data-component="session-elicitation-dock"]')
+  const input = dock.getByRole("textbox", { name: "Environment", exact: true })
+  const submit = dock.getByRole("button", { name: "Submit", exact: true })
+  await input.fill("prod")
+
+  await submit.dblclick()
+  await expect.poll(() => replies.length).toBe(1)
+  await expect(submit).toBeDisabled()
+  expect(replies).toEqual([{ body: { answer: { env: "prod" } }, directory: encodeURIComponent(directory) }])
+
+  await page.clock.fastForward(30_000)
+  await expect(submit).toBeEnabled()
+  await expect(input).toHaveValue("prod")
+  await expect(page.getByText("Request failed", { exact: true })).toBeVisible()
+
+  await transport.send({
+    id: "evt_form_replied_global",
+    created: 1700000004000,
+    type: "form.replied",
+    location: { directory },
+    data: { sessionID: "global", id: "frm_mcp_global", answer: { env: "prod" } },
+  })
+  await expect(dock).toHaveCount(0)
+  await expect(page.locator('[data-component="composer"]')).toBeVisible()
+  expect(replies).toHaveLength(1)
+})
+
+test("names the MCP tool, the hook's message and the masked full input in the permission dock", async ({ page }) => {
+  const body = "x".repeat(3000)
+  const secret = "sk-live-e2e-not-shown"
+  await mockServer(page, {
+    sessionPermissions: {
+      [sessionID]: [
+        {
+          id: "permission-request",
+          sessionID,
+          action: "linear_save_comment",
+          resources: ["*"],
+          save: ["*"],
+          metadata: { input: { issueId: "ENG-1", labels: ["bug"], body, apiToken: secret, auth: `Bearer ${secret}` } },
+          message: "Posts a comment on a Linear issue",
+        },
+      ],
+    },
+  })
+
+  await page.goto(sessionHref(sessionID))
+  await expectSessionTitle(page, title)
+
+  const permission = page.locator('[data-component="dock-prompt"][data-kind="permission"]')
+  // The fork renders arguments through the masked ReviewApproval.display JSON, not upstream's plain key: value list.
+  const input = permission.locator("pre")
+  const scroller = input.locator("xpath=..")
+  await expect(permission.getByText("linear_save_comment")).toBeVisible()
+  await expect(permission.getByText("Posts a comment on a Linear issue")).toBeVisible()
+  await expect(input).toContainText('"issueId": "ENG-1"')
+  await expect(input).toContainText('"labels": [')
+  await expect(input).toContainText('"bug"')
+  await expect(input).toContainText('"apiToken": "[REDACTED]"')
+  await expect(input).toContainText('"auth": "Bearer [REDACTED]"')
+  await expect(permission).not.toContainText(secret)
+  // The user approves these arguments, so a long one stays whole and scrolls inside the dock instead of being cut
+  await expect(input).toContainText(`"body": "${body}"`)
+  await expect.poll(() => scroller.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true)
+  // "Allow always" saves the wildcard, so its scope stays visible next to this call's input
+  await expect(permission.locator('[data-slot="permission-patterns"]').getByText("*", { exact: true })).toBeVisible()
 })
 
 test("loads a running subagent's question without polling idle subagents on every update", async ({ page }) => {
@@ -347,7 +628,11 @@ const childID = "ses_request_docks_child"
 
 const otherRootID = "ses_request_docks_other"
 
-const permissionDock = (page: Page) => page.locator('[data-component="dock-prompt"][data-kind="permission"]')
+// A face leaving the composer morph keeps rendering its last dock, aria-hidden and inert, until its box closes.
+const permissionDock = (page: Page) =>
+  page
+    .locator('[data-slot="composer-face"]:not([aria-hidden="true"])')
+    .locator('[data-component="dock-prompt"][data-kind="permission"]')
 
 const permissionReply = (page: Page) =>
   page.waitForResponse((response) => response.request().method() === "POST" && response.url().includes("/permission/"))
@@ -429,11 +714,15 @@ test("a child request pending before the parent connects is shown and answered f
   expect(replies).toEqual([{ sessionID: childID, permissionID: "per_fixture", body: { decision: "review_once" } }])
 })
 
-// Records every read naming another root, which a selected-tree catch-up must never touch.
+// Records every read naming another root, which a selected-tree catch-up must never touch. The one exception is the
+// connect-time registration of a running Session this client has not loaded (#53012): the mock reports a Session with
+// a pending request as running, and that read loads only its info.
 function foreignReads(page: Page) {
   const reads: string[] = []
   page.on("request", (request) => {
-    if (request.url().includes(otherRootID)) reads.push(`${request.method()} ${new URL(request.url()).pathname}`)
+    const read = `${request.method()} ${new URL(request.url()).pathname}`
+
+    if (request.url().includes(otherRootID) && read !== `GET /api/session/${otherRootID}`) reads.push(read)
   })
 
   return reads
@@ -619,6 +908,75 @@ test("an expired manual approval reports failure and removes the request without
   await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
   expect(posts).toEqual([{ decision: "review_once" }])
 })
+
+test("a hung permission reply's own request is aborted at the timeout", async ({ page }) => {
+  await page.clock.install()
+  await mockServer(page, {
+    onPermissionReply: () => {},
+    sessionPermissions: { [sessionID]: [permissionRequest()] },
+  })
+  const held = await holdRoute(page, "**/api/session/*/permission/*/reply", { method: "POST" })
+
+  try {
+    await page.goto(sessionHref(sessionID))
+    await expectSessionTitle(page, title)
+    const dock = permissionDock(page)
+    const allow = dock.getByRole("button", { name: "Allow once", exact: true })
+    await allow.click()
+    const first = await held.arrived
+    const failed = page.waitForEvent("requestfailed", { predicate: (request) => request === first, timeout: 10_000 })
+
+    await page.clock.fastForward(15_000)
+    // The abandoned attempt's own HTTP request is cancelled, not merely ignored when it lands.
+    expect((await failed).failure()?.errorText).toBe("net::ERR_ABORTED")
+    await expect(page.getByText("Request failed", { exact: true })).toBeVisible()
+    await expect(allow).toBeEnabled()
+    expect(held.requests).toHaveLength(1)
+  } finally {
+    held.release()
+  }
+})
+
+for (const settled of ["reject", "review_once"] as const) {
+  test(`a manual approval in flight when permission.replied (${settled}) arrives closes and cancels its request`, async ({
+    page,
+  }) => {
+    const replies: unknown[] = []
+
+    const mock = await mockServer(page, {
+      onPermissionReply: (reply) => replies.push(reply),
+      sessionPermissions: { [sessionID]: [permissionRequest({ review: true })] },
+    })
+
+    const held = await holdRoute(page, "**/api/session/*/permission/*/reply", { method: "POST" })
+
+    try {
+      await page.goto(sessionHref(sessionID))
+      await expectSessionTitle(page, title)
+      const dock = permissionDock(page)
+      await dock.getByRole("button", { name: "Approve per_fixture once", exact: true }).click()
+      const request = await held.arrived
+      const failed = page.waitForEvent("requestfailed", { predicate: (item) => item === request, timeout: 10_000 })
+
+      // Expiry or another client settles the request first; the dock hides it either way.
+      await mock.push([
+        {
+          id: `evt_reply_${settled}`,
+          created: 1700000000002,
+          type: "permission.replied",
+          location: { directory: mock.directory },
+          data: { sessionID, requestID: "per_fixture", reply: settled },
+        },
+      ])
+      await expect(dock).toHaveCount(0)
+      expect((await failed).failure()?.errorText).toBe("net::ERR_ABORTED")
+      await expect(page.getByText("Request failed", { exact: true })).toHaveCount(0)
+      expect(replies).toEqual([])
+    } finally {
+      held.release()
+    }
+  })
+}
 
 test("ordinary requests show their exact masked scope and offer Allow always only with a save scope", async ({
   page,

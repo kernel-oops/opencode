@@ -25,6 +25,7 @@ export function SessionPermissionDock(props: {
 
   const toolDescription = () => {
     const key = `settings.permissions.tool.${props.request.action}.description`
+    // SAFETY: an action without a curated description returns the key itself, which the check below detects.
     const value = language.t(key as Parameters<typeof language.t>[0])
 
     if (value === key) return ""
@@ -127,7 +128,13 @@ export function SessionPermissionDock(props: {
             <div data-slot="permission-hint">{toolDescription()}</div>
           </Show>
           <pre class="text-12-regular text-text-base whitespace-pre-wrap break-all m-0">
-            {ReviewApproval.display({ resources: props.request.resources, action: props.request.metadata?.action })}
+            {/* Upstream v2.2.6 lists metadata.input (e.g. MCP tool arguments) unmasked; it goes through the masked
+                renderer here instead, inside the scroller so every argument stays reachable. */}
+            {ReviewApproval.display({
+              resources: props.request.resources,
+              action: props.request.metadata?.action,
+              input: props.request.metadata?.input,
+            })}
           </pre>
           <Show when={save().length > 0}>
             <div class="flex flex-col gap-1">

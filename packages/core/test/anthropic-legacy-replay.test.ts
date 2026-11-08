@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { DateTime, Effect } from "effect"
-import { ai } from "@opencode/ai/effect"
+import { ai, type ContentPart } from "@opencode/ai/effect"
 import { AnthropicMessages } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/testing"
 import { SessionMessage } from "@opencode/schema/session-message"
@@ -83,7 +83,7 @@ test("interrupted and cross-provider reasoning never compiles to Anthropic assis
   ]
   for (const message of cases) {
     const messages = toLLMMessages([message], ref, "anthropic")
-    const parts = messages.flatMap((item) => item.content)
+    const parts = messages.flatMap((item): ReadonlyArray<ContentPart> => item.content)
     expect(parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual(["Visible answer"])
     expect(parts.some((part) => part.type === "reasoning" && part.text === "Hidden thought")).toBe(true)
     const body: AnthropicMessages.AnthropicMessagesBody = (await compile(messages)).body

@@ -115,7 +115,7 @@ describe("SessionModelRequest HTTP hooks", () => {
     const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
     const prepared = yield* requests.primary({
       session: stored, agent: Agent.ID.make("build"), model, system: [],
-      messages: [new Message({ id: "msg_old", role: "assistant", content: [{ type: "reasoning", text: "Visible summary", providerMetadata: { test: { itemId: "rs_old", reasoningEncryptedContent: "unbound" } } }] })],
+      messages: [Message.make({ id: "msg_old", role: "assistant", content: [{ type: "reasoning", text: "Visible summary", providerMetadata: { test: { itemId: "rs_old", reasoningEncryptedContent: "unbound" } } }] })],
     })
     yield* sessions.setContextBudget({ sessionID: stored.id, contextBudget: { target: 400_000, maximum: 480_000 } })
     const error = yield* prepared.options.http!(HttpClientRequest.post("https://example.test/request").pipe(HttpClientRequest.bodyText(JSON.stringify({ max_tokens: 32_000, input: [{ type: "reasoning", id: "rs_old", summary: [], encrypted_content: "unbound" }] }))), () => Effect.die("must not dispatch")).pipe(Effect.flip)

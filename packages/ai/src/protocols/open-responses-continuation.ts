@@ -27,20 +27,15 @@ interface CheckpointValue {
  */
 export type Shape = (request: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>> | undefined
 
-export interface BaseDriver extends WebSocketChannelDriver {
-  readonly observeEvent?: (
-    create: ChannelCreate,
-    frame: string,
-    event: OpenResponses.Event,
-  ) => Effect.Effect<ChannelObservation, AIError>
-}
-
 export interface DriverInput {
   readonly id: string
   readonly name: string
   readonly request: Readonly<Record<string, unknown>>
-  readonly message: string
-  readonly base: BaseDriver
+  readonly base: (
+    create: ChannelCreate,
+    frame: string,
+    event: OpenResponses.Event,
+  ) => Effect.Effect<ChannelObservation, AIError>
   readonly continuation?: Shape
   readonly steering?: boolean
 }
@@ -197,71 +192,67 @@ export const driver = (input: DriverInput): WebSocketChannelDriver => {
           })
       : undefined,
     create: (checkpoint) =>
-      input.base.create(undefined).pipe(
-        Effect.andThen(
-          Effect.gen(function* () {
-            output = []
-            const previous = checkpointValue(checkpoint)
-            // Ask the route first: diffing the whole history is wasted when it declines the continuation.
-            const fields = previous ? shape(request) : undefined
-            const delta = previous && fields ? incremental(request, previous) : undefined
-            if (previous?.automatic && (!fields || !delta))
-              return yield* new AIError({
-                reason: new TransportError({
-                  message: "Conversation changed before the automatic steering continuation",
-                  transport: "websocket",
-                  operation: "request",
-                  recovery: "rotate-and-retry-full",
-                }),
-              })
-            if (!previous || !fields || !delta || (delta.length === 0 && previous.steer === undefined))
-              return { message: ProviderShared.encodeJson(request), mode: "full" as const }
-            const steerIndex =
-              previous.steer === undefined
-                ? -1
-                : delta.findIndex(
-                    (item) =>
-                      ProviderShared.isRecord(item) &&
-                      item.role === "user" &&
-                      Array.isArray(item.content) &&
-                      item.content.length === 1 &&
-                      ProviderShared.isRecord(item.content[0]) &&
-                      item.content[0].type === "input_text" &&
-                      item.content[0].text === previous.steer,
-                  )
-            if (previous.steer !== undefined && steerIndex === -1)
-              return yield* new AIError({
-                reason: new TransportError({
-                  message: "Accepted steering is missing from canonical history",
-                  transport: "websocket",
-                  operation: "request",
-                  recovery: "rotate-and-retry-full",
-                }),
-              })
-            const remaining = delta.filter((_, index) => index !== steerIndex)
-            if (previous.automatic) {
-              if (remaining.length > 0)
-                return yield* new AIError({
-                  reason: new TransportError({
-                    message: "New input requires a fresh request after steering",
-                    transport: "websocket",
-                    operation: "request",
-                    recovery: "rotate-and-retry-full",
-                  }),
-                })
-              return { message: "", mode: "automatic" as const }
-            }
-            return {
-              message: ProviderShared.encodeJson({
-                ...fields,
-                input: remaining,
-                previous_response_id: previous.responseID,
+      Effect.gen(function* () {
+        output = []
+        const previous = checkpointValue(checkpoint)
+        // Ask the route first: diffing the whole history is wasted when it declines the continuation.
+        const fields = previous ? shape(request) : undefined
+        const delta = previous && fields ? incremental(request, previous) : undefined
+        if (previous?.automatic && (!fields || !delta))
+          return yield* new AIError({
+            reason: new TransportError({
+              message: "Conversation changed before the automatic steering continuation",
+              transport: "websocket",
+              operation: "request",
+              recovery: "rotate-and-retry-full",
+            }),
+          })
+        if (!previous || !fields || !delta || (delta.length === 0 && previous.steer === undefined))
+          return { message: ProviderShared.encodeJson(request), mode: "full" as const }
+        const steerIndex =
+          previous.steer === undefined
+            ? -1
+            : delta.findIndex(
+                (item) =>
+                  ProviderShared.isRecord(item) &&
+                  item.role === "user" &&
+                  Array.isArray(item.content) &&
+                  item.content.length === 1 &&
+                  ProviderShared.isRecord(item.content[0]) &&
+                  item.content[0].type === "input_text" &&
+                  item.content[0].text === previous.steer,
+              )
+        if (previous.steer !== undefined && steerIndex === -1)
+          return yield* new AIError({
+            reason: new TransportError({
+              message: "Accepted steering is missing from canonical history",
+              transport: "websocket",
+              operation: "request",
+              recovery: "rotate-and-retry-full",
+            }),
+          })
+        const remaining = delta.filter((_, index) => index !== steerIndex)
+        if (previous.automatic) {
+          if (remaining.length > 0)
+            return yield* new AIError({
+              reason: new TransportError({
+                message: "New input requires a fresh request after steering",
+                transport: "websocket",
+                operation: "request",
+                recovery: "rotate-and-retry-full",
               }),
-              mode: "incremental" as const,
-            }
+            })
+          return { message: "", mode: "automatic" as const }
+        }
+        return {
+          message: ProviderShared.encodeJson({
+            ...fields,
+            input: remaining,
+            previous_response_id: previous.responseID,
           }),
-        ),
-      ),
+          mode: "incremental" as const,
+        }
+      }),
     observe: (create, frame) =>
       Effect.gen(function* () {
         const event = yield* OpenResponses.decodeChannelEvent(frame).pipe(
@@ -303,9 +294,7 @@ export const driver = (input: DriverInput): WebSocketChannelDriver => {
         }
         if (terminal && accepted && event.type === "response.created") return handoff(true, frame)
         if (event.type === "response.created") responseID = event.response?.id
-        const observation = yield* input.base.observeEvent
-          ? input.base.observeEvent(create, frame, event)
-          : input.base.observe(create, frame)
+        const observation = yield* input.base(create, frame, event)
         if (event.type === "response.output_item.done" && event.item) output.push(event.item)
         if (observation.type === "provider-failure") {
           const rejection = code(event)

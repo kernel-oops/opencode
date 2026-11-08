@@ -1951,3 +1951,47 @@ test.each([
     await server.stop(true)
   }
 })
+
+test("an aborted permission reply cancels its HTTP request and leaves the request pending", async () => {
+  const request = { id: "per_held", sessionID: "ses_permission", action: "synthetic", resources: ["/synthetic"] }
+  const arrived = Promise.withResolvers<void>()
+  const closed = Promise.withResolvers<void>()
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(incoming) {
+      if (incoming.method === "GET") return Response.json({ data: [request] })
+      arrived.resolve()
+      incoming.signal.addEventListener("abort", () => closed.resolve(), { once: true })
+      // Never answers: only the client's abort ends this request.
+      return new Promise<Response>(() => {})
+    },
+  })
+  const api = OpenCode.make({ baseUrl: `http://127.0.0.1:${server.port}` })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/synthetic",
+      event: { on: () => () => {}, listen: () => () => {} },
+    }),
+    dispose,
+  }))
+  try {
+    await setup.data.session.permission.sync(request.sessionID)
+    const controller = new AbortController()
+    const reply = setup.data.session.permission
+      .reply({ sessionID: request.sessionID, requestID: request.id, decision: "once" }, { signal: controller.signal })
+      .then(
+        () => "resolved",
+        () => "rejected",
+      )
+    await arrived.promise
+    controller.abort()
+    expect(await reply).toBe("rejected")
+    await closed.promise
+    expect(setup.data.session.permission.list(request.sessionID)).toHaveLength(1)
+  } finally {
+    setup.dispose()
+    await server.stop(true)
+  }
+})

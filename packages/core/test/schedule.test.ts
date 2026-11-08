@@ -132,7 +132,7 @@ const testEnvironment = Layer.effect(
     yield* files.mkdir(toggleDirectory).pipe(Effect.orDie)
     const spawner = ChildProcessSpawner.make((command) =>
       Effect.gen(function* () {
-        const script = command._tag === "StandardCommand" ? (command.args.at(-1) ?? command.command) : "pipeline"
+        const script = command._tag === "StandardCommand" ? String(command.args.at(-1) ?? command.command) : "pipeline"
         shellState.runs.push(script)
         if (shellState.hangMs > 0) yield* Effect.sleep(shellState.hangMs)
         const outBytes = new TextEncoder().encode(shellState.stdout)
@@ -1579,7 +1579,10 @@ describe("Schedule", () => {
 
         // Bounded MAX_SLEEP (30s) wakes the idle loop, claims leadership, and fires the row.
         yield* TestClock.adjust("30 seconds")
-        yield* Effect.repeat(Effect.yieldNow, { times: 5 })
+        // The fire does real SQLite work, so a fixed number of yields loses the race on a loaded host.
+        const deadline = performance.now() + 15_000
+        while ((yield* primary.get(externalID)).status !== "done" && performance.now() < deadline)
+          yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 1)))
         yield* Fiber.interrupt(runner)
 
         expect(yield* primary.get(externalID)).toMatchObject({

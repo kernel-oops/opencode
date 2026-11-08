@@ -21,6 +21,7 @@ import { ReadToolFileSystem } from "@opencode/core/tool/read-filesystem"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
+import { Skill } from "@opencode/core/skill"
 import { it } from "./lib/effect"
 import { permissionLayer } from "./lib/permission"
 import { executeTool, registerToolPlugin, toolIdentity } from "./lib/tool"
@@ -37,6 +38,7 @@ const readToolNode = makeLocationNode({
     Image.node,
     Permission.node,
     SessionInstructions.node,
+    Skill.node,
     FSUtil.node,
     Location.node,
   ],

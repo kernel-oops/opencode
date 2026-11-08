@@ -12,6 +12,7 @@ import { Config } from "../../config.js"
 import { Watcher } from "../../filesystem/watcher.js"
 import { Location } from "../../location.js"
 import { PluginSourceDirectory } from "../../plugin/source-directory.js"
+import { ConfigEntryObserver } from "./entry-observer.js"
 
 export type Operation =
   | {
@@ -64,7 +65,7 @@ export const layer = Layer.effect(
         if (operation.type !== "add" || !path.isAbsolute(operation.target)) continue
         if (watched.has(operation.target)) continue
         // The config change feed already covers {plugin,plugins} directories.
-        if (isPluginSource(entries, operation.target)) continue
+        if (ConfigEntryObserver.isDirectorySource(entries, operation.target, PluginSourceDirectory.names)) continue
         watched.add(operation.target)
         const updates = yield* watcher.subscribe({
           path: operation.target,
@@ -91,7 +92,9 @@ export const layer = Layer.effect(
         Stream.merge(
           config.changes().pipe(
             Stream.filterEffect((update) =>
-              Effect.map(config.entries(), (entries) => isPluginSource(entries, update.path)),
+              Effect.map(config.entries(), (entries) =>
+                ConfigEntryObserver.isDirectorySource(entries, update.path, PluginSourceDirectory.names),
+              ),
             ),
             Stream.map(() => undefined),
           ),
@@ -207,11 +210,3 @@ const scan = Effect.fn("ConfigPluginSource.scan")(function* (
     }),
   )
 })
-
-function isPluginSource(entries: readonly Entry[], file: string) {
-  return entries.some(
-    (entry) =>
-      entry.type === "directory" &&
-      PluginSourceDirectory.names.some((directory) => FSUtil.contains(path.join(entry.path, directory), file)),
-  )
-}

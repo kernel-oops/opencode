@@ -81,21 +81,20 @@ export function SessionComposerRegion(props: {
                   {(request) => <SessionElicitationDock request={request} onSubmit={controller.onResponseSubmit} />}
                 </Grow>
 
+                {/* The face's own request, so a face that is leaving keeps the request it showed. */}
                 <Grow when={current().permission} fade card class={controller.child() ? "mb-2" : undefined}>
-                  <Show when={controller.state.permissionRequest()} keyed>
-                    {(request) => (
-                      <SessionPermissionDock
-                        request={request}
-                        responding={controller.state.permissionResponding()}
-                        onDecide={(response, message) =>
-                          controller.state.decide(request, response, message).then((accepted) => {
-                            if (accepted) controller.onResponseSubmit()
-                            return accepted
-                          })
-                        }
-                      />
-                    )}
-                  </Show>
+                  {(request) => (
+                    <SessionPermissionDock
+                      request={request}
+                      responding={controller.state.permissionResponding()}
+                      onDecide={(response, message) =>
+                        controller.state.decide(request, response, message).then((accepted) => {
+                          if (accepted) controller.onResponseSubmit()
+                          return accepted
+                        })
+                      }
+                    />
+                  )}
                 </Grow>
 
                 <Show when={current().composer}>

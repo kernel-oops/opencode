@@ -19,7 +19,6 @@ const WebSocketResponseCreate = Schema.StructWithRest(Schema.Struct({ type: Sche
   Schema.Record(Schema.String, Schema.Unknown),
 ])
 const decodeMessage = ProviderShared.validateWith(Schema.decodeUnknownEffect(WebSocketResponseCreate))
-const encodeMessage = Schema.encodeSync(Schema.fromJsonString(WebSocketResponseCreate))
 
 export interface Options {
   readonly id: string
@@ -47,18 +46,24 @@ const message = (body: unknown) =>
     if (!ProviderShared.isRecord(body))
       return yield* ProviderShared.invalidRequest("Open Responses WebSocket body must be a JSON object")
     const { stream: _stream, stream_options: _streamOptions, background: _background, ...request } = body
-    const decoded = yield* decodeMessage({ ...request, type: "response.create" })
-    return { request: decoded, message: encodeMessage(decoded) }
+    return yield* decodeMessage({ ...request, type: "response.create" })
   })
 
-const driver = (options: Options, body: string): OpenResponsesContinuation.BaseDriver => {
+const observer = (options: Options) => {
   let responseID: string | undefined
   let terminal = false
-  const observeEvent = Effect.fnUntraced(function* (
-    _create: ChannelCreate,
+  let current: ChannelCreate | undefined
+  return Effect.fnUntraced(function* (
+    create: ChannelCreate,
     frame: string,
     event: OpenResponses.Event,
   ): Effect.fn.Return<ChannelObservation, AIError> {
+    // Each create starts a fresh response, e.g. a retried full send on the same driver after a steering rotation.
+    if (create !== current) {
+      current = create
+      responseID = undefined
+      terminal = false
+    }
     if (terminal)
       return yield* ProviderShared.eventError(
         options.id,
@@ -118,22 +123,6 @@ const driver = (options: Options, body: string): OpenResponsesContinuation.BaseD
     }
     return { type: "frame", frame }
   })
-  return {
-    create: () =>
-      Effect.sync(() => {
-        responseID = undefined
-        terminal = false
-        return { message: body, mode: "full" }
-      }),
-    observeEvent,
-    observe: (create, frame) =>
-      OpenResponses.decodeChannelEvent(frame).pipe(
-        Effect.mapError((cause) =>
-          ProviderShared.eventError(options.id, `Invalid ${options.name} WebSocket event`, frame, cause),
-        ),
-        Effect.flatMap((event) => observeEvent(create, frame, event)),
-      ),
-  }
 }
 
 export const transport = <Body>(options: Options): Transport<Body, Prepared, string> => {
@@ -147,22 +136,20 @@ export const transport = <Body>(options: Options): Transport<Body, Prepared, str
         const channel =
           input.webSocket && (options.enabled?.(parts.url) ?? true)
             ? yield* Effect.gen(function* () {
-                const create = yield* message(parts.jsonBody)
-                const base = driver(options, create.message)
+                const request = yield* message(parts.jsonBody)
                 const continued = OpenResponsesContinuation.driver({
                   id: options.id,
                   name: options.name,
-                  request: create.request,
-                  message: create.message,
-                  base,
+                  request,
+                  base: observer(options),
                   continuation: options.continuation,
                   steering:
                     options.nativeSteer === true &&
                     options.id === "openai-responses" &&
-                    typeof create.request.model === "string" &&
-                    /^gpt-6(?:[.-]|$)/.test(create.request.model) &&
-                    create.request.context_management === undefined &&
-                    create.request.conversation === undefined,
+                    typeof request.model === "string" &&
+                    /^gpt-6(?:[.-]|$)/.test(request.model) &&
+                    request.context_management === undefined &&
+                    request.conversation === undefined,
                 })
                 return {
                   url: yield* WebSocketTransport.toWebSocketUrl(options.url?.(parts.url) ?? parts.url),

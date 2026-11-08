@@ -61,7 +61,7 @@ export function DialogOpen(props: { sessions: SessionInfo[]; onLoad: (sessions: 
     })
     onCleanup(unsubscribe)
     return client.api.session
-      .list({ limit: 50, order: "desc", parentID: null })
+      .list({ limit: 50, order: "desc", parentID: null, archived: false })
       .then((response) => {
         if (!closed)
           props.onLoad(
@@ -158,7 +158,10 @@ export function DialogOpen(props: { sessions: SessionInfo[]; onLoad: (sessions: 
   const attention = (sessionID: string) => sessionTabs.status(sessionID).attention
   const sessions = createMemo(() => {
     const match = matched()
-    const list = topLevelSessions([...data.session.list(), ...props.sessions, ...(match ? [match] : [])], match?.id)
+    // Exact-ID matches may be child sessions; archived sessions appear only when matched exactly.
+    const list = topLevelSessions([...data.session.list(), ...props.sessions, ...(match ? [match] : [])], match?.id).filter(
+      (session) => session.time.archived === undefined || session.id === match?.id,
+    )
     const attentionByID = new Map(list.map((session) => [session.id, Boolean(attention(session.id))]))
     return list.toSorted((a, b) => {
       const attentionA = attentionByID.get(a.id) ?? false

@@ -133,7 +133,9 @@ async function mountPanes(
                 <LocationProvider>
                   <ThemeProvider mode="dark" source={emptyThemeSource}>
                     <ToastProvider>
-                      <Panes />
+                      <DialogProvider>
+                        <Panes />
+                      </DialogProvider>
                     </ToastProvider>
                   </ThemeProvider>
                 </LocationProvider>

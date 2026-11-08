@@ -2,7 +2,7 @@ import { expect } from "bun:test"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "path"
-import { Clock, Deferred, Effect, Fiber } from "effect"
+import { Clock, Deferred, Effect, Fiber, Logger, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { Agent } from "@opencode/core/agent"
 import { Command } from "@opencode/core/command"
@@ -27,7 +27,6 @@ import { Global } from "@opencode/util/global"
 import { Document, Info } from "@opencode/schema/config"
 import { AbsolutePath } from "@opencode/core/schema"
 import { tmpdirScoped } from "./fixture/tmpdir"
-import { Stream } from "effect"
 
 const it = testEffect(PluginTestLayer)
 
@@ -871,7 +870,7 @@ it.effect("activates a saved credential through the context", () =>
 it.effect("host event subscriptions deliver requested rpc types and ignore unknown types", () =>
   Effect.gen(function* () {
     const bus = yield* Bus.Service
-    const host = yield* PluginHost.make(yield* Plugin.Service)
+    const host = yield* PluginHost.make(yield* Plugin.Service, "test")
     const fiber = yield* host.event
       // @ts-expect-error untyped JavaScript plugins can still pass unknown type names
       .subscribe({ types: ["rpc.test.ping", "test.unknown"] })
@@ -883,5 +882,35 @@ it.effect("host event subscriptions deliver requested rpc types and ignore unkno
     expect(Array.from(yield* Fiber.join(fiber)).map((event) => [event.type, event.data])).toEqual([
       ["rpc.test.ping", { value: 1 }],
     ])
+  }),
+)
+
+it.effect("unknown event type warnings name the subscribing plugin", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const warnings: unknown[] = []
+    yield* plugins.activate([
+      {
+        id: "probe",
+        revision: "1",
+        effect: (ctx) =>
+          ctx.event
+            // @ts-expect-error untyped JavaScript plugins can still pass unknown type names
+            .subscribe({ types: ["test.unknown"] })
+            .pipe(
+              Stream.runDrain,
+              Effect.forkScoped({ startImmediately: true }),
+              Effect.provide(
+                Logger.layer([
+                  Logger.make((entry) => {
+                    if (entry.logLevel === "Warn") warnings.push(entry.message)
+                  }),
+                ]),
+              ),
+            ),
+      },
+    ])
+
+    expect(warnings).toEqual([["ignoring unknown event types", { pluginID: "probe", types: ["test.unknown"] }]])
   }),
 )

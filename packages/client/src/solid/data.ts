@@ -2119,7 +2119,14 @@ export function createData(config: CreateDataInput) {
               (item) => !ids.has(item.id) && (outbox.has(item.id) || admitted.has(item.id)),
             )
             const messages = local.length === 0 ? fetched : [...fetched, ...local]
+            // The transcript only holds delivered input, so a pending row it contains missed its
+            // inbox.delivered event (and maybe its enqueued echo) while the event stream was down.
+            const delivered = [...admitted].filter((id) => ids.has(id))
             batch(() => {
+              delivered.forEach((id) => {
+                outbox.delete(id)
+                removePending(sessionID, id)
+              })
               messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
               setStore("session", "message", sessionID, reconcile(messages))
               setStore("session", "messageCursor", sessionID, response.cursor.next ?? undefined)
@@ -2223,9 +2230,10 @@ export function createData(config: CreateDataInput) {
         },
         // A request the server no longer has is removed locally either way. Ordinary replies to it stay benign, but
         // a manual review approval did not approve anything, so it still fails for its caller.
-        async reply(input: PermissionReplyInput) {
+        // The signal aborts the request itself, so an abandoned attempt can neither land nor touch the store.
+        async reply(input: PermissionReplyInput, options?: { signal?: AbortSignal }) {
           const stale = await api()
-            .permission.reply(input)
+            .permission.reply(input, { signal: options?.signal })
             .then(
               () => undefined,
               (error: unknown) => {

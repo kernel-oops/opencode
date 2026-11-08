@@ -4,6 +4,7 @@ import { ToolFailure } from "@opencode/ai/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect, Schema } from "effect"
 import path from "path"
+import { toolFailure } from "../runtime.js"
 import { Environment } from "../../environment/index.js"
 import { FileSystem } from "../../filesystem.js"
 import { Location } from "../../location.js"
@@ -70,7 +71,6 @@ export const Plugin = {
           execute: (input, context) =>
             Effect.gen(function* () {
               const searchPath = input.path === "undefined" || input.path === "null" ? undefined : input.path
-              const source = { type: "tool" as const, messageID: context.messageID, id: context.id }
               const target = yield* access.resolve({ path: searchPath ?? ".", kind: "directory" })
               const root = target.absolute
               const external = target.externalDirectory !== undefined
@@ -124,9 +124,7 @@ export const Plugin = {
                           complete: Boolean(boundArguments),
                         }),
                       },
-                      sessionID: context.sessionID,
-                      agent: context.agent,
-                      source,
+                      ...Permission.invocation(context),
                     })
                     yield* BoundExternal.verify(scope).pipe(Effect.mapError(pinnedFailure))
                     if (binding)
@@ -197,11 +195,7 @@ export const Plugin = {
                 ),
                 metadata: { count: result.entries.length, truncated: result.truncated },
               })),
-              Effect.mapError((error) =>
-                error instanceof ToolFailure
-                  ? error
-                  : new ToolFailure({ message: `Unable to find files matching ${input.pattern}`, error }),
-              ),
+              Effect.mapError(toolFailure(`Unable to find files matching ${input.pattern}`)),
             ),
         }),
       )

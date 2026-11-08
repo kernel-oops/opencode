@@ -1,6 +1,6 @@
 export * as SessionBudgetReasoning from "./context-budget-reasoning.js"
 
-import { LLMRequest, Message } from "@opencode/ai/effect"
+import { AssistantMessage, type LLMRequest } from "@opencode/ai/effect"
 import type { SessionMessage } from "./message.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import type { Schema } from "effect"
@@ -73,9 +73,11 @@ export const counting = (request: LLMRequest, body: Schema.Json | undefined, inv
   const allowed = new Map<string, Evidence>()
   const sources = new Map<string, number>()
   let valid = true
-  const messages = request.messages.map(
-    (message) =>
-      new Message({
+  // Only assistant messages carry replayed reasoning.
+  const messages = request.messages.map((message) =>
+    message.role !== "assistant"
+      ? message
+      : new AssistantMessage({
         ...message,
         content: message.content.map((part) => {
           if (part.type !== "reasoning") return part
@@ -171,7 +173,7 @@ export const counting = (request: LLMRequest, body: Schema.Json | undefined, inv
     return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, rewrite(entry)]))
   }
   return {
-    request: LLMRequest.update(request, { messages }),
+    request: { ...request, messages },
     body: body === undefined ? undefined : rewrite(body),
     generated: [...sources.values()].reduce((sum, value) => sum + value, 0),
     valid,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { LLMRequest } from "@opencode/ai/effect"
+import { ai } from "@opencode/ai/effect"
 import { OpenAIResponses } from "@opencode/ai/protocols"
 import { SessionBudgetReasoning } from "@opencode/core/session/context-budget-reasoning"
 import { SessionContextBudget } from "@opencode/core/session/context-budget"
@@ -36,12 +36,10 @@ const source = (id = "one", generated = 20, items = ["rs_one"]) =>
   })
 const fixture = (sources = [source()], selected = model) => {
   const inventory = SessionBudgetReasoning.capture({ messages: sources, model: selected })
-  const request = new LLMRequest({
+  const request = ai.request({
     model: selected.model,
     messages: toLLMMessages(sources, selected.ref, "openai"),
-    system: [],
-    tools: [],
-    generation: { maxTokens: 32_000 },
+    maxTokens: 32_000,
   })
   const input = [
     ...new Map(

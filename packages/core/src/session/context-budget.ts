@@ -75,7 +75,7 @@ const measure = (
 ): Assessment => {
   const decoded = wire === undefined ? undefined : Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))(wire)
   const body = decoded && Option.isSome(decoded) ? decoded.value : undefined
-  const output = wire === undefined ? request.generation?.maxTokens : outputReserve(body)
+  const output = wire === undefined ? request.maxTokens : outputReserve(body)
   const counting = SessionBudgetReasoning.counting(request, body, reasoning)
   const wireEstimate =
     wire === undefined || body === undefined

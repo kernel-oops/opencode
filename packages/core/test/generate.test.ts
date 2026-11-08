@@ -3,7 +3,7 @@ import {
   AIError,
   InvalidProviderOutputError,
   LLMResponse,
-  LLMRequest,
+  type LLMRequest,
   Usage,
   AuthenticationError,
   HttpContext,
@@ -130,7 +130,7 @@ for (const protocol of [OpenAIResponses.route, AnthropicMessages.route, OpenAICh
         expect(requests).toHaveLength(1)
         const request = requests[0]!
         expect(request.model).toBe(model)
-        expect(request.http?.headers?.["x-opencode-session"]).toStartWith("ses_")
+        expect(request.headers?.["x-opencode-session"]).toStartWith("ses_")
         expect(request.http?.body).toEqual(
           protocol === OpenAIResponses.route
             ? { text: { format: { type: "json_schema", ...responseSchema, strict: true } } }

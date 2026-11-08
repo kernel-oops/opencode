@@ -15,7 +15,7 @@ const it = testEffect(makePluginTestLayer())
 it.effect("assistant synthetic inherits identity, strips controls and admits no model work", () =>
   Effect.gen(function* () {
     const plugins = yield* Plugin.Service
-    const ctx = yield* PluginHost.make(plugins)
+    const ctx = yield* PluginHost.make(plugins, "test")
     const sessions = yield* Session.Service
     const session = yield* ctx.session.create({ agent: Agent.ID.make("test"), model: Model.Ref.make({ id: Model.ID.make("test"), providerID: Provider.ID.make("test") }) })
     const before = yield* sessions.get(session.id)
@@ -48,7 +48,7 @@ it.effect("assistant synthetic inherits identity, strips controls and admits no 
 it.effect("Promise assistant synthetic bypasses inbox encoding and retains ordinary input compatibility", () =>
   Effect.gen(function* () {
     const plugins = yield* Plugin.Service
-    const ctx = yield* PluginHost.make(plugins)
+    const ctx = yield* PluginHost.make(plugins, "test")
     const sessions = yield* Session.Service
     const session = yield* ctx.session.create({ agent: Agent.ID.make("test"), model: Model.Ref.make({ id: Model.ID.make("test"), providerID: Provider.ID.make("test") }) })
     yield* PluginPromise.fromPromise({

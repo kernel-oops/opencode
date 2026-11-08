@@ -1,6 +1,6 @@
-import { createEffect, createMemo, onCleanup } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
 import type { FormInfo, PermissionRequest } from "@opencode/client/promise"
+import { abort } from "@opencode/util/abort"
 import { useParams } from "@solidjs/router"
 import { showToast } from "@/shell/notifications/toast"
 import { useServerSDK } from "@/runtime/server/client"
@@ -11,15 +11,44 @@ import { sessionPermissionRequest, sessionFormRequest, sessionTreeIDs } from "@/
 import { createWebSearchRequest } from "./websearch"
 import { createSessionBackground } from "@/session/requests/background"
 import { createSteerBackground } from "@/session/requests/steer-background"
-import { useData } from "@/runtime/server/current"
+import { useData, useServer } from "@/runtime/server/current"
+import { needsUser } from "./auto-approve-machine"
+import {
+  INITIAL_PERMISSION_REPLY_STATE,
+  isPermissionReplied,
+  isPermissionResponding,
+  PERMISSION_REPLIED_LIMIT,
+  transitionPermissionReply,
+  type PermissionDecision,
+  type PermissionReplyEffect,
+  type PermissionReplyEvent,
+  type PermissionReplyState,
+} from "./permission-machine"
 
 export function createSessionRequestModel() {
   const params = useParams()
   const sdk = useWorkspaceLocation()
   const serverSDK = useServerSDK()
   const data = useData()
+  const autoApprove = useServer().ctx.autoApprove
   const language = useLanguage()
   const settings = useSettings()
+  // Manual replies from the dock, by request. Requests nobody answered from this dock have no entry.
+  const [replies, setReplies] = createSignal<Readonly<Record<string, PermissionReplyState>>>({})
+  const runs = new Map<string, { controller: AbortController; timer: ReturnType<typeof setTimeout> }>()
+  const replyState = (requestID: string) => replies()[requestID] ?? INITIAL_PERMISSION_REPLY_STATE
+  // The fork's decision (including review_once), feedback message and caller promise for a reply in flight.
+  const pending = new Map<string, { response: PermissionDecision; message?: string; settle: (accepted: boolean) => void }>()
+
+  const stop = serverSDK.event.on("permission.replied", (event) =>
+    dispatch(event.data.requestID, { type: "resolved", reply: event.data.reply }),
+  )
+
+  onCleanup(() => {
+    stop()
+    Object.keys(untrack(replies)).forEach((id) => dispatch(id, { type: "disposed" }))
+  })
+
   createEffect(() => {
     const id = params.id
 
@@ -36,17 +65,26 @@ export function createSessionRequestModel() {
     onCleanup(() => controller.abort())
     void data.session.descendants.sync(id, { signal: controller.signal }).catch(() => undefined)
   })
-  // A descendant may already be waiting when this view connects, so sync the whole tree, not only this Session.
-  createEffect(() => {
-    const id = params.id
 
-    if (!id || serverSDK.connection.status() !== "connected") return
-    void Promise.allSettled(
-      sessionTreeIDs(data.session.list(), id).flatMap((sessionID) => [
-        data.session.permission.sync(sessionID),
-        data.session.form.sync(sessionID),
-      ]),
-    )
+  // A descendant may already be waiting when this view connects, so sync the whole tree's permissions: a request can
+  // wait on an idle Session. Only a running Session can hold a pending form, and events keep loaded ones current.
+  // Comparing by value keeps every session update in a large subagent tree from re-requesting either.
+  const sameIDs = (a: string[], b: string[]) => a.join() === b.join()
+  const treeSessions = createMemo(() => sessionTreeIDs(data.session.list(), params.id), [], { equals: sameIDs })
+  const formSessions = createMemo(
+    () => treeSessions().filter((id) => id === params.id || data.session.status(id) === "running"),
+    [],
+    { equals: sameIDs },
+  )
+
+  createEffect(() => {
+    if (serverSDK.connection.status() !== "connected") return
+    void Promise.allSettled(treeSessions().map((sessionID) => data.session.permission.sync(sessionID)))
+  })
+
+  createEffect(() => {
+    if (serverSDK.connection.status() !== "connected") return
+    void Promise.allSettled(formSessions().map((sessionID) => data.session.form.sync(sessionID)))
   })
 
   const formRequest = createMemo((): FormInfo | undefined => {
@@ -111,10 +149,18 @@ export function createSessionRequestModel() {
   const permissionRequest = createMemo((): PermissionRequest | undefined => {
     const id = params.id
 
-    const project = projectSettingsKey(serverSDK.scope, id ? data.session.get(id)?.projectID : undefined)
+    const enabled = settings.permissions.autoApproves(
+      projectSettingsKey(serverSDK.scope, id ? data.session.get(id)?.projectID : undefined),
+    )
 
-    return sessionPermissionRequest(data.session.list(), data.session.permission.list, id,
-      (request) => !settings.permissions.autoApproves(project) || !!request.review)
+    return sessionPermissionRequest(
+      data.session.list(),
+      data.session.permission.list,
+      id,
+      // A model-review (review_once) request always needs the user, even under auto-approve.
+      (item) =>
+        (!!item.review || needsUser(autoApprove.state(item.id), enabled)) && !isPermissionReplied(replyState(item.id)),
+    )
   })
 
   const blocked = createMemo(() => {
@@ -163,42 +209,88 @@ export function createSessionRequestModel() {
     move: (sessionID) => serverSDK.api.session.background({ sessionID }),
   })
 
-  const [store, setStore] = createStore<{ responding: string | undefined }>({ responding: undefined })
+  // The dock keeps the last request mounted while it closes, so its buttons follow that request's reply.
+  const lastPermissionID = createMemo<string | undefined>((previous) => permissionRequest()?.id ?? previous)
 
   const permissionResponding = createMemo(() => {
-    const perm = permissionRequest()
+    const id = lastPermissionID()
 
-    if (!perm) return false
-
-    return store.responding === perm.id
+    return !!id && isPermissionResponding(replyState(id))
   })
 
   // Resolves true only once the server accepted the reply, so callers keep typed input on any failure.
-  const decide = async (
-    request: PermissionRequest,
-    response: "once" | "always" | "reject" | "review_once",
-    message?: string,
-  ) => {
-    if (permissionRequest()?.id !== request.id || store.responding === request.id) return false
+  const decide = (request: PermissionRequest, response: PermissionDecision, message?: string) => {
+    if (permissionRequest()?.id !== request.id || isPermissionResponding(replyState(request.id)))
+      return Promise.resolve(false)
 
-    setStore("responding", request.id)
+    return new Promise<boolean>((settle) => {
+      pending.set(request.id, { response, message, settle })
+      dispatch(request.id, { type: "decide", sessionID: request.sessionID, decision: response })
+    })
+  }
 
-    return data.session.permission
-      .reply({ sessionID: request.sessionID, requestID: request.id, decision: response, message })
-      .then(
-        () => true,
-        (error) => {
-          showToast({
-            title: language.t("common.requestFailed"),
-            description: error instanceof Error ? error.message : String(error),
-          })
+  function dispatch(requestID: string, event: PermissionReplyEvent) {
+    const state = untrack(() => replyState(requestID))
+    const result = transitionPermissionReply(state, event)
 
-          return false
+    if (result.state !== state) setReplies((current) => pruneReplied({ ...current, [requestID]: result.state }))
+
+    result.effects.forEach((effect) => execute(requestID, effect))
+
+    const waiting = pending.get(requestID)
+    if (waiting && result.state.status !== "responding") {
+      pending.delete(requestID)
+      waiting.settle(result.state.status === "replied" && result.state.accepted)
+    }
+  }
+
+  function execute(requestID: string, effect: PermissionReplyEffect) {
+    if (effect.type === "toast-failed") {
+      showToast({ title: language.t("common.requestFailed"), description: effect.error })
+
+      return
+    }
+
+    if (effect.type === "abort") {
+      const run = runs.get(requestID)
+      runs.delete(requestID)
+      clearTimeout(run?.timer)
+      abort(run?.controller)
+
+      return
+    }
+
+    const controller = new AbortController()
+    const waiting = pending.get(requestID)
+
+    runs.set(requestID, {
+      controller,
+      timer: setTimeout(
+        () => dispatch(requestID, { type: "reply.timed-out", attempt: effect.attempt }),
+        effect.timeoutMs,
+      ),
+    })
+    // The data layer treats a request another client or the TUI already answered as replied, except a stale
+    // review_once approval, which approved nothing and so still fails. It also drops the request locally.
+    void data.session.permission
+      .reply(
+        {
+          sessionID: effect.sessionID,
+          requestID,
+          decision: waiting?.response ?? effect.decision,
+          message: waiting?.message,
         },
+        { signal: controller.signal },
       )
-      .finally(() => {
-        setStore("responding", (id) => (id === request.id ? undefined : id))
-      })
+      .then(
+        () => dispatch(requestID, { type: "reply.succeeded", attempt: effect.attempt }),
+        (error) =>
+          dispatch(requestID, {
+            type: "reply.failed",
+            attempt: effect.attempt,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      )
   }
 
   return {
@@ -220,3 +312,13 @@ export function createSessionRequestModel() {
 }
 
 export type SessionRequestModel = ReturnType<typeof createSessionRequestModel>
+
+// Replied entries only hide requests until `permission.replied` removes them, so the oldest can go.
+function pruneReplied(replies: Readonly<Record<string, PermissionReplyState>>) {
+  const replied = Object.entries(replies).flatMap(([id, state]) => (isPermissionReplied(state) ? [id] : []))
+
+  if (replied.length <= PERMISSION_REPLIED_LIMIT) return replies
+  const drop = new Set(replied.slice(0, replied.length - PERMISSION_REPLIED_LIMIT))
+
+  return Object.fromEntries(Object.entries(replies).filter(([id]) => !drop.has(id)))
+}

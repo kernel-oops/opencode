@@ -124,12 +124,12 @@ for (const transport of ["http", "websocket", "anthropic"] as const) {
       ).pipe(Layer.provide(native))
       const model =
         transport === "anthropic"
-          ? AnthropicMessages.route.with({ http: { headers: { "x-route": "retained" } } }).model({ id: "api-model" })
-          : OpenAIResponses.route.with({ http: { headers: { "x-route": "retained" } } }).model({
+          ? AnthropicMessages.route.with({ headers: { "x-route": "retained" } }).model({ id: "api-model" })
+          : OpenAIResponses.route.with({ headers: { "x-route": "retained" } }).model({
               id: "api-model",
-              defaults: { providerOptions: { reasoningEffort: "low" } },
+              options: { providerOptions: { reasoningEffort: "low" } },
             })
-      const defaults = JSON.stringify(model.route.defaults)
+      const defaults = JSON.stringify([model.route.options, model.options])
       const resolution = Layer.mock(ModelResolver.Service, {
         resolve: () =>
           Effect.succeed({
@@ -167,7 +167,7 @@ for (const transport of ["http", "websocket", "anthropic"] as const) {
           ])
         }
       }
-      expect(JSON.stringify(model.route.defaults)).toBe(defaults)
+      expect(JSON.stringify([model.route.options, model.options])).toBe(defaults)
     }),
   )
 }

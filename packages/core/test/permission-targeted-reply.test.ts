@@ -13,7 +13,7 @@ for (const scope of [undefined, "request"] as const) {
   it.effect(`plugin rejection preserves the requested scope (${scope ?? "session"})`, () =>
     Effect.gen(function* () {
       const plugins = yield* Plugin.Service
-      const ctx = yield* PluginHost.make(plugins)
+      const ctx = yield* PluginHost.make(plugins, "test")
       const agents = yield* Agent.Service
       yield* agents.transform((editor) => editor.update(Agent.ID.make("test"), (agent) => { agent.permissions = [] }))
       const session = yield* ctx.session.create({ agent: Agent.ID.make("test"), permissions: [{ action: "*", resource: "*", effect: "ask" }] })

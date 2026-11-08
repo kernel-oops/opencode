@@ -182,7 +182,7 @@ for (const mode of [
               })
           })
         },
-      }).effect(yield* PluginHost.make(yield* Plugin.Service))
+      }).effect(yield* PluginHost.make(yield* Plugin.Service, "test"))
       const snapshot = yield* tools.snapshot()
       const execute = (id: string) =>
         snapshot.execute({
@@ -336,7 +336,7 @@ for (const mode of ["interrupt", "return", "throw", "grant", "grant-cancel", "wr
               })
           })
         },
-      }).effect(yield* PluginHost.make(yield* Plugin.Service))
+      }).effect(yield* PluginHost.make(yield* Plugin.Service, "test"))
       const snapshot = yield* tools.snapshot()
       const execute = (id: string) =>
         snapshot.execute({

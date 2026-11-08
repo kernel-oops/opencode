@@ -69,8 +69,7 @@ test("only absent or empty provider state is compatible, never reserved native f
     await expect(compile(pair(name, "reserved"))).rejects.toThrow("cannot safely replay")
   }
   const [call, result] = pair("Bash", "state")
-  await expect(compile([{ ...call!, metadata: { caller: "native" } }, result!])).rejects.toThrow("cannot safely replay")
-  await expect(compile([call!, { ...result!, metadata: { caller: "native" } }])).rejects.toThrow("cannot safely replay")
+  // Upstream removed part-level `metadata` (e5c9b0151b); native state now travels only in providerMetadata.
   for (const providerMetadata of [
     { anthropic: { caller: { type: "code_execution" } } },
     { anthropic: { futureNativeState: "opaque" } },
