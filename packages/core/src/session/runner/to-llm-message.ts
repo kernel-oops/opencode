@@ -208,8 +208,9 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
               } : item.native),
             },
           ]
+        // Never relabel reasoning as assistant text; the destination adapter decides unsigned replay.
         : (nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary").length > 0 : item.text.length > 0)
-          ? [{ type: message.error === undefined && message.interruption === undefined && !reasoningInterrupted ? "reasoning" : "text", text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary") : item.text }]
+          ? [{ type: "reasoning", text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "summary") : item.text }]
           : []
     }
     // Call-side metadata is model-scoped proof of generation (Gemini thought
@@ -244,7 +245,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       if (sameModel) content.push({ type: "reasoning", text, providerMetadata: providerMetadata(providerMetadataKey, {
         itemId: item.id, reasoningEncryptedContent: typeof item.encrypted_content === "string" ? item.encrypted_content : null,
       }) })
-      else if (text) content.push(Message.text(text))
+      else if (text) content.push({ type: "reasoning", text })
     }
   }
   if (nativeRestricted && Array.isArray(message.native?.unresolvedHostedItems))

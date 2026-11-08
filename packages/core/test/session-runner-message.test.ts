@@ -36,8 +36,10 @@ describe("toLLMMessages", () => {
     if (done === true) expect(JSON.stringify(messages)).toContain("ack-only")
     else {
       expect(JSON.stringify(messages)).not.toContain("ack-only")
-      if (done === false) expect(messages[0].content).toContainEqual({ type: "text", text: "Readable partial" })
+      if (done === false) expect(messages[0].content).toContainEqual({ type: "reasoning", text: "Readable partial" })
     }
+    for (const target of [model, { ...model, id: Model.ID.make("foreign") }, { ...model, providerID: Provider.ID.make("other-provider") }])
+      expect(JSON.stringify(toLLMMessages([assistant], target).flatMap((message) => message.content).filter((part) => part.type === "text"))).not.toContain("Readable partial")
     const foreign = toLLMMessages([assistant], { ...model, id: Model.ID.make("foreign") })
     expect(JSON.stringify(foreign)).not.toContain("ack-only")
     expect(JSON.stringify(foreign)).not.toContain("unacknowledged-latest")
@@ -65,7 +67,7 @@ describe("toLLMMessages", () => {
     const messages = toLLMMessages([assistant], model)
     expect(messages[0].content).toEqual([
       { type: "text", text: "Partial text", providerMetadata: undefined },
-      { type: "text", text: "Readable thought" },
+      { type: "reasoning", text: "Readable thought" },
       expect.objectContaining({ type: "tool-call", id: "settled", providerMetadata: { provider: { signature: "valid-tool-proof" } } }),
     ])
     expect(messages[1].content).toContainEqual(expect.objectContaining({ type: "tool-result", id: "settled" }))

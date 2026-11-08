@@ -69,6 +69,22 @@ it.effect("native done observation before display replaces added proof, includin
   expect(missing.same).toContain("Acknowledged summary")
   expect(missing.same).not.toContain("UNACKNOWLEDGED_ADDED_PROOF")
   expect(missing.same).not.toContain("ACKNOWLEDGED_DONE_PROOF")
+  for (const value of [result.same, result.switched, missing.same, missing.switched]) {
+    expect(value).toContain(`"type":"reasoning","text":"Acknowledged summary"`)
+    expect(value).not.toContain(`"type":"text","text":"Acknowledged summary"`)
+  }
+}))
+
+it.effect("native done receipt without a display part recovers structured reasoning across model switches", () => Effect.gen(function* () {
+  const { bus, base, replay } = yield* setup
+  const done = { type: "reasoning", id: "rs_receipt", summary: [{ type: "summary_text", text: "Receipt summary" }], encrypted_content: "RECEIPT_PROOF" }
+  yield* bus.publish(SessionEvent.Step.Observed, { ...base, native: { nativeObserved: true, completedOutputItems: [done], unresolvedHostedItems: [] } })
+  const result = yield* replay
+  expect(result.same).toContain(`"type":"reasoning","text":"Receipt summary"`)
+  expect(result.same).toContain("RECEIPT_PROOF")
+  expect(result.switched).toContain(`"type":"reasoning","text":"Receipt summary"`)
+  expect(result.switched).not.toContain("RECEIPT_PROOF")
+  for (const value of [result.same, result.switched]) expect(value).not.toContain(`"type":"text","text":"Receipt summary"`)
 }))
 
 it.effect("native crash excludes unowned fragments but retains owned calls, results and model-scoped proof", () => Effect.gen(function* () {

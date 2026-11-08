@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { Effect } from "effect"
+import { DateTime, Effect } from "effect"
 import { ai } from "@opencode/ai/effect"
 import { AnthropicMessages } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/testing"
@@ -56,4 +56,38 @@ test("projection preserves non-empty state for rejection and rejects empty IDs",
   ]) await expect(compile(project([tool("Bash", "state", completed, extra)]))).rejects.toThrow("cannot safely replay")
   await expect(compile(project([tool("Bash", "", completed)]))).rejects.toThrow("cannot safely replay")
   expect((await compile(project([tool("Bash", "valid_id", completed)]))).body.messages[0]!.content[0]).toMatchObject({ id: "valid_id" })
+})
+
+const created = DateTime.makeUnsafe(0)
+test("interrupted and cross-provider reasoning never compiles to Anthropic assistant text", async () => {
+  const assistant = (model: Model.Ref, extra: Partial<SessionMessage.Assistant>, content: SessionMessage.Assistant["content"]) =>
+    SessionMessage.Assistant.make({ id: SessionMessage.ID.make("msg_reasoning"), type: "assistant", agent: "build" as never, model, content, time: { created, completed: created }, ...extra })
+  const openai = { providerID: "openai", id: "gpt-fixture" } as Model.Ref
+  const cases = [
+    assistant(ref, { interruption: "steer" }, [
+      { type: "reasoning", text: "Hidden thought", native: { signature: "sig" }, time: { created, completed: created } },
+      { type: "text", text: "Visible answer" },
+    ]),
+    ...[{ nativeInterrupted: true }, { nativeObserved: true }].map((native) => assistant(openai, { native: { ...native, completedOutputItems: [
+      { type: "reasoning", id: "rs_done", summary: [{ type: "summary_text", text: "Hidden thought" }] },
+      { type: "message", id: "msg_done", content: [{ type: "output_text", text: "Visible answer" }] },
+    ] } }, [
+      { type: "reasoning", text: "Hidden thought", native: { itemId: "rs_done" }, time: { created, completed: created } },
+      { type: "text", text: "Visible answer", native: { itemId: "msg_done" } },
+    ])),
+    // Done receipts without published display parts.
+    assistant(openai, { native: { nativeObserved: true, completedOutputItems: [
+      { type: "reasoning", id: "rs_done", summary: [{ type: "summary_text", text: "Hidden thought" }] },
+      { type: "message", id: "msg_done", content: [{ type: "output_text", text: "Visible answer" }] },
+    ] } }, []),
+  ]
+  for (const message of cases) {
+    const messages = toLLMMessages([message], ref, "anthropic")
+    const parts = messages.flatMap((item) => item.content)
+    expect(parts.filter((part) => part.type === "text").map((part) => part.text)).toEqual(["Visible answer"])
+    expect(parts.some((part) => part.type === "reasoning" && part.text === "Hidden thought")).toBe(true)
+    const body: AnthropicMessages.AnthropicMessagesBody = (await compile(messages)).body
+    const text = body.messages.flatMap((item) => typeof item.content === "string" ? [item.content] : item.content.flatMap((part) => part.type === "text" ? [part.text] : []))
+    expect(text).toEqual(["Visible answer"])
+  }
 })
