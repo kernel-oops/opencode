@@ -1,0 +1,12 @@
+# Release invariants: <package dir> <test file> <why>. Every release build runs .kernel-oops/check-release-invariants.
+# Never delete or narrow an entry to make a merge pass; changing this list needs the release controller's independent review.
+
+# Upstream #60498 (822594b9ae): reasoning is never replayed as ordinary text. Lost in merge ade24051c6, shipped B12-B14.
+packages/core test/reasoning-replay-invariant.test.ts      matrix over error/steer/finish/native receipts/model switch
+packages/core test/session-runner-message.test.ts          upstream #60498 expectations plus fork replay cases
+packages/core test/session-native-crash-replay.test.ts     done-receipt recovery stays structured reasoning
+packages/core test/anthropic-legacy-replay.test.ts         interrupted/cross-provider reasoning never becomes Anthropic text
+
+# f8a78b89: experimental flags are read per field across config documents, not from the last whole experimental block.
+packages/core test/schedule.test.ts                        Schedule.enabled survives a later experimental block
+packages/core test/tool-schedule.test.ts                   schedule tools register when another document sets experimental
