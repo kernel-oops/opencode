@@ -1795,6 +1795,39 @@ test.each(["metadata", "location", "project"] as const)(
   },
 )
 
+test("session metadata updates replace the whole record", () => {
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const api = OpenCode.make({ baseUrl: "http://fixture.invalid", fetch: async () => Response.json({ data: [], cursor: {} }) })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+    }),
+    dispose,
+  }))
+  const emit = (metadata: Record<string, unknown>) => {
+    const details: OpenCodeEvent = { type: "session.metadata.updated", data: { sessionID: "ses_meta", metadata } }
+    listeners.forEach((listener) => listener({ name: details.type, details }))
+  }
+  try {
+    setup.data.session.remember({ ...session(1), id: "ses_meta", metadata: { running: true, obsolete: "x" } })
+    emit({})
+    expect(setup.data.session.get("ses_meta")?.metadata).toEqual({})
+    emit({ running: true })
+    emit({ running: false, next: 1 })
+    expect(setup.data.session.get("ses_meta")?.metadata).toEqual({ running: false, next: 1 })
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("large fully cached descendant hydration yields to input and cancellation without HTTP", async () => {
   let requests = 0
   const children = Array.from({ length: 2_000 }, (_, index) => ({

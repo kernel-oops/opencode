@@ -328,6 +328,80 @@ describe("Composer submission", () => {
     expect(calls).toEqual([])
   })
 
+  test("a held review approval owns submission: ordinary and quote sends wait, a newer draft survives", async () => {
+    const state = createMemoryComposerState({ prompt: "I approve per_held" }).capture()
+    const calls: string[] = []
+    const approvals: string[] = []
+    const reply = Promise.withResolvers<void>()
+
+    const submission = submitInput(active(state, session({ calls })), undefined, "normal", undefined, [], undefined,
+      async (id) => { approvals.push(id); await reply.promise })
+
+    const approving = submission.submit(new Event("submit"))
+    expect(approvals).toEqual(["per_held"])
+    expect(composerSubmitView(submission.state())).toEqual({ held: false, busy: false, canSubmit: false })
+
+    // A second typed approval, an ordinary send and a quote send all wait for the approval to settle.
+    await submission.submit(new Event("submit"))
+    state.set([{ type: "text", content: "newer draft", start: 0, end: 11 }], 11)
+    state.context.add({ type: "quote", text: "Selected passage", commentID: "selected" })
+    await submission.submit(new Event("submit"))
+    expect(await submission.submitQuote("quote:c=selected", "Comment")).toBe(false)
+    expect(approvals).toEqual(["per_held"])
+    expect(calls).toEqual([])
+
+    reply.resolve()
+    await approving
+    expect(composerSubmitView(submission.state()).canSubmit).toBe(true)
+    expect(state.current()).toEqual([{ type: "text", content: "newer draft", start: 0, end: 11 }])
+    expect(state.context.items()).toMatchObject([{ key: "quote:c=selected" }])
+    expect(calls).toEqual([])
+  })
+
+  test("a rejected held review approval keeps its phrase and frees the composer", async () => {
+    const state = createMemoryComposerState({ prompt: "I approve per_rejected" }).capture()
+    const calls: string[] = []
+    const errors: unknown[] = []
+    const reply = Promise.withResolvers<void>()
+
+    const submission = submitInput(active(state, session({ calls })),
+      { missingSelection() {}, unqueueable() {}, failed: (_kind, error) => void errors.push(error) },
+      "normal", undefined, [], undefined, () => reply.promise)
+
+    const approving = submission.submit(new Event("submit"))
+    expect(composerSubmitView(submission.state()).canSubmit).toBe(false)
+    reply.reject(new Error("Rejected"))
+    await approving
+    expect(errors.map(String)).toEqual(["Error: Rejected"])
+    expect(state.current()).toEqual([{ type: "text", content: "I approve per_rejected", start: 0, end: 22 }])
+    expect(composerSubmitView(submission.state()).canSubmit).toBe(true)
+    expect(calls).toEqual([])
+
+    // The composer is free again: an ordinary prompt now sends.
+    state.set([{ type: "text", content: "ordinary", start: 0, end: 8 }], 8)
+    await submission.submit(new Event("submit"))
+    expect(calls[0]).toBe("admit")
+  })
+
+  test("a review approval held across disposal settles and clears only its unchanged phrase", async () => {
+    const state = createMemoryComposerState({ prompt: "I approve per_disposed" }).capture()
+    const calls: string[] = []
+    const reply = Promise.withResolvers<void>()
+
+    const owner = createRoot((dispose) => ({
+      submission: submitInput(active(state, session({ calls })), undefined, "normal", undefined, [], undefined,
+        () => reply.promise),
+      dispose,
+    }))
+
+    const approving = owner.submission.submit(new Event("submit"))
+    owner.dispose()
+    reply.resolve()
+    await approving
+    expect(state.current()).toEqual([{ type: "text", content: "", start: 0, end: 0 }])
+    expect(calls).toEqual([])
+  })
+
   test("retains the submitting session before waiting for server admission", async () => {
     const calls: string[] = []
 

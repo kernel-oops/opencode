@@ -104,18 +104,155 @@ test("revalidates an older in-flight inbox snapshot at an execution boundary", a
   }
 })
 
-test("a successful admission reconciles a consumed optimistic input when both events were missed", async () => {
+test("a successful admission reconciles a consumed optimistic input from one fresh transcript read", async () => {
   const response = Promise.withResolvers<Response>()
-  const setup = fixture(async (request) => request.method === "GET" ? Response.json({ data: [item] }) : response.promise)
+  const reading = Promise.withResolvers<void>()
+  let reads = 0
+  const setup = fixture(async (request) => {
+    if (request.method === "POST") return response.promise
+    if (!new URL(request.url).pathname.endsWith("/message")) return Response.json({ data: [item] })
+    reads++
+    reading.resolve()
+    // The server delivered the prompt while this client missed both inbox events.
+    return Response.json({ data: [{ id: "msg_local", type: "user", text: "local", time: { created: 2 } }], cursor: {} })
+  })
   try {
     const admission = setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_local", text: "local" })
     await setup.data.session.pending.sync(item.sessionID)
     expect(setup.data.session.input.list(item.sessionID)).toContain("msg_local")
     response.resolve(Response.json({ data: { ...item, id: "msg_local", payload: { text: "local" } } }))
     await admission
+    await reading.promise
+    await setup.data.session.message.sync(item.sessionID)
+    expect(reads).toBe(1)
+    expect(setup.data.session.input.list(item.sessionID)).toEqual([item.id])
+    expect(setup.data.session.message.get(item.sessionID, "msg_local")?.time.created).toBe(2)
+    // Another inbox read cannot resurrect the delivered prompt.
+    setup.data.session.pending.invalidate(item.sessionID)
     await setup.data.session.pending.sync(item.sessionID)
     expect(setup.data.session.input.list(item.sessionID)).toEqual([item.id])
-    expect(setup.data.session.message.get(item.sessionID, "msg_local")?.type).toBe("user")
+    expect(reads).toBe(1)
+  } finally {
+    response.resolve(Response.json({ data: item }))
+    setup.dispose()
+  }
+})
+
+test("an older transcript read cannot erase an accepted prompt before its delivery proof", async () => {
+  const transcripts = [Promise.withResolvers<Response>(), Promise.withResolvers<Response>()]
+  let reads = 0
+  const setup = fixture(async (request) => {
+    if (request.method === "POST") return Response.json({ data: { id: item.id } })
+    if (new URL(request.url).pathname.endsWith("/message")) return transcripts[reads++]!.promise
+    return Response.json({ data: [] })
+  })
+  try {
+    const older = setup.data.session.message.sync(item.sessionID)
+    await setup.data.session.prompt({ sessionID: item.sessionID, id: item.id, text: item.payload.text })
+    await setup.data.session.pending.sync(item.sessionID)
+    expect(setup.data.session.input.has(item.sessionID, item.id)).toBe(true)
+    // The held read predates admission.
+    transcripts[0]!.resolve(Response.json({ data: [], cursor: {} }))
+    await older
+    expect(setup.data.session.input.has(item.sessionID, item.id)).toBe(true)
+    expect(setup.data.session.message.get(item.sessionID, item.id)?.type).toBe("user")
+    transcripts[1]!.resolve(Response.json(transcript))
+    await setup.data.session.message.sync(item.sessionID)
+    expect(reads).toBe(2)
+    expect(setup.data.session.input.has(item.sessionID, item.id)).toBe(false)
+    expect(setup.data.session.message.get(item.sessionID, item.id)?.time.created).toBe(2)
+  } finally {
+    transcripts.forEach((entry) => entry.resolve(Response.json({ data: [], cursor: {} })))
+    setup.dispose()
+  }
+})
+
+test("an accepted prompt stays queued without holding back the next admission", async () => {
+  const inbox = Promise.withResolvers<Response>()
+  const posts: string[] = []
+  let reads = 0
+  const setup = fixture(async (request) => {
+    if (request.method === "POST") {
+      const body = (await request.json()) as { id: string }
+      posts.push(body.id)
+      return Response.json({ data: { id: body.id } })
+    }
+
+    if (new URL(request.url).pathname.endsWith("/message")) reads++
+    return inbox.promise.then((value) => value.clone())
+  })
+  const queued: SessionInboxItem = { ...item, id: "msg_first", delivery: "queue", payload: { text: "First" } }
+  const second: SessionInboxItem = { ...item, id: "msg_second", payload: { text: "Second" } }
+  try {
+    await setup.data.session.prompt({ sessionID: item.sessionID, id: queued.id, text: "First", delivery: "queue" })
+    await setup.data.session.prompt({ sessionID: item.sessionID, id: second.id, text: "Second" })
+    expect(posts).toEqual([queued.id, second.id])
+    expect(setup.data.session.input.list(item.sessionID)).toEqual([queued.id, second.id])
+    expect(setup.data.session.pending.status(item.sessionID, queued.id)).toBe("queued")
+    // A positive inbox read, not a transcript read, settles both as server state.
+    inbox.resolve(Response.json({ data: [queued, second] }))
+    await setup.data.session.pending.sync(item.sessionID)
+    expect(setup.data.session.input.list(item.sessionID)).toEqual([queued.id, second.id])
+    expect(reads).toBe(0)
+  } finally {
+    inbox.resolve(Response.json({ data: [] }))
+    setup.dispose()
+  }
+})
+
+test("a rejected admission rolls back only its own row, and a failed retry keeps the accepted one", async () => {
+  const inbox = Promise.withResolvers<Response>()
+  let posts = 0
+  const setup = fixture(async (request) => {
+    if (request.method === "POST")
+      return ++posts === 1 ? Response.json({ data: { id: "msg_first" } }) : new Response("Admission failed", { status: 500 })
+    return inbox.promise.then((value) => value.clone())
+  })
+  try {
+    await setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_first", text: "First" })
+    await expect(setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_second", text: "Second" })).rejects.toThrow()
+    await expect(setup.data.session.prompt({ sessionID: item.sessionID, id: "msg_first", text: "First" })).rejects.toThrow()
+    expect(setup.data.session.input.list(item.sessionID)).toEqual(["msg_first"])
+    expect(setup.data.session.message.get(item.sessionID, "msg_first")?.type).toBe("user")
+    expect(setup.data.session.message.get(item.sessionID, "msg_second")).toBeUndefined()
+  } finally {
+    inbox.resolve(Response.json({ data: [] }))
+    setup.dispose()
+  }
+})
+
+test.each([
+  ["delivered", "succeeds"],
+  ["cancelled", "succeeds"],
+  ["delivered", "fails"],
+] as const)("a prompt %s before its POST %s is not resurrected or rolled back", async (action, outcome) => {
+  const response = Promise.withResolvers<Response>()
+  let reads = 0
+  const setup = fixture(async (request) => {
+    if (request.method === "POST") return response.promise
+    reads++
+    return Response.json({ data: [], cursor: {} })
+  })
+  try {
+    const admission = setup.data.session
+      .prompt({ sessionID: item.sessionID, id: item.id, text: item.payload.text })
+      .catch(() => undefined)
+    setup.emit({
+      id: "evt_consumed",
+      type: `session.inbox.${action}`,
+      created: 2,
+      durable: { aggregateID: item.sessionID, seq: 2, version: 1 },
+      data: { sessionID: item.sessionID, inboxID: item.id },
+    })
+    response.resolve(
+      outcome === "succeeds" ? Response.json({ data: { id: item.id } }) : new Response("Lost response", { status: 500 }),
+    )
+    await admission
+    expect(setup.data.session.input.has(item.sessionID, item.id)).toBe(false)
+    const message = setup.data.session.message.get(item.sessionID, item.id)
+    if (action === "cancelled") expect(message).toBeUndefined()
+    else expect(message?.time.created).toBe(2)
+    expect(reads).toBe(0)
   } finally {
     response.resolve(Response.json({ data: item }))
     setup.dispose()

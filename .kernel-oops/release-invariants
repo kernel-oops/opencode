@@ -10,3 +10,11 @@ packages/core test/anthropic-legacy-replay.test.ts         interrupted/cross-pro
 # f8a78b89: experimental flags are read per field across config documents, not from the last whole experimental block.
 packages/core test/schedule.test.ts                        Schedule.enabled survives a later experimental block
 packages/core test/tool-schedule.test.ts                   schedule tools register when another document sets experimental
+
+# B15 v2.2.6 overlap: upstream's composer submit machine owns sends; the fork's typed review approval must join it.
+flags packages/app --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts
+packages/app src/composer/submit.test.ts                   typed approval owns submission; a newer draft survives it
+# Fork metadata notification and upstream reconcile share one session.metadata.updated handler.
+packages/client test/solid-data.test.ts                    metadata replaces the whole record; live update beats stale page
+# Fork release-on-POST (706dcbb80c) and upstream transcript proof (0d226daccf): an acknowledged prompt stays pending until its outcome is shown.
+packages/client test/solid-inbox-race.test.ts              accepted prompt survives empty/older reads; proof, delivery or cancellation settles it

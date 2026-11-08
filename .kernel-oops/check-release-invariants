@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Fork release gate. Default: fail unless every test in .kernel-oops/release-invariants exists and passes.
+# A `flags <package dir> <bun test flags...>` line gives the flags that package's tests need (e.g. the app's Solid harness).
 # --overlap OLD NEW [OURS]: list upstream OLD..NEW commits touching files our OLD..OURS patch set also changes.
 set -euo pipefail
 root=$(git rev-parse --show-toplevel)
@@ -16,9 +17,11 @@ if [ "${1:-}" = "--overlap" ]; then
 fi
 
 entries=()
+declare -A flags=()
 missing=0
-while read -r dir file _; do
+while read -r dir file rest; do
   [[ -z "$dir" || "$dir" == \#* ]] && continue
+  if [ "$dir" = flags ]; then flags[$file]=$rest; continue; fi
   if [ -f "$root/$dir/$file" ]; then entries+=("$dir $file"); else echo "MISSING invariant test: $dir/$file" >&2; missing=1; fi
 done <"$list"
 [ "$missing" -eq 0 ] || exit 1
@@ -28,6 +31,7 @@ failed=0
 for entry in "${entries[@]}"; do
   read -r dir file <<<"$entry"
   echo "== $dir/$file"
-  (cd "$root/$dir" && bun test "$file") || { echo "FAILED invariant test: $dir/$file" >&2; failed=1; }
+  read -ra extra <<<"${flags[$dir]:-}"
+  (cd "$root/$dir" && bun test "${extra[@]}" "$file") || { echo "FAILED invariant test: $dir/$file" >&2; failed=1; }
 done
 exit "$failed"

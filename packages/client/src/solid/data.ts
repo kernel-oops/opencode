@@ -435,12 +435,13 @@ export function createData(config: CreateDataInput) {
     setStore("session", "pending", sessionID, index, { ...item, delivery })
   }
 
-  // Inbox IDs of optimistic admissions awaiting acknowledgement, so rejection
-  // only rolls back unacknowledged rows and a pending re-fetch cannot wipe a
-  // row the server does not know about yet. Prompts clear on their durable
-  // echo, positive pending read, or rollback; compactions also reconcile the
-  // POST's canonical ID.
-  const outbox = new Set<string>()
+  // Inbox IDs of optimistic admissions the server has not yet shown, so a
+  // pending or transcript re-fetch cannot wipe a row it does not know about yet.
+  // "sending" rows may roll back on rejection; "accepted" rows (POST acknowledged,
+  // outcome unproven) never do. Prompts clear on their durable echo, delivery,
+  // cancellation, positive pending read, transcript proof, or rollback;
+  // compactions also reconcile the POST's canonical ID.
+  const outbox = new Map<string, "sending" | "accepted">()
 
   // Session IDs of optimistic create admissions still awaiting acknowledgement
   // (the session.created echo or the create response itself). A failed create
@@ -679,7 +680,7 @@ export function createData(config: CreateDataInput) {
     sync.invalidate(`session.pending:${sessionID}`)
     sync.invalidate(`session.message:${sessionID}`)
     messageLoads.delete(sessionID)
-    // Keep unacknowledged submissions until their echo or rollback settles them.
+    // Keep submissions the server has not shown yet until their outcome or rollback settles them.
     const pending = store.session.pending[sessionID]?.filter((item) => outbox.has(item.id)) ?? []
     const messages = store.session.message[sessionID]?.filter((item) => outbox.has(item.id)) ?? []
     messageIndex.delete(sessionID)
@@ -884,8 +885,9 @@ export function createData(config: CreateDataInput) {
       }
       case "session.metadata.updated":
         // Providers mark mirrored subagent sessions running here (see the sidebar's Subagents list).
+        // The event carries the whole record, so keys it drops must go too.
         if (store.session.info[event.data.sessionID]) {
-          setStore("session", "info", event.data.sessionID, "metadata", event.data.metadata)
+          setStore("session", "info", event.data.sessionID, "metadata", reconcile(event.data.metadata))
           notifySessionInfo(event.data.sessionID)
         }
         return
@@ -907,11 +909,6 @@ export function createData(config: CreateDataInput) {
           setStore("session", "info", event.data.sessionID, "contextBudgetState", event.data.state ?? undefined)
           notifySessionInfo(event.data.sessionID)
         }
-        return
-      case "session.metadata.updated":
-        // The event carries the whole record, so keys it drops must go too.
-        if (store.session.info[event.data.sessionID])
-          setStore("session", "info", event.data.sessionID, "metadata", reconcile(event.data.metadata))
         return
       case "session.archived":
         if (store.session.info[event.data.sessionID])
@@ -969,6 +966,7 @@ export function createData(config: CreateDataInput) {
         return
       }
       case "session.inbox.delivered": {
+        outbox.delete(event.data.inboxID)
         const admitted = result.session.input.has(event.data.sessionID, event.data.inboxID)
         removePending(event.data.sessionID, event.data.inboxID)
         message.update(event.data.sessionID, (draft, index) => {
@@ -988,6 +986,7 @@ export function createData(config: CreateDataInput) {
         updatePending(event.data.sessionID, event.data.inboxID, event.data.delivery)
         return
       case "session.inbox.cancelled": {
+        outbox.delete(event.data.inboxID)
         retractLocal(event.data.sessionID, event.data.inboxID)
         compacting.get(event.data.sessionID)?.observed.add(event.data.inboxID)
         return
@@ -1848,7 +1847,7 @@ export function createData(config: CreateDataInput) {
         // a fresh ID and let the server coalesce, without duplicating its row.
         const id = SessionMessage.ID.create()
         if (!store.session.pending[input.sessionID]?.some((item) => item.type === "compaction")) {
-          outbox.add(id)
+          outbox.set(id, "sending")
           admitLocal({
             id,
             sessionID: input.sessionID,
@@ -1906,7 +1905,7 @@ export function createData(config: CreateDataInput) {
             metadata: request.metadata,
           }
           if (files) payload.files = files
-          outbox.add(id)
+          outbox.set(id, "sending")
           admitLocal({
             id,
             sessionID: request.sessionID,
@@ -1928,16 +1927,30 @@ export function createData(config: CreateDataInput) {
           },
           gate,
         ).then((item) => {
-          // The response acknowledges admission even if both inbox events were missed.
-          if (fresh && outbox.delete(id)) {
+          // The response acknowledges admission, not delivery: keep the row until
+          // its outcome is shown, in case both inbox events were missed.
+          if (fresh && outbox.has(id)) {
+            outbox.set(id, "accepted")
             result.session.pending.invalidate(request.sessionID)
-            refresh(() => result.session.pending.sync(request.sessionID))
+            refresh(async () => {
+              await result.session.pending.sync(request.sessionID)
+              if (outbox.get(id) !== "accepted") return
+              // A post-acknowledgement inbox read no longer holds it, so one fresh
+              // transcript read supplies the delivery proof.
+              result.session.message.invalidate(request.sessionID)
+              await result.session.message.sync(request.sessionID)
+            })
           }
+
           return item
         }).catch((error) => {
           // Roll back only rows this call admitted and the server has not
           // acknowledged: anything else is server state.
-          if (fresh && outbox.delete(id)) retractLocal(request.sessionID, id)
+          if (fresh && outbox.get(id) === "sending") {
+            outbox.delete(id)
+            retractLocal(request.sessionID, id)
+          }
+
           throw error
         })
       },

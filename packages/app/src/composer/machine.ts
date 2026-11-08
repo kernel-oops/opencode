@@ -54,7 +54,8 @@ export type ComposerSubmitState =
   // Session shows in its timeline at once and leaves the composer (`shown`); any other send waits in the composer,
   // where an edit cancels it.
   | { type: "held"; attempt: number; snapshot: SubmitSnapshot; shown: ShownHold | undefined; done: SubmitDone }
-  // A client command or a quote runs; neither takes the draft, but the composer submits nothing else meanwhile.
+  // A client command, a quote or a typed review approval runs; none takes the draft, but the composer submits nothing
+  // else meanwhile.
   | { type: "running"; attempt: number; done: SubmitDone }
   // Image attachments resolve and, for a new Session, the Session starts. Nothing is sent yet. `cleared` is the
   // composer a shown hold already cleared.
@@ -113,6 +114,8 @@ export type QuoteSnapshot = {
 export type ComposerSubmitEvent =
   | { type: "submit"; snapshot: SubmitSnapshot; done: SubmitDone }
   | { type: "quote"; snapshot: QuoteSnapshot; done: SubmitDone }
+  /** A typed "I approve per_…" answers its review request directly; `approve` replies to the server. */
+  | { type: "review"; approve: () => Promise<void>; done: SubmitDone }
   | { type: "stop" }
   | { type: "unmounted" }
   | { type: "hold.changed"; attempt: number }
@@ -148,6 +151,7 @@ export type ComposerSubmitEffect =
   /** Removes a cancelled held prompt from the timeline and returns it to the composer it left. */
   | { type: "hold.cancel"; session: ComposerSession; snapshot: SubmitSnapshot; cleared: Prompt | undefined }
   | { type: "command.run"; attempt: number; prompt: Prompt; run: () => void | Promise<void> }
+  | { type: "review.approve"; attempt: number; approve: () => Promise<void> }
   | {
       type: "quote.send"
       attempt: number
@@ -200,6 +204,16 @@ export function transitionComposerSubmit(
   if (event.type === "submit") return submit(state, event.snapshot, event.done)
 
   if (event.type === "quote") return quote(state, event.snapshot, event.done)
+
+  if (event.type === "review") {
+    if (state.type !== "idle") return { state, effects: [{ type: "done", done: event.done, sent: false }] }
+    const attempt = state.attempt + 1
+
+    return {
+      state: { type: "running", attempt, done: event.done },
+      effects: [{ type: "review.approve", attempt, approve: event.approve }],
+    }
+  }
 
   // Stopping a held send cancels it and leaves the prompt in the composer.
   if (event.type === "stop")

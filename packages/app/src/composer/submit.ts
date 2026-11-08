@@ -144,6 +144,18 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       return
     }
 
+    if (effect.type === "review.approve") {
+      void effect.approve().then(
+        () => dispatch({ type: "run.settled", attempt: effect.attempt, sent: true }),
+        (error) => {
+          input.notify.failed("command", error)
+          dispatch({ type: "run.settled", attempt: effect.attempt, sent: false })
+        },
+      )
+
+      return
+    }
+
     if (effect.type === "quote.send") {
       input.adapter.beforeSubmit?.()
       const target = input.adapter.state
@@ -258,30 +270,30 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
 
   onCleanup(() => dispatch({ type: "unmounted" }))
 
-  // "I approve per_…" answers a pending review_once request directly and never reaches the model. The typed phrase
-  // stays in the composer until the server accepts the approval.
-  let approving = false
-  const approveReview = async (prompt: Prompt, text: string) => {
-    if (approving || state().type !== "idle") return
-    approving = true
+  // "I approve per_…" answers a pending review_once request directly and never reaches the model. It owns the submit
+  // lifecycle like a client command, and the typed phrase stays in the composer until the server accepts it.
+  const approveReview = (prompt: Prompt, text: string) => {
+    if (state().type !== "idle") return Promise.resolve()
+    const reviewID = ReviewApproval.requestID(text)
+    const reply = input.reviewApproval
+    const target = input.adapter.state
 
-    try {
-      const reviewID = ReviewApproval.requestID(text)
+    if (!reviewID || prompt.some((part) => part.type !== "text") || target.context.items().length || !reply) {
+      input.notify.failed("command", new Error(input.invalidReviewApproval?.() ?? "Invalid permission approval"))
 
-      if (
-        !reviewID ||
-        prompt.some((part) => part.type !== "text") ||
-        input.adapter.state.context.items().length ||
-        !input.reviewApproval
-      )
-        throw new Error(input.invalidReviewApproval?.() ?? "Invalid permission approval")
-      await input.reviewApproval(reviewID)
-      clearClientCommand(input, prompt)
-    } catch (error) {
-      input.notify.failed("command", error)
-    } finally {
-      approving = false
+      return Promise.resolve()
     }
+
+    const approved = JSON.stringify(target.current())
+
+    const approve = async () => {
+      await reply(reviewID)
+
+      // A draft typed while the approval waited is the user's; only the unchanged phrase clears.
+      if (JSON.stringify(target.current()) === approved) clearClientCommand(input, prompt, target)
+    }
+
+    return new Promise<void>((resolve) => dispatch({ type: "review", approve, done: () => resolve() }))
   }
 
   return {
@@ -480,9 +492,9 @@ function afterHold(draft: CapturedDraft, cleared: Prompt): ClearedComposer {
   return { cleared: current, following: typed ? clonePrompt(current) : undefined, edited }
 }
 
-function clearClientCommand(input: ComposerSubmitInput, prompt: Prompt) {
-  input.adapter.state.set([{ type: "text", content: "", start: 0, end: 0 }, ...prompt.filter(isAttachment)], 0)
-  input.adapter.state.mode.set("normal")
+function clearClientCommand(input: ComposerSubmitInput, prompt: Prompt, target = input.adapter.state) {
+  target.set([{ type: "text", content: "", start: 0, end: 0 }, ...prompt.filter(isAttachment)], 0)
+  target.mode.set("normal")
   input.closePopover()
 }
 
