@@ -69,7 +69,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
     },
   pluginID: string,
 ) {
-  const app = yield* App.Metadata
+  const app = yield* App.Service
   const agents = yield* Agent.Service
   const artifacts = yield* Artifact.Service
   const aisdk = yield* AISDK.Service
@@ -645,7 +645,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
       switchAgent: sessions.switchAgent,
       switchModel: sessions.switchModel,
       prompt: sessions.prompt,
-      generate: (input) => sessions.generate(input).pipe(Effect.map((text) => ({ text }))),
+      generate: sessions.generate,
       command: (input) => sessions.command({ ...input, command: input.name }),
       // Public fields only: the internal checkpoint binding is reachable through `stateCheckpoint.compact` alone.
       compact: (input) => sessions.compact({ sessionID: input.sessionID, id: input.id, delivery: input.delivery }),

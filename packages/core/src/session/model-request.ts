@@ -346,7 +346,7 @@ export const layer = Layer.effect(
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
     const store = yield* SessionStore.Service
-    const app = yield* App.Metadata
+    const app = yield* App.Service
     const bus = yield* Bus.Service
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },

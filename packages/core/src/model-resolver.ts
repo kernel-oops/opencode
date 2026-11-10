@@ -156,6 +156,9 @@ export type MediaError =
   | Integration.AuthorizationError
 
 export interface Interface {
+  /** The model used when nothing is selected: the configured default, or the first available text model. */
+  readonly fallback: () => Effect.Effect<Info | undefined>
+  /** An enabled image model by ref, or undefined when no image model has that ref. */
   readonly resolveImage: (ref: Ref) => Effect.Effect<ImageModel | undefined, MediaError>
   readonly resolveDecision: (ref: Ref) => Effect.Effect<DecisionModel | undefined, MediaError>
   readonly resolve: (requested?: Ref, options?: Options) => Effect.Effect<Resolved | undefined, Error>
@@ -587,23 +590,18 @@ export const layer = Layer.effect(
       const { credential, runtimeInfo } = yield* prepare(info, ref.variant)
       return yield* fromCatalogMedia(runtimeInfo, is, credential, dependencies)
     })
-    const selectDefault = models
-      .default()
-      .pipe(
-        Effect.flatMap((model) =>
-          model && hasPackage(model)
-            ? Effect.succeed(model)
-            : Effect.map(models.available(), (models) =>
-                models.find((model) => hasPackage(model) && Model.supportsText(model)),
-              ),
-        ),
-      )
+    const fallback = Effect.fn("ModelResolver.fallback")(function* () {
+      const model = yield* models.default()
+      if (model && hasPackage(model)) return model
+      return (yield* models.available()).find((model) => hasPackage(model) && Model.supportsText(model))
+    })
     return Service.of({
       resolve: Effect.fn("ModelResolver.resolve")(function* (requested, options) {
-        const selected = requested ? yield* models.get(requested.providerID, requested.id) : yield* selectDefault
+        const selected = requested ? yield* models.get(requested.providerID, requested.id) : yield* fallback()
         if (!selected) return undefined
         return yield* load(selected, requested?.variant, options)
       }),
+      fallback,
       resolveModel: load,
       resolveImage: (ref) => loadMedia(ref, "image", isImageModel),
       resolveDecision: (ref) => loadMedia(ref, "decision", isDecisionModel),
@@ -611,7 +609,7 @@ export const layer = Layer.effect(
         // Mirrors SessionRunnerModel: explicit selections come from the available catalog.
         const selected = requested
           ? (yield* models.available()).find((model) => model.providerID === requested.providerID && model.id === requested.id)
-          : yield* selectDefault
+          : yield* fallback()
         if (!selected) return "model-unavailable" as const
         const provider = yield* providers.get(selected.providerID)
         if (provider?.settings?.nativeSteer !== "response.steer") return "allowance-missing" as const
@@ -641,9 +639,12 @@ export const layer = Layer.effect(
 )
 
 function hasConfiguredAuth(model: RuntimeInfo) {
-  return [model.settings?.apiKey, model.settings?.authToken, model.settings?.accessToken].some(
-    (value) => typeof value === "string" && value !== "",
-  )
+  return [
+    model.settings?.apiKey,
+    model.settings?.gatewayApiKey,
+    model.settings?.authToken,
+    model.settings?.accessToken,
+  ].some((value) => typeof value === "string" && value !== "")
 }
 
 const API_KEY_AUTH_PACKAGES: ReadonlySet<string> = new Set([

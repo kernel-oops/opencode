@@ -276,6 +276,7 @@ const readinessFixture = Effect.fn(function* () {
         resolveDecision: () => Effect.die("unused"),
         resolveModel: () => Effect.die("Unused by stateless generation"),
         nativeSteerSupport: () => Effect.die("Unused by stateless generation"),
+        fallback: () => Effect.die("Unused by stateless generation"),
         resolve: () =>
           Effect.sync(() => {
             resolutions.push(location.directory)

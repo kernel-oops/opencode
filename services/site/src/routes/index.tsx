@@ -20,7 +20,6 @@ import {
   Suspense,
   Switch,
 } from "solid-js"
-import { Faq } from "~/component/faq"
 import { ConsoleField } from "~/component/site/console-field"
 import { ChevronRight, ExternalArrow } from "~/component/site/icons"
 import { LogoWall } from "~/component/site/logo-wall"
@@ -49,7 +48,7 @@ import { isMobile } from "~/lib/platform"
 import { LocaleLinks } from "~/component/locale-links"
 import { ShareMeta } from "~/component/share-meta"
 import { ogImage } from "~/lib/og"
-import { faqData, JsonLd, organizationData, softwareData, websiteData } from "~/component/structured-data"
+import { JsonLd, organizationData, softwareData, websiteData } from "~/component/structured-data"
 import { Rich } from "~/component/site/rich-text"
 import { homeOrderDefaultCss, homeOrderScript, homeOrderStyleId, useHomeOrder } from "~/component/site/home-order"
 import { designCopy, designEditing } from "~/component/site/design-copy"
@@ -67,10 +66,16 @@ import { repoStats, type RepoStats } from "~/lib/github"
 import { inlineKey } from "~/lib/direction"
 import { copyOnClick } from "~/lib/clipboard"
 
+// Settings › Hero text and Stats pick these in development; production shows the static title and
+// the slot stats, so the rolling chunk isn't built.
+const HeroTitle = import.meta.env.DEV
+  ? lazy(() => import("~/component/site/rolling").then((module) => ({ default: module.HeroTitle })))
+  : () => undefined
+const RollingStat = import.meta.env.DEV
+  ? lazy(() => import("~/component/site/rolling").then((module) => ({ default: module.RollingStat })))
+  : () => undefined
 // Only rendered inside the settings panel, so it loads with it.
 // Settings rows are a development tool (component/site/settings-panel.tsx), left out of production.
-const HeroTitle = lazy(() => import("~/component/site/rolling").then((module) => ({ default: module.HeroTitle })))
-const RollingStat = lazy(() => import("~/component/site/rolling").then((module) => ({ default: module.RollingStat })))
 const PageSettings = import.meta.env.DEV ? lazy(() => import("~/component/site/page-settings")) : () => undefined
 
 export default function Home() {
@@ -217,7 +222,6 @@ export default function Home() {
           operatingSystem: "macOS, Windows, Linux",
         })}
       />
-      <JsonLd data={faqData(content().faq.items)} />
 
       {/* The default section order from the server; a saved one (Design mode, development only)
           replaces it before the sections paint. */}
@@ -451,37 +455,6 @@ export default function Home() {
 
       <section
         data-component="block"
-        data-section="faq"
-        data-design="faqColumns spacer spacerLength spacerCount spacerStartDash spacerStartGap spacerCurve ditherHeight ditherOrientation ditherDirection ditherLength ditherPixel ditherPattern ditherDensity ditherOpacity ditherCurve ditherLine"
-        data-columns={siteSettings.faqColumns.charAt(0)}
-      >
-        <h2 data-slot="label">{content().faq.title}</h2>
-        <div data-slot="body">
-          <ul data-component="faq">
-            <For each={content().faq.items}>
-              {(item) => (
-                <li>
-                  <Faq question={item.question}>
-                    <Show
-                      when={"copy" in item && item.copy ? (item.copy as CopyId) : undefined}
-                      fallback={<Rich value={item.answer} />}
-                    >
-                      {(copy) => (
-                        <span data-design-copy={copy()}>
-                          <Rich value={richCopy(copy(), item.answer, content().copyLinks)} />
-                        </span>
-                      )}
-                    </Show>
-                  </Faq>
-                </li>
-              )}
-            </For>
-          </ul>
-        </div>
-      </section>
-
-      <section
-        data-component="block"
         data-section="console"
         data-design="consoleSection consoleHeight consoleColumns consoleCopyColumns consoleLabel consoleLayout"
         data-columns={siteSettings.consoleColumns.charAt(0)}
@@ -539,7 +512,8 @@ export default function Home() {
  * Settings › Announcement: a "New" bar level with the logo, over the hero's three card columns
  * (in the page's flow on phones). It always renders; the site root's data-home-announcement (set
  * before first paint for a saved value) opens it, and changes animate its height and opacity.
- * ⇧A (or the older ⇧N) toggles it, like ⇧S and ⇧D for Settings and Design mode, except while typing.
+ * On the development server ⇧A (or the older ⇧N) toggles it, like ⇧S and ⇧D for Settings and Design
+ * mode, except while typing.
  */
 function Announcement() {
   const language = useLanguage()
@@ -896,7 +870,11 @@ function SlotStat(props: { value: string; start?: number; stat: number }) {
 }
 
 function SlotDigit(props: { digit: number; start?: number; place: number; stat: number }) {
+  // The reel's cells are added when it first spins and stay; only a spinning reel shows more than the
+  // first (index.css). Removing them as each digit landed, a frame apart, restyled the whole page in
+  // each of those frames (every :has() rule re-checks a removal), right while it scrolled.
   const [reel, setReel] = createSignal([props.digit])
+  const [spinning, setSpinning] = createSignal(false)
   let strip: HTMLSpanElement | undefined
   createEffect(
     on(
@@ -911,6 +889,7 @@ function SlotDigit(props: { digit: number; start?: number; place: number; stat: 
           props.digit,
         ]
         setReel(digits)
+        setSpinning(true)
         const line = strip.parentElement?.getBoundingClientRect().height ?? 0
         const animation = strip.animate(
           [{ transform: "translateY(0)" }, { transform: `translateY(${-(digits.length - 1) * line}px)` }],
@@ -922,7 +901,8 @@ function SlotDigit(props: { digit: number; start?: number; place: number; stat: 
           },
         )
         animation.onfinish = () => {
-          setReel([props.digit])
+          setReel((cells) => cells.with(0, props.digit))
+          setSpinning(false)
           animation.cancel()
         }
         onCleanup(() => animation.cancel())
@@ -930,7 +910,7 @@ function SlotDigit(props: { digit: number; start?: number; place: number; stat: 
     ),
   )
   return (
-    <span data-slot="reel" aria-hidden="true" data-spinning={reel().length > 1 ? "" : undefined}>
+    <span data-slot="reel" aria-hidden="true" data-spinning={spinning() ? "" : undefined}>
       <span data-slot="strip" ref={strip}>
         <Index each={reel()}>{(digit) => <span>{digit()}</span>}</Index>
       </span>
@@ -1371,6 +1351,20 @@ function ToolGrid(props: {
     return wash.armed() && style ? { animation: style, vars: revealMotion(style, siteSettings.logoTuning) } : undefined
   }
   createEffect(on([animation, () => siteSettings.toolsStagger], wash.replay, { defer: true }))
+  // The tiles' logos (SVG masks, index.css) load once the grid is within a screen of the window, so
+  // a page doesn't fetch them with its first screen.
+  onMount(() => {
+    const near = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return
+        grid?.setAttribute("data-near", "")
+        near.disconnect()
+      },
+      { rootMargin: "100% 0px" },
+    )
+    if (grid) near.observe(grid)
+    onCleanup(() => near.disconnect())
+  })
 
   return (
     <ul
@@ -1414,7 +1408,7 @@ function ToolGrid(props: {
                           role={props.iconTiles ? "img" : undefined}
                           aria-label={props.iconTiles ? tool.name : undefined}
                           aria-hidden={props.iconTiles ? undefined : "true"}
-                          style={{ "mask-image": `url(${tool.logo})`, "-webkit-mask-image": `url(${tool.logo})` }}
+                          style={{ "--logo": `url(${tool.logo})` }}
                         />
                         {props.iconTiles ? null : tool.name}
                       </>
@@ -1424,8 +1418,7 @@ function ToolGrid(props: {
                       data-slot="wordmark"
                       aria-hidden="true"
                       style={{
-                        "mask-image": `url(${tool.wordmark})`,
-                        "-webkit-mask-image": `url(${tool.wordmark})`,
+                        "--logo": `url(${tool.wordmark})`,
                         ...(tool.metrics ? balanceLogo(tool.metrics) : {}),
                       }}
                     />

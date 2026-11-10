@@ -145,7 +145,10 @@ const layer = Layer.effect(
                   Effect.gen(function* () {
                     yield* plugins.awaitActivation
                     const selected = yield* context.select(sessionID)
-                    const model = yield* context.resolveModel(selected.session)
+                    const model = yield* context.resolveModel(selected.session, {
+                      kind: "compaction",
+                      agent: selected.agent.id,
+                    })
                     // Preview updates without admitting them after the already-delivered compaction marker.
                     const history = yield* SessionHistory.preview(db, sessionID, selected.instructions, model.ref)
                     return yield* compaction.compact({
@@ -336,6 +339,7 @@ const layer = Layer.effect(
           })
         }),
       ).pipe(Effect.uninterruptible)
+      let retryAttempt: number | undefined
       while (true) {
         const steering = initialSteering ?? (yield* SessionInbox.watch(db, sessionID))
         initialSteering = undefined
@@ -435,6 +439,7 @@ const layer = Layer.effect(
                 hook: prepared.retry,
                 retry: proposed,
               }),
+            retryAttempt,
             recoverContinuation,
             recoverOverflow: Effect.suspend(() =>
               recoverOverflow
@@ -445,6 +450,7 @@ const layer = Layer.effect(
             ),
           })
           .pipe(Effect.ensuring(steering.finish))
+        retryAttempt = undefined
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           BudgetTarget: Effect.fnUntraced(function* (outcome) {
             const current = yield* store.get(sessionID)
@@ -470,13 +476,16 @@ const layer = Layer.effect(
               )
             return outcome.needsContinuation
           }),
-          Retry: (outcome) =>
-            retry.wait({
+          Retry: Effect.fnUntraced(function* (outcome) {
+            retryAttempt = outcome.decision.attempt
+            yield* retry.wait({
               decision: outcome.decision,
               error: outcome.error,
               assistantMessageID,
-            }),
+            })
+          }),
           Continue: Effect.fnUntraced(function* (outcome) {
+            retryAttempt = outcome.decision.attempt
             yield* retry.wait({
               decision: outcome.decision,
               error: outcome.error,

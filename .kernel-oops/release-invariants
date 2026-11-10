@@ -10,6 +10,10 @@ packages/core test/anthropic-legacy-replay.test.ts         interrupted/cross-pro
 # f8a78b89: experimental flags are read per field across config documents, not from the last whole experimental block.
 packages/core test/schedule.test.ts                        Schedule.enabled survives a later experimental block
 packages/core test/tool-schedule.test.ts                   schedule tools register when another document sets experimental
+# B17 v2.2.7 overlap: upstream rewrote flag.ts around a required build-metadata service (#62686); the fork's per-field read must stay inside it.
+packages/core test/flag.test.ts                            per-field flags across documents; every flag off in a latest release build
+# B17 v2.2.7 overlap: upstream's model resolve hook (#62997) added a request argument; the fork's native test policy is the separate options argument.
+packages/core test/session-generate.test.ts                only primary resolution reads the native test snapshot; generation stays HTTP
 
 # B15 v2.2.6 overlap: upstream's composer submit machine owns sends; the fork's typed review approval must join it.
 flags packages/app --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts

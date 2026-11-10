@@ -72,7 +72,12 @@ const make: Effect.Effect<Interface, never, Session.Service | Job.Service | Scop
       const info = yield* handle.wait
       if (yield* handle.claimBackground)
         yield* SubagentCompletion.deliver(sessions, jobs, { ...info, recovery })
-    }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.setContext(context))
+    }).pipe(
+      // The global context drops the caller's span annotations; delivery is the parent session's work.
+      Effect.annotateSpans("session.id", recovery.parentSessionID),
+      Effect.forkIn(scope, { startImmediately: true }),
+      Effect.setContext(context),
+    )
   })
 
   return Service.of({

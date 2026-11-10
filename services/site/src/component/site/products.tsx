@@ -24,7 +24,7 @@ import { extensionCardSource, productsSource } from "~/i18n/content/areas/produc
 import type { DownloadPlatform } from "~/routes/download/types"
 import {
   desktopBuilds,
-  detectDesktopBuild,
+  detectDesktopDownload,
   detectOS,
   getDownloadHref,
   getDownloadPlatform,
@@ -55,29 +55,24 @@ import {
 import { designCopy, designMode } from "./design-copy"
 import { sortableProducts } from "./products-order"
 import { carouselBreakpoints, cardEasingCurves, siteSettings } from "./settings"
-import { pageMedia, pageScheme, productVideo } from "./videos"
-import { imageSources, loadStill, posterFile, Still, stillSizes, VideoSources } from "./media"
+import { pageMedia, productVideo } from "./videos"
+import {
+  imageSources,
+  loadStill,
+  pageScheme,
+  posterFile,
+  prefersReducedMotion,
+  rescueMedia,
+  Still,
+  stillSizes,
+  VideoSources,
+} from "./media"
 import { inlineKey } from "~/lib/direction"
 
 export { installs, products, sdkSnippet, type ProductSlug } from "./product-data"
 
 // Loaded only for a fine pointer once the carousel's cards overflow (ProductCarousel).
 const ProductsArrows = lazy(() => import("./products-arrows"))
-
-/**
- * Loads a video again once it is on the page. A client-rendered video gets its src while it still
- * belongs to Solid's template document, and while the router holds a new page off screen for its
- * data, Chromium tries the load there and rejects the URL ("URL safety check"). Joining the page
- * does not retry it. A video that has already picked its source is left alone.
- */
-export function rescueMedia(video: HTMLVideoElement | undefined) {
-  if (video && (video.getAttribute("src") || video.querySelector("source[src]")) && !video.currentSrc) video.load()
-}
-
-/** True when the user asks for reduced motion. Always false during SSR. */
-export function prefersReducedMotion() {
-  return typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches
-}
 
 type Scroll = { y: number; x: number }
 /** The pages a product page's hero can shrink back into a card on: the home carousel and the /product grid. */
@@ -587,9 +582,9 @@ export function carouselCss() {
  * ("hover · reverse") or the still fades back over it ("hover · fade"). "autoplay" plays all the
  * time. Reduced motion keeps the still.
  *
- * With `loop`, the card rests on that short idle loop instead of a still: it plays while the card
- * is on screen, crossfades to the product video on hover and back on leave. Reduced motion shows
- * its first frame (`still`).
+ * With `loop`, the card rests on that short idle loop instead of a still: it shows its first frame
+ * (`still`) until the page has loaded, then plays while the card is on screen, crossfades to the
+ * product video on hover and back on leave. Reduced motion and Save-Data keep the first frame.
  */
 export function CardVideo(props: {
   src: string
@@ -657,10 +652,17 @@ export function CardVideo(props: {
   }
   createEffect(speed)
 
-  // The idle loop plays only while the card is on screen and resting.
+  // Reduced motion and Save-Data keep a card on its still: no resting loop and no sizzle.
+  const cover = () =>
+    prefersReducedMotion() ||
+    (navigator as typeof window.navigator & { connection?: { saveData?: boolean } }).connection?.saveData === true
+
+  // The idle loop plays only while the card is on screen and resting, and only once the page has
+  // loaded (ready), so it never competes with the stills: it starts from the frame the still shows.
+  let ready = false
   const rest = () => {
     if (!idle) return
-    if (visible && !active && mode() !== "autoplay" && !prefersReducedMotion()) {
+    if (ready && visible && !active && mode() !== "autoplay" && !cover()) {
       void idle.play().catch(() => {})
       return
     }
@@ -779,8 +781,6 @@ export function CardVideo(props: {
     // Leaving pauses the sizzle where it is and coming back resumes it, unless the card was away
     // for over 30s: then it starts again from the cover. Reduced motion and Save-Data keep the cover.
     setSizzle(window.matchMedia("(hover: none), (pointer: coarse)").matches || isMobile(detectPlatform()))
-    const connection = (navigator as typeof window.navigator & { connection?: { saveData?: boolean } }).connection
-    const cover = () => prefersReducedMotion() || connection?.saveData === true
     let wait: ReturnType<typeof setTimeout> | undefined
     let away = 0
     // Back to the cover with the sizzle rewound, without a fade (the card is off screen).
@@ -826,7 +826,13 @@ export function CardVideo(props: {
       { rootMargin: "100% 50%" },
     )
     if (media) ahead.observe(media)
+    const start = () => {
+      ready = true
+      rest()
+    }
+    afterLoad(start)
     onCleanup(() => {
+      window.removeEventListener("load", start)
       view.disconnect()
       ahead.disconnect()
       clearTimeout(wait)
@@ -844,13 +850,16 @@ export function CardVideo(props: {
       <video
         ref={video}
         aria-hidden="true"
-        // The demo's poster is its first product frame: show it only once the loop covers it, so the
-        // card never flashes the demo while it loads.
+        // The demo's poster is its first product frame, and the loop covers the demo until a frame
+        // of it is on screen (enter waits for one), so only autoplay, which takes the loop away
+        // once mounted, ever shows it.
         // On phones the cover stays over it until a frame of it is playing, so it needs no poster.
         // A clip whose still is its own poster (the feature clips) has the image over it until it
         // plays (except with autoplay), so the attribute would only download it again as WebP.
         poster={
-          (props.demo && !loaded()) || sizzle() || (!props.loop && !props.still && mode() !== "autoplay")
+          (props.demo && (still() || mode() !== "autoplay")) ||
+          sizzle() ||
+          (!props.loop && !props.still && mode() !== "autoplay")
             ? undefined
             : posterFile(props.poster)
         }
@@ -920,8 +929,8 @@ export function CardVideo(props: {
               muted
               loop
               playsinline
-              // The first screen's loops buffer with the page; the others once they play on screen.
-              preload={props.priority ? "auto" : "metadata"}
+              // Nothing loads until the loop first plays (rest), after the page has loaded.
+              preload="none"
             >
               <VideoSources src={loop()} video={() => idle} />
             </video>
@@ -962,7 +971,7 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
   const platform = useDevicePlatform()
   const mobile = () => isMobile(platform())
   const [os, setOS] = createSignal<OS>(requestOS())
-  // The exact build for this computer, once the browser has said (the Mac's chip; detectDesktopBuild).
+  // The build for this computer, once the browser has said (the Mac's chip, Windows or Linux on ARM64; detectDesktopDownload).
   const [build, setBuild] = createSignal<DownloadPlatform>()
   const [open, setOpen] = createSignal(false)
   onCloseMenus(() => setOpen(false))
@@ -1002,11 +1011,16 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
   onMount(() => {
     setOS(detectOS())
     setSheet(prefersSheet())
-    if (props.slug === "desktop") void detectDesktopBuild().then(setBuild)
+    if (props.slug === "desktop") void detectDesktopDownload().then(setBuild)
+    onCleanup(() => clearTimeout(timer))
+  })
+  // While the menu is open, Escape or a click outside it closes it.
+  createEffect(() => {
+    if (!open()) return
     const close = (event: Event) => {
       if (event instanceof KeyboardEvent && event.key !== "Escape") return
       if (event instanceof MouseEvent && menu?.contains(event.target as Node)) return
-      if (event instanceof KeyboardEvent && open() && menu?.contains(document.activeElement)) trigger?.focus()
+      if (event instanceof KeyboardEvent && menu?.contains(document.activeElement)) trigger?.focus()
       setOpen(false)
     }
     document.addEventListener("keydown", close)
@@ -1014,7 +1028,6 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
     onCleanup(() => {
       document.removeEventListener("keydown", close)
       document.removeEventListener("click", close)
-      clearTimeout(timer)
     })
   })
 
@@ -1075,7 +1088,7 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
   const storeRow = (item: (typeof stores)[number]) => (
     <>
       <PlatformIcon platform={item.beta ? "TestFlight" : item.platform} />
-      <span data-slot="label">
+      <span data-slot="label" dir="auto">
         {item.label}
         <Show when={item.beta}>
           <NewTab />
@@ -1107,7 +1120,9 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
       {(item) => (
         <a href={getDownloadHref(item.id)} data-slot="store" role="menuitem">
           <PlatformIcon platform={item.platform} />
-          <span data-slot="label">{i18n.t(item.label)}</span>
+          <span data-slot="label" dir="auto">
+            {i18n.t(item.label)}
+          </span>
         </a>
       )}
     </For>
@@ -1273,7 +1288,9 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
                           aria-label={i18n.t("site.action.comingSoonFor", { os: item.device })}
                         >
                           <PlatformIcon platform={item.platform} />
-                          <span data-slot="label">{item.device}</span>
+                          <span data-slot="label" dir="auto">
+                            {item.device}
+                          </span>
                           <span data-slot="status">{i18n.t("site.action.comingSoon")}</span>
                         </span>
                       </Show>
@@ -1383,13 +1400,11 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
                   <For each={desktopBuilds}>
                     {(item) => (
                       <li>
-                        <a
-                          href={getDownloadHref(item.id)}
-                          data-slot="row"
-                          on:click={() => sheetControl?.close()}
-                        >
+                        <a href={getDownloadHref(item.id)} data-slot="row" on:click={() => sheetControl?.close()}>
                           <PlatformIcon platform={item.platform} />
-                          <span data-slot="label">{i18n.t(item.label)}</span>
+                          <span data-slot="label" dir="auto">
+                            {i18n.t(item.label)}
+                          </span>
                         </a>
                       </li>
                     )}
@@ -1448,7 +1463,9 @@ export function ProductAction(props: { slug: PageSlug; split?: boolean; both?: b
                             aria-label={i18n.t("site.action.comingSoonFor", { os: item.device })}
                           >
                             <PlatformIcon platform={item.platform} />
-                            <span data-slot="label">{item.device}</span>
+                            <span data-slot="label" dir="auto">
+                              {item.device}
+                            </span>
                             <span data-slot="status">{i18n.t("site.action.comingSoon")}</span>
                           </button>
                         </Show>
