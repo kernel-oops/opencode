@@ -1875,6 +1875,68 @@ test("large fully cached descendant hydration yields to input and cancellation w
   }
 })
 
+test("a reconnect resync that refetches unchanged family data does not republish it", async () => {
+  // Each republished empty list used to re-run every family-wide view (tabs, program status), once per member.
+  const children = Array.from({ length: 50 }, (_, index) => ({
+    ...session(1),
+    id: `child_${index}`,
+    parentID: "ses_refresh",
+  }))
+  let title = "Same"
+  const api = OpenCode.make({
+    baseUrl: "http://fixture.invalid",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      if (url.pathname === "/api/session/ses_refresh") return Response.json({ data: session(1) })
+      if (url.pathname.endsWith("/permission") || url.pathname.endsWith("/form")) return Response.json({ data: [] })
+      const data =
+        url.searchParams.get("parentID") === "ses_refresh" ? children.map((child) => ({ ...child, title })) : []
+      return Response.json({ data, cursor: {} })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  // Store values keep their identity unless a write replaced them, so identity shows what was republished.
+  const view = () =>
+    setup.data.session
+      .family("ses_refresh")
+      .flatMap((id) => [
+        setup.data.session.get(id),
+        setup.data.session.permission.list(id),
+        setup.data.session.form.list(id),
+      ])
+  const resync = async () => {
+    await setup.data.session.descendants.sync("ses_refresh")
+    const family = setup.data.session.family("ses_refresh")
+    await Promise.all(
+      family.flatMap((id) => [setup.data.session.permission.sync(id), setup.data.session.form.sync(id)]),
+    )
+  }
+  const invalidate = () =>
+    setup.data.session.family("ses_refresh").forEach((id) => {
+      setup.data.session.descendants.invalidate(id)
+      setup.data.session.permission.invalidate(id)
+      setup.data.session.form.invalidate(id)
+    })
+  try {
+    await resync()
+    const before = view()
+    expect(before).toHaveLength(153)
+    invalidate()
+    await resync()
+    view().forEach((value, index) => expect(value).toBe(before[index]))
+    // A real change still publishes.
+    title = "Renamed"
+    invalidate()
+    await resync()
+    expect(setup.data.session.get("child_0")?.title).toBe("Renamed")
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("cold paginated idle descendants stay selected-scope and metadata changes supersede a page", async () => {
   const page = Promise.withResolvers<Response>()
   const started = Promise.withResolvers<void>()

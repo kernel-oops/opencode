@@ -2057,7 +2057,7 @@ export function createData(config: CreateDataInput) {
                       for (const child of children.slice(position, position + 128)) {
                         // A live metadata sync/deletion during paging supersedes this snapshot.
                         if (updated.has(child.id)) continue
-                        setStore("session", "info", child.id, child)
+                        setStore("session", "info", child.id, reconcile(child))
                         sync.complete(`session:${child.id}`)
                         registerSession(child.id)
                       }
@@ -2235,7 +2235,7 @@ export function createData(config: CreateDataInput) {
             const started = deletionEpoch
             const list = await api().permission.list({ sessionID }).catch(evictMissing)
             if ((deletedAt.get(sessionID) ?? 0) > started) return
-            setStore("session", "permission", sessionID, list)
+            setStore("session", "permission", sessionID, reconcile(list))
           })
         },
         invalidate(sessionID: string) {
@@ -2293,7 +2293,7 @@ export function createData(config: CreateDataInput) {
             const started = deletionEpoch
             const list = await api().session.form.list({ sessionID }).catch(evictMissing)
             if ((deletedAt.get(sessionID) ?? 0) > started) return
-            setStore("session", "form", sessionID, list)
+            setStore("session", "form", sessionID, reconcile(list))
           })
         },
         invalidate(sessionID: string, ref?: LocationRef) {
