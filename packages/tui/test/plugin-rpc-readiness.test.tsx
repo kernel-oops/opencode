@@ -116,8 +116,8 @@ test("server reload: an unchanged active inventory after the reload still retrie
   await app.setup.waitForFrame((frame) => frame.includes("1 plugin failed"))
   await app.setup.flush()
   const rejected = app.counts.status
-  // Bounded: at most one retry per inventory refresh, never a polling loop.
-  expect(rejected).toBeLessThanOrEqual(2)
+  // Bounded: the first setup plus at most one retry per inventory read, never a polling loop.
+  expect(rejected).toBeLessThanOrEqual(app.counts.list + 1)
   await Bun.sleep(300)
   expect(app.counts.status).toBe(rejected)
 
