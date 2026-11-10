@@ -8,7 +8,8 @@ import { startServer } from "./fixture/server"
 
 // Offline fixture only: the provider endpoint is never contacted because no prompt is submitted.
 const config = (allowance: boolean) => ({
-  model: "fixture/chat",
+  // The resolver gates native steering on a GPT-6 identity as well as the Responses route and the allowance.
+  model: "fixture/gpt-6",
   providers: {
     fixture: {
       package: "@opencode/ai/providers/openai",
@@ -18,7 +19,7 @@ const config = (allowance: boolean) => ({
         transport: "http",
         ...(allowance ? { nativeSteer: "response.steer" } : {}),
       },
-      models: { chat: {} },
+      models: { "gpt-6": {}, chat: {} },
     },
   },
 })
@@ -146,7 +147,7 @@ it.live("refuses a known non-Responses route offline without reserving the lane,
       })
     const chat = (yield* call("POST", "/api/session", { title: "Chat", location: { directory: tmp.path } })).body!.data.id as string
     const responses = (yield* call("POST", "/api/session", { title: "Responses", location: { directory: tmp.path } })).body!.data.id as string
-    expect((yield* call("POST", `/api/session/${responses}/model`, { model: { providerID: "fixture", id: "chat" } })).status).toBe(204)
+    expect((yield* call("POST", `/api/session/${responses}/model`, { model: { providerID: "fixture", id: "gpt-6" } })).status).toBe(204)
     const route = (id: string) => `/api/experimental/session/${id}/native-test`
 
     // Default selection resolves to Chat Completions: not supported, refused, nothing reserved.
@@ -161,9 +162,16 @@ it.live("refuses a known non-Responses route offline without reserving the lane,
     expect((yield* call("PUT", route(responses), { nativeSteer: "response.steer", debug: false })).status).toBe(200)
 
     // Switching the explicit selection to the Chat route makes the status truthful again.
-    expect((yield* call("POST", `/api/session/${chat}/model`, { model: { providerID: "fixture", id: "chat" } })).status).toBe(204)
+    expect((yield* call("POST", `/api/session/${chat}/model`, { model: { providerID: "fixture", id: "gpt-6" } })).status).toBe(204)
     expect((yield* call("GET", route(chat))).body!.data.supported).toBe(true)
     expect((yield* call("POST", `/api/session/${responses}/model`, { model: { providerID: "chatfix", id: "chat" } })).status).toBe(204)
     expect((yield* call("GET", route(responses))).body!.data).toMatchObject({ supported: false, reason: "protocol-unsupported" })
+
+    // A Responses route without a GPT-6 identity is refused the same way.
+    expect((yield* call("POST", `/api/session/${chat}/model`, { model: { providerID: "fixture", id: "chat" } })).status).toBe(204)
+    expect((yield* call("GET", route(chat))).body!.data).toMatchObject({ supported: false, reason: "not-requested" })
+    const unsupported = yield* call("PUT", route(chat), { nativeSteer: "response.steer", debug: false })
+    expect(unsupported.status).toBe(400)
+    expect(unsupported.body).toMatchObject({ reason: "protocol-unsupported" })
   }).pipe(Effect.scoped),
 )

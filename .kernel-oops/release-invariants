@@ -22,3 +22,8 @@ packages/app src/composer/submit.test.ts                   typed approval owns s
 packages/client test/solid-data.test.ts                    metadata replaces the whole record; live update beats stale page
 # Fork release-on-POST (706dcbb80c) and upstream transcript proof (0d226daccf): an acknowledged prompt stays pending until its outcome is shown.
 packages/client test/solid-inbox-race.test.ts              accepted prompt survives empty/older reads; proof, delivery or cancellation settles it
+# B17 review: upstream #62796 answers RPCs before plugin activation; a combined plugin's TUI half (KCP's DCP panel) must recover.
+flags packages/tui --timeout 30000
+packages/tui test/plugin-rpc-readiness.test.tsx            rpc.unavailable setup retries when the server half is active (cold and reload); genuine failures stay
+# B17 review: the native test lane's supported path needs a GPT-6 Responses identity; the HTTP API must reach it.
+packages/server test/session-native-test.test.ts           exact-session lane status/enable/disable/isolation; non-Responses and non-GPT-6 refused

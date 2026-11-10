@@ -66,8 +66,8 @@ it.live("real runner: A native while B stays HTTP; a pending disable keeps the l
   }))
   const context = yield* Layer.build(createEmbeddedRoutes({
     app: { version: "native-test-runner" }, database: { path: ":memory:" }, models: { fetch: false }, fs: { filewatcher: false },
-    config: { content: JSON.stringify({ model: "fixture/chat", providers: { fixture: {
-      package: "@opencode/ai/providers/openai", settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture-only", transport: "http", nativeSteer: "response.steer" }, models: { chat: { limit: { context: 100_000, output: 1_000 } } },
+    config: { content: JSON.stringify({ model: "fixture/gpt-6", providers: { fixture: {
+      package: "@opencode/ai/providers/openai", settings: { baseURL: "https://fixture.invalid/v1", apiKey: "fixture-only", transport: "http", nativeSteer: "response.steer" }, models: { "gpt-6": { limit: { context: 100_000, output: 1_000 } } },
     } } }) },
   }, [
     Global.node.replace(tempGlobalLayer),

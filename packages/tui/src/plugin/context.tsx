@@ -27,6 +27,7 @@ import { useTuiLifecycle } from "../context/runtime"
 import { useClient } from "../context/client"
 import { useData } from "../context/data"
 import { errorMessage } from "../util/error"
+import { isRecord } from "../util/record"
 import { createPluginContext, usePluginHost, type Dispose, type RegisteredSlot, type SlotRender } from "./api"
 import { createSourceWatcher } from "./watch"
 import { discoverPluginTargets, localSource, mergePluginTargets } from "./discovery"
@@ -109,7 +110,22 @@ export function PluginProvider(props: ParentProps<{ packages: PackageSource; dir
   })
   // One save can emit several watch events. Remember setup failures so those
   // events do not repeatedly tear down and restore the last good generation.
-  const setupFailures = new Map<string, { version: string; options: Registration["options"]; error: string }>()
+  // `retry` marks a setup that failed only because its server half had not registered its RPC yet (the server no
+  // longer waits for plugins, #62796). It holds the server inventory count when that setup started: one retry is due
+  // per later inventory that lists the plugin's source active, so there is no polling and genuine failures stay put.
+  const setupFailures = new Map<
+    string,
+    { version: string; options: Registration["options"]; error: string; retry?: number }
+  >()
+  let inventory = 0
+  const sourceKey = (value: string) => localSource(value, directory)?.href ?? value
+  const serverActive = (target: string) =>
+    serverPlugins().some(
+      (plugin) =>
+        plugin.state.status === "active" &&
+        (plugin.source.type === "package" || plugin.source.type === "local") &&
+        sourceKey(plugin.source.type === "package" ? plugin.source.target : plugin.source.path) === sourceKey(target),
+    )
   let operationID = 0
   const trace: Trace = (stage, tags, task) => {
     const id = ++operationID
@@ -179,6 +195,7 @@ export function PluginProvider(props: ParentProps<{ packages: PackageSource; dir
         active: () => Boolean(store.registrations[id]?.active),
       },
     })
+    const attempt = inventory
     const cleanup = await trace("setup", { plugin: id, target: item.target }, () =>
       setup(item.plugin, context, owned),
     ).catch((error) => {
@@ -188,6 +205,7 @@ export function PluginProvider(props: ParentProps<{ packages: PackageSource; dir
           version: item.version,
           options: snapshotOptions(item.options),
           error: errorMessage(error),
+          retry: isRecord(error) && error.type === "rpc.unavailable" ? attempt : undefined,
         })
       throw error
     })
@@ -376,7 +394,8 @@ export function PluginProvider(props: ParentProps<{ packages: PackageSource; dir
         continue
       }
       const setupFailure = setupFailures.get(target)
-      if (setupFailure && sameGeneration(setupFailure, { version: resolved.version, options }) && previous) {
+      const retry = setupFailure?.retry !== undefined && setupFailure.retry < inventory && serverActive(target)
+      if (setupFailure && !retry && sameGeneration(setupFailure, { version: resolved.version, options }) && previous) {
         failures.push({
           target,
           id: previous.plugin.id,
@@ -548,7 +567,11 @@ export function PluginProvider(props: ParentProps<{ packages: PackageSource; dir
                 serverPluginName(previous) === serverPluginName(plugin) && isDeepEqual(previous.state, plugin.state),
             ),
         )
+        inventory++
         setServerPlugins(response.data)
+        // An unchanged inventory starts no reconcile, yet it can be the moment a reloaded server half is ready.
+        if ([...setupFailures.values()].some((failure) => failure.retry !== undefined))
+          void enqueue(reconcile).catch(() => undefined)
         const first = failed[0]
         if (!first) return
         host.toast.show({
