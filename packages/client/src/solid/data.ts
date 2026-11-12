@@ -732,6 +732,9 @@ export function createData(config: CreateDataInput) {
   // one read rather than one per member. The read sees only the directory's own instance, and the public session
   // location omits any workspace, so a listed session missing from the reply is re-read on its own, never emptied.
   // Sessions deleted after the read started keep their eviction.
+  // shortcut: a workspace member never read before is not fetched on the root route until an event arrives or its
+  // session is opened, because Location.PublicRef lacks workspaceID; upgrade when the server exposes the workspace on
+  // the public location or accepts it on the location read.
   async function syncLocationPending<T extends { id: string; sessionID: string }>(
     ref: LocationRef,
     pending: Set<Map<string, T | undefined>>,
