@@ -372,6 +372,9 @@ export function createData(config: CreateDataInput) {
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
   const shellUpdates = new Map<string, Map<string, ShellWithLocation | undefined>>()
+  // Asks and answers seen while a location pending read is in flight; its snapshot may predate them.
+  const permissionUpdates = new Set<Map<string, PermissionRequest | undefined>>()
+  const formUpdates = new Set<Map<string, FormWithLocation | undefined>>()
 
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
@@ -391,6 +394,7 @@ export function createData(config: CreateDataInput) {
   }
 
   function removePermission(sessionID: string, requestID: string) {
+    permissionUpdates.forEach((updates) => updates.set(requestID, undefined))
     const requests = store.session.permission[sessionID]
     if (!requests?.some((request) => request.id === requestID)) return
     setStore(
@@ -402,6 +406,7 @@ export function createData(config: CreateDataInput) {
   }
 
   function removeForm(sessionID: string, formID: string, ref?: LocationRef) {
+    if (sessionID !== "global") formUpdates.forEach((updates) => updates.set(formID, undefined))
     const forms = store.session.form[sessionID]
     if (!forms) return false
     const location = ref && locationKey(ref)
@@ -724,24 +729,45 @@ export function createData(config: CreateDataInput) {
   }
 
   // A location-wide pending list replaces every per-session list for the sessions there, so a large family costs
-  // one read rather than one per member. Sessions deleted after the read started keep their eviction.
-  function applyLocationPending<T extends { sessionID: string }>(
+  // one read rather than one per member. The read sees only the directory's own instance, and the public session
+  // location omits any workspace, so a listed session missing from the reply is re-read on its own, never emptied.
+  // Sessions deleted after the read started keep their eviction.
+  async function syncLocationPending<T extends { id: string; sessionID: string }>(
     ref: LocationRef,
-    items: readonly T[],
-    current: Record<string, readonly unknown[]>,
-    started: number,
+    pending: Set<Map<string, T | undefined>>,
+    current: Record<string, readonly { id: string }[]>,
+    read: () => Promise<readonly T[]>,
     set: (sessionID: string, list: T[]) => void,
+    reread: (sessionID: string) => Promise<void>,
   ) {
-    const grouped = Map.groupBy(items, (item) => item.sessionID)
-    const key = locationKey(ref)
-    batch(() => {
-      for (const [sessionID, list] of grouped)
-        if (sessionID !== "global" && (deletedAt.get(sessionID) ?? 0) <= started) set(sessionID, list)
-      for (const [sessionID, list] of Object.entries(current)) {
-        const location = store.session.info[sessionID]?.location
-        if (list.length > 0 && !grouped.has(sessionID) && location && locationKey(location) === key) set(sessionID, [])
+    const started = deletionEpoch
+    const updates = new Map<string, T | undefined>()
+    pending.add(updates)
+    try {
+      const grouped = Map.groupBy(await read(), (item) => item.sessionID)
+      // Events arriving during the read supersede its snapshot: live asks stay, answered requests stay gone.
+      const live = (sessionID: string, list: readonly T[]) => {
+        const next = new Map(list.map((item) => [item.id, item]))
+        updates.forEach((item, id) => {
+          if (!item) next.delete(id)
+          else if (item.sessionID === sessionID) next.set(id, item)
+        })
+        return [...next.values()]
       }
-    })
+      const key = locationKey(ref)
+      batch(() => {
+        for (const [sessionID, list] of grouped)
+          if (sessionID !== "global" && (deletedAt.get(sessionID) ?? 0) <= started) set(sessionID, live(sessionID, list))
+      })
+      const missing = Object.entries(current).flatMap(([sessionID, list]) => {
+        const location = store.session.info[sessionID]?.location
+        const unconfirmed = list.some((item) => !updates.get(item.id))
+        return unconfirmed && !grouped.has(sessionID) && location && locationKey(location) === key ? [sessionID] : []
+      })
+      await Promise.allSettled(missing.map(reread))
+    } finally {
+      pending.delete(updates)
+    }
   }
 
   function evictMissing(error: unknown): never {
@@ -1431,6 +1457,7 @@ export function createData(config: CreateDataInput) {
         if (event.data.inputID) compacting.get(event.data.sessionID)?.observed.add(event.data.inputID)
         return
       case "permission.asked":
+        permissionUpdates.forEach((updates) => updates.set(event.data.id, event.data))
         if (store.session.permission[event.data.sessionID]?.some((request) => request.id === event.data.id)) return
         setStore("session", "permission", event.data.sessionID, [
           ...(store.session.permission[event.data.sessionID] ?? []),
@@ -1503,6 +1530,8 @@ export function createData(config: CreateDataInput) {
         refreshLocation("vcs", result.location.vcs, location)
         break
       case "form.created":
+        if (event.data.form.sessionID !== "global")
+          formUpdates.forEach((updates) => updates.set(event.data.form.id, event.data.form))
         if (store.session.form[event.data.form.sessionID]?.some((form) => form.id === event.data.form.id)) break
         setStore("session", "form", event.data.form.sessionID, [
           ...(store.session.form[event.data.form.sessionID] ?? []),
@@ -2260,13 +2289,19 @@ export function createData(config: CreateDataInput) {
           })
         },
         syncLocation(ref: LocationRef) {
-          return sync.run(`location.permission:${locationKey(ref)}`, async () => {
-            const started = deletionEpoch
-            const response = await api().permission.request.list({ location: locationQuery(ref) })
-            applyLocationPending(ref, response.data, store.session.permission, started, (sessionID, list) =>
-              setStore("session", "permission", sessionID, reconcile(list)),
-            )
-          })
+          return sync.run(`location.permission:${locationKey(ref)}`, () =>
+            syncLocationPending(
+              ref,
+              permissionUpdates,
+              store.session.permission,
+              async () => (await api().permission.request.list({ location: locationQuery(ref) })).data,
+              (sessionID, list) => setStore("session", "permission", sessionID, reconcile(list)),
+              (sessionID) => {
+                result.session.permission.invalidate(sessionID)
+                return result.session.permission.sync(sessionID)
+              },
+            ),
+          )
         },
         invalidate(sessionID: string) {
           sync.invalidate(`session.permission:${sessionID}`)
@@ -2327,13 +2362,19 @@ export function createData(config: CreateDataInput) {
           })
         },
         syncLocation(ref: LocationRef) {
-          return sync.run(`location.form:${locationKey(ref)}`, async () => {
-            const started = deletionEpoch
-            const response = await api().form.list({ location: locationQuery(ref) })
-            applyLocationPending(ref, response.data, store.session.form, started, (sessionID, list) =>
-              setStore("session", "form", sessionID, reconcile(list)),
-            )
-          })
+          return sync.run(`location.form:${locationKey(ref)}`, () =>
+            syncLocationPending(
+              ref,
+              formUpdates,
+              store.session.form,
+              async () => (await api().form.list({ location: locationQuery(ref) })).data,
+              (sessionID, list) => setStore("session", "form", sessionID, reconcile(list)),
+              (sessionID) => {
+                result.session.form.invalidate(sessionID)
+                return result.session.form.sync(sessionID)
+              },
+            ),
+          )
         },
         invalidate(sessionID: string, ref?: LocationRef) {
           sync.invalidate(

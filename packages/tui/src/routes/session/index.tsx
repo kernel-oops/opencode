@@ -43,6 +43,7 @@ import {
   type SessionMessageUser,
   type SessionInfo,
   type ModelInfo,
+  type LocationRef,
 } from "@opencode/client"
 import { useLocal } from "../../context/local"
 import { PromptMetadataRow } from "../../component/prompt/metadata"
@@ -355,18 +356,31 @@ export function Session(props: {
     on([descendantSessionIDs, () => client.connection.status()], ([sessionIDs, status]) => {
       if (status !== "connected") return
       // One pending read per location covers the whole family; per-member reads fan out hundreds of requests.
-      const locations = new Map(
-        sessionIDs.flatMap((sessionID) => {
-          const location = data.session.get(sessionID)?.location
-          return location ? [[locationKey(location), location] as const] : []
-        }),
-      )
-      void Promise.allSettled(
-        Array.from(locations.values(), (location) => [
-          data.session.permission.syncLocation(location),
-          data.session.form.syncLocation(location),
-        ]).flat(),
-      )
+      // A location that cannot be read falls back to its members' own reads, which resolve each session's own instance.
+      const locations = new Map<string, { location: LocationRef; sessionIDs: string[] }>()
+      const own: string[] = []
+      for (const sessionID of sessionIDs) {
+        const location = data.session.get(sessionID)?.location
+        if (!location) {
+          own.push(sessionID)
+          continue
+        }
+        const key = locationKey(location)
+        const entry = locations.get(key) ?? { location, sessionIDs: [] as string[] }
+        locations.set(key, entry)
+        entry.sessionIDs.push(sessionID)
+      }
+      const each = (ids: string[]) =>
+        ids.flatMap((sessionID) => [data.session.permission.sync(sessionID), data.session.form.sync(sessionID)])
+      void Promise.allSettled([
+        ...Array.from(locations.values(), (entry) =>
+          Promise.all([
+            data.session.permission.syncLocation(entry.location),
+            data.session.form.syncLocation(entry.location),
+          ]).catch(() => Promise.allSettled(each(entry.sessionIDs))),
+        ),
+        ...each(own),
+      ])
     }),
   )
 

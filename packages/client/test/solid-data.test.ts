@@ -1937,41 +1937,123 @@ test("a reconnect resync that refetches unchanged family data does not republish
   }
 })
 
-test("a location pending read replaces per-session lists only for sessions in that location", async () => {
-  const request = (id: string, sessionID: string) => ({ id, sessionID, action: "shell", resources: ["echo"] })
-  const sessions = {
-    here: { ...session(1), id: "here" },
-    there: { ...session(1), id: "there", location: { directory: "/other" } },
-  }
+function locationPendingFixture(input: {
+  sessions: Record<string, { directory: string }>
+  own: (pathname: string) => unknown[]
+  location: (pathname: string) => Promise<unknown[]>
+}) {
   const requests: string[] = []
+  let handler: ((event: any) => void) | undefined
   const api = OpenCode.make({
     baseUrl: "http://fixture.invalid",
-    fetch: async (input, init) => {
-      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+    fetch: async (request, init) => {
+      const url = new URL((request instanceof Request ? request : new Request(request, init)).url)
       requests.push(url.pathname)
-      const id = url.pathname.match(/^\/api\/session\/([^/]+)/)?.[1] as keyof typeof sessions | undefined
-      if (id && url.pathname.endsWith("/permission")) return Response.json({ data: [request(`stale_${id}`, id)] })
-      if (id) return Response.json({ data: sessions[id] })
-      if (url.pathname === "/api/permission/request")
-        return Response.json({ location: { directory: "/project" }, data: [request("new", "unseen")] })
-      return Response.json({ location: { directory: "/project" }, data: [] })
+      const id = url.pathname.match(/^\/api\/session\/([^/]+)$/)?.[1]
+      if (id) return Response.json({ data: { ...session(1), id, location: input.sessions[id] } })
+      if (url.pathname.startsWith("/api/session/")) return Response.json({ data: input.own(url.pathname) })
+      return Response.json({ location: { directory: "/project" }, data: await input.location(url.pathname) })
     },
   })
-  const setup = createRoot((dispose) => ({
-    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+  const root = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: { on: () => () => {}, listen: (listener: any) => ((handler = listener), () => {}) },
+    }),
     dispose,
   }))
+  return { ...root, requests, emit: (details: any) => handler?.({ name: details.type, details }) }
+}
+
+// The tests' server build of solid-js/store reconciles a list to [] as [undefined]; the TUI build does not.
+const present = (list?: readonly unknown[]) => list?.filter((item) => item !== undefined)
+const ask = (id: string, sessionID: string) => ({ id, sessionID, action: "shell", resources: ["echo"] })
+const form = (id: string, sessionID: string) => ({ id, sessionID, title: id, fields: [] })
+
+test("a location pending read covers its sessions and re-reads a listed session it does not return", async () => {
+  // The public session location omits any workspace, so a session the directory read misses (for example one in a
+  // workspace) must be re-read on its own rather than emptied.
+  let answered = false
+  const setup = locationPendingFixture({
+    sessions: { stale: { directory: "/project" }, workspace: { directory: "/project" }, other: { directory: "/other" } },
+    own: (pathname) => {
+      const id = pathname.split("/")[3]!
+      return answered && id === "stale" ? [] : [ask(`own_${id}`, id)]
+    },
+    location: async () => [ask("new", "unseen")],
+  })
+  const ids = (sessionID: string) => setup.data.session.permission.list(sessionID)?.map((item) => item.id)
   try {
     await Promise.all(
-      Object.keys(sessions).flatMap((id) => [setup.data.session.sync(id), setup.data.session.permission.sync(id)]),
+      ["stale", "workspace", "other"].flatMap((id) => [setup.data.session.sync(id), setup.data.session.permission.sync(id)]),
     )
-    requests.length = 0
+    answered = true
+    expect(ids("stale")).toEqual(["own_stale"])
+    setup.requests.length = 0
     await setup.data.session.permission.syncLocation({ directory: "/project" })
     await setup.data.session.permission.syncLocation({ directory: "/project" })
-    expect(requests).toEqual(["/api/permission/request"])
-    expect(setup.data.session.permission.list("here")).toEqual([])
-    expect(setup.data.session.permission.list("there")?.map((item) => item.id)).toEqual(["stale_there"])
-    expect(setup.data.session.permission.list("unseen")?.map((item) => item.id)).toEqual(["new"])
+    expect(setup.requests.toSorted()).toEqual([
+      "/api/permission/request",
+      "/api/session/stale/permission",
+      "/api/session/workspace/permission",
+    ])
+    expect(present(setup.data.session.permission.list("stale"))).toEqual([])
+    expect(ids("workspace")).toEqual(["own_workspace"])
+    expect(ids("other")).toEqual(["own_other"])
+    expect(ids("unseen")).toEqual(["new"])
+  } finally {
+    setup.dispose()
+  }
+})
+
+test("asks and answers that arrive during a location pending read supersede its snapshot", async () => {
+  const reply = Promise.withResolvers<unknown[]>()
+  const started = Promise.withResolvers<void>()
+  const setup = locationPendingFixture({
+    sessions: { a: { directory: "/project" } },
+    own: () => [],
+    location: () => (started.resolve(), reply.promise),
+  })
+  try {
+    await setup.data.session.sync("a")
+    setup.emit({ type: "permission.asked", data: ask("answered", "a") })
+    const read = setup.data.session.permission.syncLocation({ directory: "/project" })
+    await started.promise
+    setup.emit({ type: "permission.asked", data: ask("live", "a") })
+    setup.emit({ type: "permission.replied", data: { sessionID: "a", requestID: "answered" } })
+    reply.resolve([ask("answered", "a")])
+    await read
+    expect(setup.data.session.permission.list("a")?.map((item) => item.id)).toEqual(["live"])
+    expect(setup.requests).not.toContain("/api/session/a/permission")
+  } finally {
+    setup.dispose()
+  }
+})
+
+test("a location form read fills session forms, skips global ones and keeps forms created during the read", async () => {
+  const reply = Promise.withResolvers<unknown[]>()
+  const started = Promise.withResolvers<void>()
+  const setup = locationPendingFixture({
+    sessions: { a: { directory: "/project" }, stale: { directory: "/project" } },
+    own: () => [],
+    location: () => (started.resolve(), reply.promise),
+  })
+  const ids = (sessionID: string) => setup.data.session.form.list(sessionID)?.map((item) => item.id)
+  try {
+    await Promise.all([setup.data.session.sync("a"), setup.data.session.sync("stale")])
+    const location = { directory: "/project" }
+    setup.emit({ type: "form.created", location, data: { form: form("old", "stale") } })
+    expect(ids("stale")).toEqual(["old"])
+    const read = setup.data.session.form.syncLocation(location)
+    await started.promise
+    setup.emit({ type: "form.created", location, data: { form: form("live", "a") } })
+    setup.emit({ type: "form.cancelled", location, data: { sessionID: "a", id: "gone" } })
+    reply.resolve([form("listed", "a"), form("gone", "a"), form("shared", "global")])
+    await read
+    expect(ids("a")).toEqual(["listed", "live"])
+    expect(present(setup.data.session.form.list("stale"))).toEqual([])
+    expect(setup.data.session.form.list("global", location)).toBeUndefined()
   } finally {
     setup.dispose()
   }
