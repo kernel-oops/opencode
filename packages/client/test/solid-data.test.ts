@@ -1937,6 +1937,46 @@ test("a reconnect resync that refetches unchanged family data does not republish
   }
 })
 
+test("a location pending read replaces per-session lists only for sessions in that location", async () => {
+  const request = (id: string, sessionID: string) => ({ id, sessionID, action: "shell", resources: ["echo"] })
+  const sessions = {
+    here: { ...session(1), id: "here" },
+    there: { ...session(1), id: "there", location: { directory: "/other" } },
+  }
+  const requests: string[] = []
+  const api = OpenCode.make({
+    baseUrl: "http://fixture.invalid",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      requests.push(url.pathname)
+      const id = url.pathname.match(/^\/api\/session\/([^/]+)/)?.[1] as keyof typeof sessions | undefined
+      if (id && url.pathname.endsWith("/permission")) return Response.json({ data: [request(`stale_${id}`, id)] })
+      if (id) return Response.json({ data: sessions[id] })
+      if (url.pathname === "/api/permission/request")
+        return Response.json({ location: { directory: "/project" }, data: [request("new", "unseen")] })
+      return Response.json({ location: { directory: "/project" }, data: [] })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({ api: () => api, directory: "/project", event: { on: () => () => {}, listen: () => () => {} } }),
+    dispose,
+  }))
+  try {
+    await Promise.all(
+      Object.keys(sessions).flatMap((id) => [setup.data.session.sync(id), setup.data.session.permission.sync(id)]),
+    )
+    requests.length = 0
+    await setup.data.session.permission.syncLocation({ directory: "/project" })
+    await setup.data.session.permission.syncLocation({ directory: "/project" })
+    expect(requests).toEqual(["/api/permission/request"])
+    expect(setup.data.session.permission.list("here")).toEqual([])
+    expect(setup.data.session.permission.list("there")?.map((item) => item.id)).toEqual(["stale_there"])
+    expect(setup.data.session.permission.list("unseen")?.map((item) => item.id)).toEqual(["new"])
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("cold paginated idle descendants stay selected-scope and metadata changes supersede a page", async () => {
   const page = Promise.withResolvers<Response>()
   const started = Promise.withResolvers<void>()

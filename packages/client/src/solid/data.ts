@@ -723,6 +723,27 @@ export function createData(config: CreateDataInput) {
     })
   }
 
+  // A location-wide pending list replaces every per-session list for the sessions there, so a large family costs
+  // one read rather than one per member. Sessions deleted after the read started keep their eviction.
+  function applyLocationPending<T extends { sessionID: string }>(
+    ref: LocationRef,
+    items: readonly T[],
+    current: Record<string, readonly unknown[]>,
+    started: number,
+    set: (sessionID: string, list: T[]) => void,
+  ) {
+    const grouped = Map.groupBy(items, (item) => item.sessionID)
+    const key = locationKey(ref)
+    batch(() => {
+      for (const [sessionID, list] of grouped)
+        if (sessionID !== "global" && (deletedAt.get(sessionID) ?? 0) <= started) set(sessionID, list)
+      for (const [sessionID, list] of Object.entries(current)) {
+        const location = store.session.info[sessionID]?.location
+        if (list.length > 0 && !grouped.has(sessionID) && location && locationKey(location) === key) set(sessionID, [])
+      }
+    })
+  }
+
   function evictMissing(error: unknown): never {
     if (isSessionNotFoundError(error)) markDeleted(error.sessionID)
     throw error
@@ -2238,6 +2259,15 @@ export function createData(config: CreateDataInput) {
             setStore("session", "permission", sessionID, reconcile(list))
           })
         },
+        syncLocation(ref: LocationRef) {
+          return sync.run(`location.permission:${locationKey(ref)}`, async () => {
+            const started = deletionEpoch
+            const response = await api().permission.request.list({ location: locationQuery(ref) })
+            applyLocationPending(ref, response.data, store.session.permission, started, (sessionID, list) =>
+              setStore("session", "permission", sessionID, reconcile(list)),
+            )
+          })
+        },
         invalidate(sessionID: string) {
           sync.invalidate(`session.permission:${sessionID}`)
         },
@@ -2294,6 +2324,15 @@ export function createData(config: CreateDataInput) {
             const list = await api().session.form.list({ sessionID }).catch(evictMissing)
             if ((deletedAt.get(sessionID) ?? 0) > started) return
             setStore("session", "form", sessionID, reconcile(list))
+          })
+        },
+        syncLocation(ref: LocationRef) {
+          return sync.run(`location.form:${locationKey(ref)}`, async () => {
+            const started = deletionEpoch
+            const response = await api().form.list({ location: locationQuery(ref) })
+            applyLocationPending(ref, response.data, store.session.form, started, (sessionID, list) =>
+              setStore("session", "form", sessionID, reconcile(list)),
+            )
           })
         },
         invalidate(sessionID: string, ref?: LocationRef) {

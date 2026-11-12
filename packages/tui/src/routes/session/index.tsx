@@ -17,7 +17,7 @@ import { EOL } from "node:os"
 import { mkdir, writeFile } from "node:fs/promises"
 import { useRoute, useRouteData } from "../../context/route"
 import { createStore } from "solid-js/store"
-import { useData } from "../../context/data"
+import { locationKey, useData } from "../../context/data"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner, SPINNER_FRAMES } from "../../component/spinner"
@@ -354,8 +354,18 @@ export function Session(props: {
   createEffect(
     on([descendantSessionIDs, () => client.connection.status()], ([sessionIDs, status]) => {
       if (status !== "connected") return
+      // One pending read per location covers the whole family; per-member reads fan out hundreds of requests.
+      const locations = new Map(
+        sessionIDs.flatMap((sessionID) => {
+          const location = data.session.get(sessionID)?.location
+          return location ? [[locationKey(location), location] as const] : []
+        }),
+      )
       void Promise.allSettled(
-        sessionIDs.flatMap((sessionID) => [data.session.permission.sync(sessionID), data.session.form.sync(sessionID)]),
+        Array.from(locations.values(), (location) => [
+          data.session.permission.syncLocation(location),
+          data.session.form.syncLocation(location),
+        ]).flat(),
       )
     }),
   )

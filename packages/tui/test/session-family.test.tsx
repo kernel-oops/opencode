@@ -57,3 +57,43 @@ test("a cold grandchild route hydrates its whole family with the sidebar hidden"
   expect(loaded).toContain("root")
   expect(loaded).toContain("children:root")
 })
+
+test("a root route reads its family's pending requests once per location, not once per member", async () => {
+  const session = (id: string, parentID?: string) => ({
+    id,
+    title: id,
+    parentID,
+    agent: "build",
+    projectID: "proj_test",
+    location: { directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 0, updated: 0 },
+  })
+  const sessions = [session("root"), ...Array.from({ length: 30 }, (_, i) => session(`worker${i}`, "root"))]
+  const permission = { id: "per_family", sessionID: "worker7", action: "shell", resources: ["echo family-fixture"] }
+  const requests: string[] = []
+  await using app = await createAppFixture({
+    width: 100,
+    height: 30,
+    args: { sessionID: "root" },
+    config: { animations: false, tabs: { enabled: false } },
+    fetch: (url) => {
+      requests.push(url.pathname)
+      if (url.pathname === "/api/session") {
+        const parent = url.searchParams.get("parentID")
+        return json({ data: sessions.filter((session) => session.parentID === (parent ?? undefined)), cursor: {} })
+      }
+      if (url.pathname === "/api/permission/request") return json({ location: { directory }, data: [permission] })
+      const id = url.pathname.match(/^\/api\/session\/([^/]+)$/)?.[1]
+      if (id) return json({ data: sessions.find((session) => session.id === id) })
+      if (/^\/api\/session\/[^/]+\/(message|inbox|permission|form)$/.test(url.pathname)) {
+        return json({ data: [], cursor: {} })
+      }
+    },
+  })
+  await app.ready
+  await app.waitForFrame((frame) => frame.includes("Permission required"))
+  expect(requests.filter((path) => /^\/api\/session\/worker\d+\/(permission|form)$/.test(path))).toEqual([])
+  expect(requests.filter((path) => path === "/api/permission/request")).toHaveLength(1)
+})
