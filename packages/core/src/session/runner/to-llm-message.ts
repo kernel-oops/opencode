@@ -165,9 +165,14 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       if ("refusal" in part && typeof part.refusal === "string") return [part.refusal]
       return []
     }).join("\n") : ""
+  // Fork-marked turns (native receipts, steer interruption) keep the fork's replay rules; every other turn
+  // follows upstream #60674, which replays same-model provider state even for failed or aborted turns.
+  const forkMarked = nativeInterrupted || nativeAmbiguous || nativeObserved || message.interruption !== undefined
   // A later owned-tool failure does not revoke the provider's acknowledged items.
   // Native receipts still restrict replay below to the authoritative done prefix.
-  const reuseProviderMetadata = sameModel && (message.error === undefined || nativeInterrupted || nativeObserved) && (message.interruption === undefined || nativeInterrupted || nativeObserved)
+  const reuseProviderMetadata = forkMarked
+    ? sameModel && (message.error === undefined || nativeInterrupted || nativeObserved) && (message.interruption === undefined || nativeInterrupted || nativeObserved)
+    : sameModel
   const reasoningInterrupted = (nativeObserved && message.finish === "length") || message.content.some(
     (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
   )
@@ -193,7 +198,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
           (item.state.status === "error" && item.state.error.type.startsWith("tool.input")),
       )
     : kept
-  const content = items.flatMap((item): Array<AssistantMessage["content"][number]> => {
+  const content = items.flatMap((item, index): Array<AssistantMessage["content"][number]> => {
     if (nativeRestricted && item.type !== "tool" && !acknowledged(item.native)) return []
     if (item.type === "text")
       return [
@@ -208,6 +213,20 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
     if (item.type === "reasoning") {
+      // Upstream #60674: a cut turn only replays reasoning the model moved past into output.
+      if (
+        cut &&
+        !items
+          .slice(index + 1)
+          .some((after) => after.type === "tool" || (after.type === "text" && after.text.trim() !== ""))
+      )
+        return []
+      if (!forkMarked)
+        return sameModel
+          ? [{ type: "reasoning", text: item.text, providerMetadata: providerMetadata(providerMetadataKey, item.native) }]
+          : item.text.length > 0
+            ? [{ type: "reasoning", text: item.text }]
+            : []
       if (!reasoningRestricted && (message.error !== undefined || reasoningInterrupted)) return []
       // A durable native done receipt can precede the display's Reasoning.Ended event.
       // Ordinary unfinished reasoning still loses its provider-bound state.
