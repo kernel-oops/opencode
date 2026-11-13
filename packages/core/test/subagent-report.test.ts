@@ -24,6 +24,8 @@ import { SessionRunner } from "@opencode/core/session/runner/index"
 import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
+import { SessionNativeTest } from "@opencode/core/session/native-test"
+import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Cause, Context, DateTime, Deferred, Effect, Exit, Layer, LayerMap, Schema, Scope } from "effect"
 import { eq, sql } from "drizzle-orm"
@@ -31,7 +33,16 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, SessionProjector.node, Job.node]),
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionStore.node,
+      SessionInbox.node,
+      SessionProjector.node,
+      Job.node,
+      SessionNativeTest.node,
+      SessionModelTransport.node,
+    ]),
   ),
 )
 

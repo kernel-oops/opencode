@@ -31,7 +31,7 @@ export const Plugin = {
           name: "task_status",
           options: { codemode: false },
           description: [
-            "Lists the background subagents you launched with the subagent tool's background=true option that are still tracked in this process.",
+            "Lists the subagents you launched with the subagent tool that are still tracked in this process.",
             "For each one, shows its sessionID, agent, description, and job status (running, completed, error, cancelled).",
             "You are notified automatically when a background subagent finishes; use this tool only if you need to check the current state on demand, not as a substitute for those notifications.",
             "DO NOT sleep, poll, or call this in a loop to wait on a background subagent — wait for its completion notification instead.",

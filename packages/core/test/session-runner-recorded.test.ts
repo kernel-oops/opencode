@@ -121,7 +121,6 @@ const execution = (llmClient: Layer.Layer<LLMClientService>) =>
       return SessionExecution.Service.of({
         active: coordinator.active,
         isActive: coordinator.isActive,
-        bindInterrupt: coordinator.bindInterrupt,
         resume: coordinator.run,
         wake: coordinator.wake,
         interrupt: (sessionID) => coordinator.interrupt(sessionID),

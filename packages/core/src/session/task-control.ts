@@ -90,7 +90,7 @@ const layer = Layer.effect(
       yield* get(sessionID)
       // Pause before interrupting so a completion racing the interruption is retained, not delivered.
       yield* jobs.pause(sessionID)
-      const interrupted = yield* execution.interrupt(sessionID, { reason: "user" })
+      const interrupted = yield* execution.interrupt(sessionID)
       return StopResponseResult.make({ interrupted, paused: true })
     })
 
@@ -108,7 +108,7 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         const cancelled = yield* cancelTree(entry.recovery.childSessionID)
         if (entry.job.status !== "running") return cancelled
-        yield* execution.interrupt(entry.recovery.childSessionID, { reason: "user" })
+        yield* execution.interrupt(entry.recovery.childSessionID)
         yield* jobs.cancel(entry.job.id, { suppress: true })
         cancelled.push(entry.recovery.childSessionID)
         return cancelled
@@ -125,7 +125,7 @@ const layer = Layer.effect(
     const stopAll: Interface["stopAll"] = Effect.fn("SessionTaskControl.stopAll")(function* (sessionID) {
       yield* get(sessionID)
       const cancelled = yield* cancelTree(sessionID)
-      const interrupted = yield* execution.interrupt(sessionID, { reason: "user" })
+      const interrupted = yield* execution.interrupt(sessionID)
       return StopAllResult.make({ interrupted, cancelled })
     })
 

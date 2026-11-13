@@ -30,7 +30,6 @@ const executionNode = makeGlobalNode({
     SessionExecution.Service.of({
       active: Effect.succeed(new Set()),
       isActive: () => Effect.succeed(false),
-      bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
       resume: () => Effect.void,
       wake: (sessionID) => Effect.sync(() => void calls.woken.push(sessionID)),
       interrupt: (sessionID) => Effect.sync(() => (calls.interrupted.push(sessionID), true)),

@@ -28,7 +28,6 @@ it.live("serves turn diffs by user message with range validation", () =>
         return SessionExecution.Service.of({
           active: Effect.succeed(new Set()),
           isActive: () => Effect.succeed(false),
-          bindInterrupt: () => Effect.succeed(() => Effect.succeed(false)),
           resume: () => Effect.void,
           wake: (sessionID) =>
             Effect.gen(function* () {

@@ -341,10 +341,7 @@ describe("SubagentTool", () => {
   )
 
   it.live("says which rule refused a subagent", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
-    ).pipe(
+    tmpdirScoped().pipe(
       Effect.flatMap((dir) =>
         Effect.gen(function* () {
           const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
@@ -1036,7 +1033,7 @@ describe("SubagentTool reporting", () => {
 })
 
 describe("SubagentJob cancellation", () => {
-  it.live("interrupts the child only for an explicit cancel and preserves shutdown claims", () =>
+  completionIt.live("interrupts the child only for an explicit cancel and preserves shutdown claims", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
       const scope = yield* Scope.make()
@@ -1069,7 +1066,11 @@ describe("SubagentJob cancellation", () => {
           }),
         awaitIdle: () => Effect.void,
       })
-      const jobs = yield* Job.make.pipe(Scope.provide(scope), Effect.provideService(Database.Service, database))
+      const jobs = yield* Job.make.pipe(
+        Scope.provide(scope),
+        Effect.provideService(KV.Service, yield* KV.Service),
+        Effect.provideService(Database.Service, database),
+      )
       const context = yield* Layer.buildWithScope(
         SubagentJob.layer.pipe(
           Layer.provide(Layer.succeed(SessionExecution.Service, execution)),

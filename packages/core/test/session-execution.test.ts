@@ -35,7 +35,6 @@ import { Event } from "@opencode/schema/event"
 import { Global } from "@opencode/util/global"
 import { join } from "node:path"
 import { Shell } from "@opencode/core/shell"
-import { Agent } from "@opencode/core/agent"
 import { ID } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { daemonShells } from "./fixture/shell-daemon"
@@ -119,7 +118,7 @@ describe("SessionExecution lifecycle", () => {
     const parent = Session.ID.create()
     const child = Session.ID.create()
     const ids = [parent, child]
-    const fileLayer = AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionStore.node, Job.node, SessionProjector.node]), [
+    const fileLayer = AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionStore.node, Job.node, SessionProjector.node, SessionNativeTest.node, SessionModelTransport.node]), [
       Database.node.replace(Database.layer({ path: join(directory, "fixture.sqlite") }).pipe(
         Layer.provide(Layer.succeed(Global.Service, Global.make({ data: directory }))),
       )),
@@ -177,6 +176,7 @@ describe("SessionExecution lifecycle", () => {
       const restartContext = yield* Layer.build(SessionRestart.layer().pipe(
         Layer.provide(Layer.succeed(SessionExecution.Service, execution)),
         Layer.provide(Layer.succeed(Session.Service, sessions)),
+        Layer.provide(Layer.succeed(Instance.Service, Instance.Service.of({ provide }))),
       ))
       yield* Context.get(restartContext, SessionRestart.Service).resumeSuspendedSessions
       yield* Deferred.await(restarted)

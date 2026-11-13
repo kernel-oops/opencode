@@ -556,7 +556,6 @@ const makeLayer = (actualPermissions = false) =>
           return SessionExecution.Service.of({
             active: Effect.suspend(() => state.nativeExecution?.active ?? coordinator.active),
             isActive: (id) => (state.nativeExecution ?? coordinator).isActive(id),
-            bindInterrupt: (id) => (state.nativeExecution ?? coordinator).bindInterrupt(id),
             resume: (id) => (state.nativeExecution?.resume ?? coordinator.run)(id),
             wake: (id) => (state.nativeExecution ?? coordinator).wake(id),
             interrupt: (id, options) =>

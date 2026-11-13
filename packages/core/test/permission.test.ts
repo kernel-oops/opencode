@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import { Flag } from "@opencode/core/flag"
 import { Cause, Deferred, Duration, Effect, Fiber, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { ToolFailure } from "@opencode/ai/effect"
@@ -1901,7 +1900,6 @@ describe("Permission", () => {
         },
         (_, tool, input, context) => execute(tool, input, context),
         service,
-        yield* Flag.Service.pipe(Effect.provide(Flag.testLayer())),
       )
       const result = yield* codeMode.execute(
         { code: "return await Promise.allSettled([tools.guarded({}), tools.sibling({})])" },
