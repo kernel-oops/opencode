@@ -184,6 +184,7 @@ function session(input: {
   switchAgent?: ComposerSession["api"]["switchAgent"]
   switchModel?: ComposerSession["api"]["switchModel"]
   background?: ComposerSession["background"]
+  accept?: () => void
 }): ComposerSession {
   return {
     // Unique per test: what this client knows about a session outlives the test that sent to it.
@@ -221,6 +222,10 @@ function session(input: {
       location: { command: { list: () => [] } },
       session: {
         setStatus: (_sessionID, status) => input.statuses?.push(status),
+        acceptSend: () => {
+          input.calls.push("accept-send")
+          input.accept?.()
+        },
         // Like the data layer: admit locally, prepare, then send.
         prompt: async (value) => {
           input.calls.push("admit")
@@ -421,6 +426,19 @@ describe("Composer submission", () => {
     admitted.resolve()
     expect(calls[0]).toBe("keep-preview")
     expect(calls).toContain("admit")
+  })
+
+  test("marks the session accepted only once the send is admitted", async () => {
+    const calls: string[] = []
+    const accepted = Promise.withResolvers<void>()
+    const state = createMemoryComposerState({ prompt: "Hello" }).capture()
+
+    await submitInput(active(state, session({ calls, accept: () => accepted.resolve() }))).submit(
+      new Event("submit"),
+    )
+    await accepted.promise
+
+    expect(calls.filter((call) => call === "accept-send")).toHaveLength(1)
   })
 
   test("an empty submit does not retain a preview", async () => {
@@ -965,9 +983,11 @@ describe("Composer submission", () => {
     const started = Promise.withResolvers<void>()
     const committed = Promise.withResolvers<void>()
     const completed = Promise.withResolvers<void>()
+    const accepted = Promise.withResolvers<void>()
 
     const target = session({
       calls,
+      accept: () => accepted.resolve(),
       switchAgent: async (request) => {
         expect(request.agent).toBe("build")
         calls.push("agent")
@@ -1014,7 +1034,8 @@ describe("Composer submission", () => {
     agent.resolve()
     committed.resolve()
     await completed.promise
-    expect(calls).toEqual(["track", "agent", "model", "command"])
+    await accepted.promise
+    expect(calls).toEqual(["track", "agent", "model", "command", "accept-send"])
   })
 
   test("cancels selection tracking and does not execute a command when selection fails", async () => {
@@ -1334,7 +1355,7 @@ describe("Composer submission", () => {
       const run = running()
 
       await run.submit()
-      expect(run.calls).toEqual(["admit", "switch-agent", "switch-model", "send", "background"])
+      expect(run.calls).toEqual(["admit", "switch-agent", "switch-model", "send", "accept-send", "background"])
 
       await run.submit()
       expect(run.calls.filter((call) => call === "background")).toHaveLength(1)

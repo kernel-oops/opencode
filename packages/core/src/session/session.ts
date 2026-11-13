@@ -250,8 +250,6 @@ export const make = Effect.fn("Session.make")(function* () {
         }).pipe(
           Effect.catchTag("SessionInbox.LifecycleConflict", () => new PromptConflictError({ sessionID, messageID })),
         )
-        const capture = yield* SessionExecution.AdmissionInterrupt
-        if (capture) yield* capture(messageID, yield* execution.bindInterrupt(sessionID))
         if (input.resume !== false) yield* execution.wake(sessionID)
         return admitted
       }),

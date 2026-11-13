@@ -30,15 +30,13 @@ import { llmClient } from "../../effect/app-node-platform.js"
 import { StepFailedError } from "../error.js"
 import { SessionRunnerRetry } from "./retry.js"
 import { SessionStep } from "./step.js"
+import { PersistentPty } from "../../persistent-pty/index.js"
 import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 import { SessionContextBudget } from "../context-budget.js"
 import { SessionBudgetReasoning } from "../context-budget-reasoning.js"
-
-const CONTINUE_AFTER_INCOMPLETE_STREAM =
-  "The previous response was interrupted. Continue from where you left off without repeating completed content."
 
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
@@ -60,6 +58,7 @@ const layer = Layer.effect(
     const jobs = yield* Job.Service
     const title = yield* SessionTitle.Service
     const steps = yield* SessionStep.make
+    const pty = yield* PersistentPty.Service
     // Title generation starts once input is visible and must not delay model execution.
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
 
@@ -240,9 +239,15 @@ const layer = Layer.effect(
           Effect.gen(function* () {
             const next = yield* advanceToStep()
             if (next._tag !== "Ready") return next
-            continuing = yield* runStep(next.context, step, next.steering, () => {
-              step = 0
-            })
+            continuing = yield* runStep(
+              next.context,
+              step,
+              next.steering,
+              () => {
+                step = 0
+              },
+              input.interruption,
+            )
             return { _tag: "Advanced" as const }
           }),
         )
@@ -269,6 +274,7 @@ const layer = Layer.effect(
       step: number,
       firstSteering: SessionInbox.SteeringGate,
       onSteer: () => void,
+      interruption: DrainInput["interruption"],
     ) {
       const sessionID = first.session.id
       let assistantMessageID = SessionMessage.ID.create()
@@ -421,6 +427,8 @@ const layer = Layer.effect(
           .attempt({
             steering,
             isLocationClosed: lifecycle.isClosed,
+            interruption,
+            handoffPrepared: pty.handoffPrepared,
             sessionID,
             assistantMessageID,
             agent: loaded.agent.id,
@@ -483,16 +491,7 @@ const layer = Layer.effect(
               error: outcome.error,
               assistantMessageID,
             })
-          }),
-          Continue: Effect.fnUntraced(function* (outcome) {
-            retryAttempt = outcome.decision.attempt
-            yield* retry.wait({
-              decision: outcome.decision,
-              error: outcome.error,
-              assistantMessageID,
-            })
-            yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_INCOMPLETE_STREAM })
-            assistantMessageID = SessionMessage.ID.create()
+            if (outcome.freshAssistant) assistantMessageID = SessionMessage.ID.create()
           }),
           OutputLimit: continueOutputLimit,
           Compacted: Effect.fnUntraced(function* () {
@@ -584,6 +583,7 @@ export const node = makeLocationNode({
     Job.node,
     SessionTitle.node,
     Snapshot.node,
+    PersistentPty.node,
     ToolOutput.node,
     Database.node,
   ],

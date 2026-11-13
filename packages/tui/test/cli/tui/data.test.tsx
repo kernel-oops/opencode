@@ -47,7 +47,7 @@ function emitEvent(events: ReturnType<typeof createEventStream>, event: OpenCode
   events.emit({ ...event, location: { directory } })
 }
 
-const config = createTuiResolvedConfig()
+const config = createTuiResolvedConfig({ session: { verbosity: "medium" } })
 
 function DataProvider(props: ParentProps) {
   return (

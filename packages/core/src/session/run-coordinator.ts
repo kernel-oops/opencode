@@ -5,10 +5,10 @@ import type { Promotable } from "./inbox.js"
 
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E, Reason = never> {
-  /** Bind acceptance and settlement to the current owner, never a later successor. */
-  readonly bindInterrupt: (key: Key) => Effect.Effect<(reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.Effect<boolean>>
   /** Snapshots keys with an execution owned by this coordinator. */
   readonly active: Effect.Effect<ReadonlySet<Key>>
+  /** Snapshots keys genuinely draining: owned and not stopping. Settlement windows are excluded. */
+  readonly draining: Effect.Effect<ReadonlySet<Key>>
   /** Checks ownership for one key, including cleanup and terminal settlement. */
   readonly isActive: (key: Key) => Effect.Effect<boolean>
   /** Starts an execution while idle, or joins the active execution and returns its exit. */
@@ -21,7 +21,9 @@ export interface Coordinator<Key, E, Reason = never> {
    * finalizers and settled hook on its own time. Returns whether an active execution was
    * interrupted.
    */
-  readonly interrupt: (key: Key, reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.Effect<boolean>
+  readonly interrupt: (key: Key, reason?: Reason) => Effect.Effect<boolean>
+  /** Why the key's execution is being stopped, once `interrupt` stopped it; undefined for teardown or when running. */
+  readonly interruption: (key: Key) => Reason | undefined
   /** Resolves once no execution is active for the key. Returns immediately when already idle and never starts work. */
   readonly awaitIdle: (key: Key) => Effect.Effect<void>
 }
@@ -114,7 +116,8 @@ export const make = <Key, E, Reason = never>(options: {
     // during failure or interruption cleanup) starts a fresh execution for the remaining work.
     const settle = (key: Key, execution: Execution<E, Reason>, exit: Exit.Exit<void, E>) =>
       Effect.gen(function* () {
-        const accepted = execution.pendingWake === undefined ? false : yield* (options.canStart?.(key) ?? Effect.succeed(true))
+        const accepted =
+          execution.pendingWake === undefined ? false : yield* (options.canStart?.(key) ?? Effect.succeed(true))
         // Keep ownership until this durable check finishes; late wakes still coalesce here.
         if (accepted && execution.pendingWake) start(key, false, execution.pendingWake)
         else executions.delete(key)
@@ -132,8 +135,13 @@ export const make = <Key, E, Reason = never>(options: {
             return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(run(key)))
           return Deferred.await(execution.done)
         }
-        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(Effect.flatMap((accepted) =>
-          accepted ? Effect.suspend(() => executions.has(key) ? run(key) : Deferred.await(start(key, true, "input").done)) : Effect.void))
+        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(
+          Effect.flatMap((accepted) =>
+            accepted
+              ? Effect.suspend(() => (executions.has(key) ? run(key) : Deferred.await(start(key, true, "input").done)))
+              : Effect.void,
+          ),
+        )
       })
 
     const wake = (key: Key, scope: Promotable = "input"): Effect.Effect<void> =>
@@ -144,12 +152,17 @@ export const make = <Key, E, Reason = never>(options: {
           execution.pendingWake = execution.pendingWake === "input" ? "input" : scope
           return Effect.void
         }
-        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(Effect.flatMap((accepted) =>
-          accepted ? Effect.suspend(() => {
-            if (executions.has(key)) return wake(key, scope)
-            start(key, false, scope)
-            return Effect.void
-          }) : Effect.void))
+        return (options.canStart?.(key) ?? Effect.succeed(true)).pipe(
+          Effect.flatMap((accepted) =>
+            accepted
+              ? Effect.suspend(() => {
+                  if (executions.has(key)) return wake(key, scope)
+                  start(key, false, scope)
+                  return Effect.void
+                })
+              : Effect.void,
+          ),
+        )
       })
 
     const interrupt = (key: Key, reason?: Reason): Effect.Effect<boolean> =>
@@ -183,22 +196,25 @@ export const make = <Key, E, Reason = never>(options: {
         return Deferred.await(execution.done).pipe(Effect.ignoreCause, Effect.andThen(awaitIdle(key)))
       })
 
-    const bindInterrupt = (key: Key) => Effect.sync(() => {
-      const execution = executions.get(key)
-      return (reason?: Reason, options?: { readonly awaitSettlement?: boolean }) => Effect.suspend(() => {
-        if (executions.get(key) !== execution) return Effect.succeed(false)
-        return interrupt(key, reason).pipe(Effect.tap(() =>
-          options?.awaitSettlement && execution ? Deferred.await(execution.done).pipe(Effect.ignoreCause) : Effect.void))
-      })
-    })
+    const interruption = (key: Key) => executions.get(key)?.interruptionReason
+
+    const draining = Effect.sync(
+      () =>
+        new Set(
+          [...executions.entries()].flatMap(([key, execution]) =>
+            execution.owner !== undefined && !execution.stopping ? [key] : [],
+          ),
+        ),
+    )
+
     return {
-      bindInterrupt,
       active: Effect.sync(() => new Set(executions.keys())),
+      draining,
       isActive,
       run,
       wake,
-      interrupt: (key, reason, options) =>
-        bindInterrupt(key).pipe(Effect.flatMap((bound) => bound(reason, options))),
+      interrupt,
+      interruption,
       awaitIdle,
     }
   })

@@ -8,7 +8,7 @@ import {
   type ToolCall,
 } from "@opencode/ai/effect"
 import type { Agent } from "@opencode/schema/agent"
-import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Clock, Data, Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { Bus } from "../../bus.js"
 import { Permission } from "../../permission.js"
@@ -34,8 +34,11 @@ import { SessionContextBudget } from "../context-budget.js"
 export type Outcome = Data.TaggedEnum<{
   BudgetTarget: { readonly assessment: SessionContextBudget.Assessment }
   Completed: { readonly needsContinuation: boolean }
-  Retry: { readonly error: SessionError.Error; readonly decision: SessionRunnerRetry.Decision }
-  Continue: { readonly error: SessionError.Error; readonly decision: SessionRunnerRetry.Decision }
+  Retry: {
+    readonly error: SessionError.Error
+    readonly decision: SessionRunnerRetry.Decision
+    readonly freshAssistant?: boolean
+  }
   RecoverFull: {}
   Compacted: {}
   Steered: {}
@@ -45,6 +48,10 @@ export const Outcome = Data.taggedEnum<Outcome>()
 interface Input {
   readonly steering?: SessionInbox.SteeringGate
   readonly isLocationClosed: () => boolean
+  /** Why the execution is being interrupted, once it is: `"user"` when someone stopped it. */
+  readonly interruption?: () => "user" | "shutdown" | undefined
+  /** Whether this server is handing its process daemon over to the next one (see `PersistentPty.handoffPrepared`). */
+  readonly handoffPrepared?: () => boolean
   readonly sessionID: SessionSchema.ID
   readonly assistantMessageID: SessionMessage.ID
   readonly agent: Agent.ID
@@ -142,9 +149,21 @@ export const make = Effect.gen(function* () {
     const toolRuns: Array<{
       readonly call: ToolCall
       readonly fiber: Fiber.Fiber<void, Permission.DeclinedError | QuestionTool.CancelledError>
+      readonly cancel: Cancel
     }> = []
     const interruptTools = Effect.suspend(() => Fiber.interruptAll(toolRuns.map((run) => run.fiber)))
-    const executeTool = (call: ToolCall) => {
+    // A user's stop asks each tool awaiting `cancel` to stop and settle its own call, and interrupts every other
+    // tool. A tool that does not settle in time is interrupted too. Teardown interrupts every tool.
+    const stopTools = Effect.suspend(() => {
+      // A reloaded Location still serves the steps that borrow it, so its tools can stop on their own too.
+      const user = input.interruption?.() === "user"
+      const immediate = toolRuns.flatMap((run) => (user && run.cancel.trigger() ? [] : [run.fiber]))
+      return Fiber.interruptAll(immediate).pipe(
+        Effect.andThen(Fiber.awaitAll(toolRuns.map((run) => run.fiber)).pipe(Effect.timeoutOption(COOPERATIVE_STOP))),
+        Effect.flatMap((settled) => (Option.isSome(settled) ? Effect.void : interruptTools)),
+      )
+    })
+    const executeTool = (call: ToolCall, cancel: Cancel) => {
       if (input.prepared.request.toolChoice?.type === "none")
         return new Tool.Error({ message: "Tools are disabled after the maximum agent steps" })
       return input.prepared.executeTool({
@@ -153,6 +172,7 @@ export const make = Effect.gen(function* () {
         messageID: input.assistantMessageID,
         call,
         progress: (update) => publisher.progress(call.id, update),
+        cancel: cancel.effect,
       })
     }
 
@@ -179,8 +199,9 @@ export const make = Effect.gen(function* () {
             if (event.type !== "tool-call" || event.providerExecuted) return
             const owned = yield* gate.guard(
               Effect.gen(function* () {
+                const cancel = makeCancel()
                 const fiber = yield* Effect.uninterruptibleMask((restore) =>
-                  restore(executeTool(event)).pipe(
+                  restore(executeTool(event, cancel)).pipe(
                     Effect.flatMap(toolOutput.truncate),
                     Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
                     Effect.catchTag("Tool.Error", (error) =>
@@ -188,7 +209,7 @@ export const make = Effect.gen(function* () {
                     ),
                   ),
                 ).pipe(Effect.forkIn(toolScope))
-                toolRuns.push({ call: event, fiber })
+                toolRuns.push({ call: event, cancel, fiber })
                 return true
               }),
             )
@@ -226,10 +247,23 @@ export const make = Effect.gen(function* () {
         )
           return yield* Effect.failCause(stream.cause)
         if (publisher.hasStarted()) yield* publisher.streamed()
-        if (streamInterrupted) yield* interruptTools
-        const joined = yield* restore(Fiber.awaitAll(toolRuns.map((run) => run.fiber))).pipe(Effect.exit)
-        if (Exit.isFailure(joined)) yield* interruptTools
-        const tools = classifyToolExits(joined, toolRuns)
+        if (streamInterrupted) yield* stopTools
+        const fibers = toolRuns.map((run) => run.fiber)
+        const joined = yield* restore(Fiber.awaitAll(fibers)).pipe(Effect.exit)
+        if (!streamInterrupted && Exit.isFailure(joined)) yield* stopTools
+        // Read each tool's exit once all have ended, so what they raised while stopping (a decline, a defect) counts.
+        const exits = Exit.isSuccess(joined) ? joined.value : yield* Fiber.awaitAll(fibers)
+        const tools = classifyToolExits(exits, toolRuns, Exit.hasInterrupts(joined))
+        // A server handing its process daemon over leaves the step as a crash would: unsettled calls and no step end.
+        // The next server settles them when the Session resumes, and takes over the shell commands still running for
+        // them. Any other interrupt settles the calls here.
+        if (
+          (streamInterrupted || tools.interrupted) &&
+          tools.declines.length === 0 &&
+          input.interruption?.() !== "user" &&
+          input.handoffPrepared?.() === true
+        )
+          return yield* Effect.interrupt
 
         if (
           !publisher.record().outputStarted &&
@@ -290,6 +324,7 @@ export const make = Effect.gen(function* () {
               )
             : undefined
         if (llmFailure && llmError && retry?.retry && !recorded.outputStarted && !steered) {
+          // Retry state projects onto the existing assistant, even before it has produced output.
           yield* publisher.startAssistant()
           return Outcome.Retry({ error: llmError, decision: retry })
         }
@@ -347,6 +382,7 @@ export const make = Effect.gen(function* () {
               files,
             })
         }
+        // Output already started (or a steer superseded it): retry into a fresh assistant; replay keeps what ran.
         if (
           llmFailure &&
           llmError &&
@@ -355,7 +391,7 @@ export const make = Effect.gen(function* () {
           tools.declines.length === 0 &&
           !tools.interrupted
         )
-          return Outcome.Continue({ error: llmError, decision: retry })
+          return Outcome.Retry({ error: llmError, decision: retry, freshAssistant: true })
         if (Exit.isFailure(stream)) return yield* Effect.failCause(stream.cause)
         if (tools.declines.length > 0) {
           if (input.isLocationClosed()) return Outcome.Completed({ needsContinuation: true })
@@ -382,10 +418,11 @@ const isInterruptedStream = (failure: AIError) => {
   return false
 }
 const classifyToolExits = (
-  settled: Exit.Exit<Array<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>>,
+  exits: ReadonlyArray<Exit.Exit<void, Permission.DeclinedError | QuestionTool.CancelledError>>,
   runs: ReadonlyArray<{ readonly call: ToolCall }>,
+  // The step was interrupted while it waited for its tools.
+  interruptedWhileWaiting: boolean,
 ) => {
-  const exits = Exit.isSuccess(settled) ? settled.value : []
   const declines = exits.flatMap((exit, index) =>
     Exit.isFailure(exit)
       ? exit.cause.reasons.flatMap((reason) =>
@@ -393,9 +430,7 @@ const classifyToolExits = (
         )
       : [],
   )
-  const causes = Exit.isFailure(settled)
-    ? [settled.cause]
-    : exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
+  const causes = exits.flatMap((exit) => (Exit.isFailure(exit) ? [exit.cause] : []))
   const failure = causes
     .flatMap((cause) => {
       if (Cause.hasInterrupts(cause)) return []
@@ -403,5 +438,39 @@ const classifyToolExits = (
       return reasons.length > 0 ? [Cause.fromReasons<never>(reasons)] : []
     })
     .at(0)
-  return { interrupted: causes.some(Cause.hasInterrupts), declines, failure }
+  return { interrupted: interruptedWhileWaiting || causes.some(Cause.hasInterrupts), declines, failure }
+}
+
+// How long a user's stop waits for the tools it asked to stop before interrupting them.
+const COOPERATIVE_STOP = "5 seconds"
+
+type Cancel = ReturnType<typeof makeCancel>
+
+/**
+ * A tool call's `cancel`. `trigger` completes it, and reports whether the tool was awaiting it, so would stop on its
+ * own; a tool that was not is interrupted instead.
+ */
+export const makeCancel = () => {
+  let listeners = 0
+  let cancelled = false
+  const gate = Deferred.makeUnsafe<void>()
+  return {
+    effect: Effect.suspend(() => {
+      if (cancelled) return Effect.void
+      listeners++
+      return Deferred.await(gate).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            listeners--
+          }),
+        ),
+      )
+    }),
+    trigger: () => {
+      cancelled = true
+      if (listeners === 0) return false
+      Deferred.doneUnsafe(gate, Exit.void)
+      return true
+    },
+  }
 }

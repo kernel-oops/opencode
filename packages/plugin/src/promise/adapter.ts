@@ -457,17 +457,23 @@ export function fromPromise(plugin: Plugin) {
                           ...input,
                           authorize: (answer) =>
                             Effect.promise(() => input.authorize(answer)).pipe(
-                              Effect.map((authorization) =>
-                                authorization.mode === "auto"
-                                  ? {
-                                      ...authorization,
-                                      callback: Effect.promise(() => authorization.callback),
-                                    }
-                                  : {
-                                      ...authorization,
-                                      callback: (code) => Effect.promise(() => authorization.callback(code)),
-                                    },
-                              ),
+                              Effect.map((authorization) => {
+                                if (authorization.mode === "code")
+                                  return {
+                                    ...authorization,
+                                    callback: (code: string) => Effect.promise(() => authorization.callback(code)),
+                                  }
+                                const submit = authorization.submit
+                                return {
+                                  ...authorization,
+                                  callback: Effect.promise(() => authorization.callback),
+                                  // A rejected paste keeps its own error, which the dialog shows as is.
+                                  submit: submit
+                                    ? (redirect: string) =>
+                                        Effect.tryPromise({ try: () => submit(redirect), catch: (error) => error })
+                                    : undefined,
+                                }
+                              }),
                             ),
                           refresh:
                             refresh === undefined
@@ -570,6 +576,7 @@ export function fromPromise(plugin: Plugin) {
                         update(value)
                         Object.assign(tool, value, {
                           output: value.output,
+                          freeform: value.freeform,
                           options: value.options,
                           execute: (input: Parameters<Info["execute"]>[0], context: Tool.Context) =>
                             executePromiseTool(value, input, context),
@@ -716,7 +723,8 @@ export function fromPromise(plugin: Plugin) {
 
         yield* Effect.acquireRelease(
           Effect.promise(() => Promise.resolve(plugin.setup(context2))),
-          (cleanup) => (cleanup ? releaseCleanup(plugin.id, cleanup) : Effect.void),
+          // JavaScript plugins may return anything, such as a v1-style hooks object; only a function is a cleanup.
+          (cleanup) => (typeof cleanup === "function" ? releaseCleanup(plugin.id, cleanup) : Effect.void),
         )
       }),
   })
@@ -777,18 +785,37 @@ const executePromiseTool = (tool: Info, input: any, context: Tool.Context) =>
         owner.closed = true
         owner.abort.abort(runtimeSignal?.reason)
       })
+    // `signal` aborts when the call is interrupted, and also when the user stops the call once the tool has read
+    // it. Reading it awaits `cancel`, which tells the step this tool stops on its own instead of being interrupted.
+    const finished = new AbortController()
+    // `cancel` stays out of the promise context; promise tools stop through `signal`.
+    const { cancel, ...rest } = context
+    let listening = false
+    const listen = (interrupted: AbortSignal) => {
+      if (listening || !cancel) return
+      listening = true
+      Effect.runPromise(cancel, { signal: AbortSignal.any([interrupted, finished.signal]) }).then(
+        () => invocation.run(owner, () => owner.abort.abort()),
+        () => {},
+      )
+    }
     return Effect.tryPromise({
       try: (signal) => {
         runtimeSignal = signal
         signal.addEventListener("abort", abort, { once: true })
         if (signal.aborted) abort()
-        return invocation.run(owner, () =>
-          tool.execute(input, {
-            ...context,
-            signal: owner.abort.signal,
-            progress: (update) => Effect.runPromise(context.progress(update), { signal }),
-          }),
-        )
+        return Promise.resolve(
+          invocation.run(owner, () =>
+            tool.execute(input, {
+              ...rest,
+              get signal() {
+                listen(signal)
+                return owner.abort.signal
+              },
+              progress: (update) => Effect.runPromise(context.progress(update), { signal }),
+            }),
+          ),
+        ).finally(() => finished.abort())
       },
       catch: toolError,
     }).pipe(

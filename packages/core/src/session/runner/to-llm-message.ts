@@ -139,6 +139,10 @@ const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: Provid
   }
 }
 
+// Sessions migrated from V1 never recorded `time.ran`, so a completed call also counts as run.
+const ranTool = (item: SessionMessage.AssistantContent) =>
+  item.type === "tool" && (item.time.ran !== undefined || item.state.status === "completed")
+
 const assistant = (message: SessionMessage.Assistant, model: Model.Ref, providerMetadataKey: string) => {
   const sameProvider = message.model.providerID === model.providerID
   const sameModel = sameProvider && message.model.id === model.id
@@ -167,7 +171,29 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
   const reasoningInterrupted = (nativeObserved && message.finish === "length") || message.content.some(
     (item) => item.type === "reasoning" && item.time !== undefined && item.time.completed === undefined,
   )
-  const content = message.content.flatMap((item): Array<AssistantMessage["content"][number]> => {
+  // Upstream #60674: a failed stream is retried from what had already happened: the local calls that ran and
+  // everything before them, so the retried request does not end on an assistant reply. A stream cut by Esc, a
+  // crash or a failure may end mid-block, so its last block's provider state is not replayed, and calls it cut off
+  // before they ran are dropped; input errors stay so the model can reissue the call. Native receipts keep their
+  // own authoritative done-prefix rules below.
+  const kept =
+    nativeRestricted || message.error === undefined || message.error.type === "aborted"
+      ? message.content
+      : message.content.slice(
+          0,
+          message.content.findLastIndex((item) => item.type === "tool" && item.executed !== true && ranTool(item)) + 1,
+        )
+  const cut = !nativeRestricted && (message.error !== undefined || message.finish === undefined)
+  const tail = cut ? message.content.at(-1) : undefined
+  const items = cut
+    ? kept.filter(
+        (item) =>
+          item.type !== "tool" ||
+          ranTool(item) ||
+          (item.state.status === "error" && item.state.error.type.startsWith("tool.input")),
+      )
+    : kept
+  const content = items.flatMap((item): Array<AssistantMessage["content"][number]> => {
     if (nativeRestricted && item.type !== "tool" && !acknowledged(item.native)) return []
     if (item.type === "text")
       return [
@@ -176,7 +202,8 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
           text: nativeRestricted ? acknowledgedText(acknowledged(item.native), "content") : item.text,
           // Text can carry provider-bound state (e.g. Gemini thought signatures),
           // which is only replayable against the model that produced it.
-          providerMetadata: reuseProviderMetadata ? providerMetadata(providerMetadataKey, item.native) : undefined,
+          providerMetadata:
+            reuseProviderMetadata && item !== tail ? providerMetadata(providerMetadataKey, item.native) : undefined,
         },
       ]
     // Let the destination adapter handle readable reasoning after a model/provider switch.
@@ -240,11 +267,11 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       if (typeof item === "object" && item !== null && "id" in item && "type" in item)
         content.push(Message.text(`The provider started hosted action ${String(item.type).slice(0, 128).replace(/[^\w.:-]/g, "_")} (${String(item.id).slice(0, 128).replace(/[^\w.:-]/g, "_")}) but did not acknowledge its completion. Its external outcome is unknown; do not assume it did not run or automatically repeat it.`))
   const meaningful = content.filter((part) => {
-    if (part.type === "text") return part.text !== ""
+    if (part.type === "text") return cut ? part.text.trim() !== "" : part.text !== ""
     if (part.type !== "reasoning") return true
     return part.text !== "" || (part.providerMetadata !== undefined && Object.keys(part.providerMetadata).length > 0)
   })
-  const results = message.content
+  const results = items
     .filter((item): item is SessionMessage.AssistantTool => item.type === "tool" && item.executed !== true)
     .filter((item) => (!message.interruption && !nativeRestricted) || item.time.ran !== undefined || ((nativeInterrupted || nativeObserved) && acknowledged(item.native)))
     .map((item) =>
