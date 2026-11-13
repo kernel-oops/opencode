@@ -7,7 +7,7 @@ import { Session } from "../session.js"
 import type { SessionMessage } from "../session/message.js"
 
 /**
- * Root agents that may keep their tools on a turn triggered by a subagent completion, when
+ * Agents that may keep their tools on a turn triggered by a subagent completion, when
  * `experimental.task_continuation_eligible` is not configured. `build` is OpenCode's own
  * stock primary agent, not a deployment-specific choice.
  */
@@ -74,8 +74,8 @@ export const Plugin = define({
             parseEnvironment(process.env.OPENCODE_TASK_CONTINUATION_AGENTS),
           eligible,
         )
-        // Only a root controller may continue; nested controllers stay report-only.
-        if (session && session.parentID === undefined && allowed.has(event.agent)) return
+        // Any allowlisted agent, root or nested, keeps its tools; this also covers a report steered mid-turn.
+        if (session && allowed.has(event.agent)) return
         for (const name of Object.keys(event.tools)) delete event.tools[name]
         event.system.push({ type: "text", text: REPORT_ONLY_GUIDANCE })
       }),

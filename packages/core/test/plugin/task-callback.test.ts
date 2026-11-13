@@ -148,7 +148,7 @@ describe("TaskCallbackPlugin", () => {
     expect(event.system).toEqual([])
   })
 
-  test("keeps tools for an allowlisted root controller only", async () => {
+  test("keeps tools for allowlisted root and nested agents only", async () => {
     const eligible = ["build", "custom-root"]
     const allowed = await run({
       messages: [synthetic("subagent")],
@@ -171,7 +171,16 @@ describe("TaskCallbackPlugin", () => {
       configured: ["build", "custom-root"],
       eligible,
     })
-    expect(Object.keys(nested.tools)).toEqual([])
+    expect(Object.keys(nested.tools)).toEqual(["read", "subagent"])
+    const nestedOther = await run({
+      messages: [synthetic("subagent")],
+      agent: "plan",
+      parentID: "ses_root",
+      configured: ["build", "custom-root"],
+      eligible,
+    })
+    expect(Object.keys(nestedOther.tools)).toEqual([])
+    expect(nestedOther.system).toEqual([{ type: "text", text: TaskCallbackPlugin.REPORT_ONLY_GUIDANCE }])
     const misconfigured = await run({
       messages: [synthetic("subagent")],
       agent: "build",
@@ -206,8 +215,7 @@ describe("TaskCallbackPlugin", () => {
       }
     }
     for (const input of [
-      { agent: "God", parentID: "ses_root" },
-      { agent: "build", parentID: "ses_root" },
+      { agent: "Lister", parentID: "ses_root" },
       { agent: "Lister" },
       { agent: "unlisted" },
       { agent: "God", configured: [] },
@@ -225,6 +233,13 @@ describe("TaskCallbackPlugin", () => {
       })
       expect(event.tools).toEqual({})
       expect(event.system).toEqual([{ type: "text", text: TaskCallbackPlugin.REPORT_ONLY_GUIDANCE }])
+    }
+    // A nested worker on the allowlist acts on its child's report, including one steered in mid-turn.
+    const workers = ["build", "God", "Lister", "Kryten"]
+    for (const messages of [[synthetic("subagent")], [synthetic("subagent"), assistant(), user()]]) {
+      const worker = await run({ messages, agent: "Lister", parentID: "ses_root", configured: workers, eligible: workers })
+      expect(Object.keys(worker.tools)).toEqual(["read", "subagent"])
+      expect(worker.system).toEqual([])
     }
     const human = await run({ messages: [user(), synthetic("subagent")], agent: "God", configured: [] })
     expect(Object.keys(human.tools)).toEqual(["read", "subagent"])
