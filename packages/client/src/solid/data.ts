@@ -784,7 +784,13 @@ export function createData(config: CreateDataInput) {
     const updates = new Map<string, T | undefined>()
     pending.add(updates)
     try {
-      const grouped = Map.groupBy(await read(), (item) => item.sessionID)
+      // Not Map.groupBy: gui-plugins compiles this file against an older lib.
+      const grouped = new Map<string, T[]>()
+      for (const item of await read()) {
+        const list = grouped.get(item.sessionID)
+        if (list) list.push(item)
+        else grouped.set(item.sessionID, [item])
+      }
       // Events arriving during the read supersede its snapshot: live asks stay, answered requests stay gone.
       const live = (sessionID: string, list: readonly T[]) => {
         const next = new Map(list.map((item) => [item.id, item]))
