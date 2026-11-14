@@ -168,9 +168,11 @@ export const { use: useSessionTabs, provider: SessionTabsProvider } = createSimp
             ? ("question" as const)
             : (false as const),
         // Parked synthetic context (user shells, plan reminders) stays pending without execution; only work counts as busy.
+        // Background shells outlive the turn, so the live shell inventory counts too, as in the session list.
         busy: members.some(
           (id) =>
             data.session.status(id) === "running" ||
+            data.shell.listBySession(id).length > 0 ||
             data.session.pending.list(id).some((item) => item.type !== "synthetic"),
         ),
         renaming: data.session.title.pending(session),
