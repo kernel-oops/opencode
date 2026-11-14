@@ -565,9 +565,9 @@ export function Prompt(props: PromptProps) {
           if (!input.focused) return
           if (!props.sessionID) return
 
-          void client.api.session.background({
-            sessionID: props.sessionID,
-          })
+          void client.api.session
+            .background({ sessionID: props.sessionID })
+            .catch(() => toast.show({ message: "Failed to move work to the background", variant: "error" }))
           dialog.clear()
         },
       },

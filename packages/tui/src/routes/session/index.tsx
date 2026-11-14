@@ -1459,7 +1459,9 @@ export function Session(props: {
       group: "Session",
       palette: undefined,
       run: () => {
-        void client.api.session.background({ sessionID: route.sessionID })
+        void client.api.session
+          .background({ sessionID: route.sessionID })
+          .catch(() => toast.show({ message: "Failed to move work to the background", variant: "error" }))
         dialog.clear()
       },
     },
@@ -1520,7 +1522,8 @@ export function Session(props: {
   Keymap.createLayer(() => ({
     mode: "composer",
     enabled: () => renderer.currentFocusedEditor === null,
-    bindings: baseAndUnfocusedCommands.map((command) => command.id),
+    // A child session has no prompt and keeps the subagent picker open, so ctrl+b must work in composer mode too.
+    bindings: [...baseAndUnfocusedCommands.map((command) => command.id), "session.background"],
   }))
 
   Keymap.createLayer(() => ({
