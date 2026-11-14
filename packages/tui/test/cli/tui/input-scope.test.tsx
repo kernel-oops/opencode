@@ -303,9 +303,11 @@ test("mounted approval with attached context names the rule, keeps the draft and
   const mounted = await mountApprovalComposer(tmp.path, pendingApproval)
   try {
     mounted.prompt().set({
+      // Upstream #63265 keeps a paste only while its placeholder is in the text, which can never be the bare
+      // phrase, so a mentionless attachment (such as a pasted image) is the context that can accompany it.
       text: "I approve per_scoped",
-      pasted: [{ text: "extra context", source: { start: 0, end: 0, text: "[Pasted text]" } }],
-      files: [],
+      pasted: [],
+      files: [{ uri: "file:///extra.png" }],
       agents: [],
       skills: [],
     })
@@ -314,7 +316,7 @@ test("mounted approval with attached context names the rule, keeps the draft and
       "Send the approval phrase by itself, without attachments or additional context, or use the pending request’s approval button.",
     )
     expect(mounted.prompt().current.text).toBe("I approve per_scoped")
-    expect(mounted.prompt().current.pasted).toHaveLength(1)
+    expect(mounted.prompt().current.files).toHaveLength(1)
     expect(mounted.panes.replies).toEqual([])
     expect(mounted.panes.submissions).toEqual([])
     expect(mounted.panes.cancellations).toEqual([])

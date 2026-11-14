@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
+import { isolatedGlobal } from "./fixture/app"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
@@ -77,7 +77,7 @@ test("a call the user stopped shows its output once, clipped like a finished cal
       args: { sessionID: session.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await setup.waitForFrame((frame) => frame.includes("Both ran"))

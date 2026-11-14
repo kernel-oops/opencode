@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
+import { isolatedGlobal } from "./fixture/app"
 import { createTestRenderer, TestRecorder } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
@@ -74,7 +74,7 @@ test.each([100, 48].flatMap((width) => [false, true].map((child) => ({ width, ch
         args: { sessionID: session.id },
         terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
         log: () => {},
-      }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+      }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
     )
     try {
       await waitForHighlightedFrame(setup, (frame) => frame.includes("Turn 59 answer"))
