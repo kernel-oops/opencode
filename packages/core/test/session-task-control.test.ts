@@ -21,7 +21,11 @@ import { tempGlobalLayer } from "./fixture/global"
 import { offlineModels } from "./fixture/models"
 import { testEffect } from "./lib/effect"
 
-const calls = { interrupted: [] as string[], woken: [] as string[] }
+const calls = {
+  interrupted: [] as string[],
+  woken: [] as string[],
+  onInterrupt: undefined as ((sessionID: string) => Effect.Effect<void>) | undefined,
+}
 
 const executionNode = makeGlobalNode({
   service: SessionExecution.Service,
@@ -32,7 +36,10 @@ const executionNode = makeGlobalNode({
       isActive: () => Effect.succeed(false),
       resume: () => Effect.void,
       wake: (sessionID) => Effect.sync(() => void calls.woken.push(sessionID)),
-      interrupt: (sessionID) => Effect.sync(() => (calls.interrupted.push(sessionID), true)),
+      interrupt: (sessionID) =>
+        Effect.suspend(() => calls.onInterrupt?.(sessionID) ?? Effect.void).pipe(
+          Effect.andThen(Effect.sync(() => (calls.interrupted.push(sessionID), true))),
+        ),
       awaitIdle: () => Effect.void,
     }),
   ),
@@ -154,11 +161,17 @@ describe("SessionTaskControl", () => {
         yield* start(child.id, grandchild.id)
         yield* start(sibling.id, siblingChild.id)
         expect(yield* jobs.pendingBackground).toHaveLength(3)
-
-        const result = yield* control.stopAll(parent.id)
+        // A child's settled hook must already see the suppressing cancel when its interrupt lands.
+        const statusAtInterrupt: Record<string, unknown> = {}
+        calls.onInterrupt = (id) =>
+          jobs.get(id).pipe(Effect.map((job) => void (statusAtInterrupt[id] = job?.metadata?.suppressed)))
+        const result = yield* control
+          .stopAll(parent.id)
+          .pipe(Effect.ensuring(Effect.sync(() => (calls.onInterrupt = undefined))))
         expect(result.interrupted).toBe(true)
         expect(result.cancelled).toEqual([grandchild.id, child.id])
         expect(calls.interrupted).toEqual([grandchild.id, child.id, parent.id])
+        expect(statusAtInterrupt).toEqual({ [grandchild.id]: true, [child.id]: true, [parent.id]: undefined })
         const cancelled = yield* jobs.get(child.id)
         expect(cancelled).toMatchObject({ status: "cancelled", metadata: { suppressed: true } })
         // No marker for the cancelled tree remains for restart recovery; the other controller keeps its job.

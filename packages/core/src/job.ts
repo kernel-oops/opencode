@@ -565,7 +565,11 @@ export const make = Effect.gen(function* () {
         // A suppressed cancellation leaves no durable notification for restart recovery to deliver.
         if (options?.suppress && job.info.notificationID) {
           if (!job.settling)
-            yield* db.delete(JobTable).where(eq(JobTable.notification_id, job.info.notificationID)).run().pipe(Effect.orDie)
+            yield* db
+              .delete(JobTable)
+              .where(eq(JobTable.notification_id, job.info.notificationID))
+              .run()
+              .pipe(Effect.orDie)
         } else if (persist && !job.settling) yield* persistBackground(next)
         return [
           { info: snapshot(next), done: job.done, scope: job.scope, generation: job.scope, cancel: job.cancel },
@@ -661,7 +665,9 @@ export const make = Effect.gen(function* () {
     function* (id, boundGeneration) {
       return yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [SubagentReportState, Map<string, Active>] => {
         const job = jobs.get(id)
-        if (job?.suppressed && job.info.status === "cancelled") return [{ mode: "suppressed" }, jobs]
+        // A suppressed cancel silences only the period it cancelled; later periods report as usual.
+        if (job?.suppressed && job.info.status === "cancelled")
+          return [{ mode: "suppressed" }, new Map(jobs).set(id, { ...job, suppressed: false, reported: true })]
         // A generation reports at most once, even when an earlier attempt only observed a cancel.
         if (!job?.isBackgrounded || job.reported || !job.info.notificationID || job.recovery?.kind !== "subagent") {
           return [{ mode: "none" }, jobs]

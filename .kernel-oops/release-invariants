@@ -15,6 +15,7 @@ packages/core test/flag.test.ts                            per-field flags acros
 # B17 v2.2.7 overlap: upstream's model resolve hook (#62997) added a request argument; the fork's native test policy is the separate options argument.
 packages/core test/session-generate.test.ts                only primary resolution reads the native test snapshot; generation stays HTTP
 packages/core test/plugin/task-callback.test.ts          allowlisted root/nested agents keep tools on subagent-report turns (B19 option B); others report-only
+packages/core test/subagent-task-control-reports.test.ts  task_cancel/stop-all suppress only the cancelled period; pause holds reports; woken workers report again (B19)
 
 # B15 v2.2.6 overlap: upstream's composer submit machine owns sends; the fork's typed review approval must join it.
 flags packages/app --conditions=solid --isolate --preload ../ui/test/solid-jsx.ts --preload ./happydom.ts

@@ -104,12 +104,15 @@ const layer = Layer.effect(
     })
 
     // Depth first: a child's own descendants are suppressed before its notification could fire.
-    const cancelEntry = (entry: Effect.Success<ReturnType<typeof children>>[number]): Effect.Effect<Array<SessionSchema.ID>> =>
+    const cancelEntry = (
+      entry: Effect.Success<ReturnType<typeof children>>[number],
+    ): Effect.Effect<Array<SessionSchema.ID>> =>
       Effect.gen(function* () {
         const cancelled = yield* cancelTree(entry.recovery.childSessionID)
         if (entry.job.status !== "running") return cancelled
-        yield* execution.interrupt(entry.recovery.childSessionID)
+        // Mark suppression before the interrupt settles, so the settled hook never claims a report.
         yield* jobs.cancel(entry.job.id, { suppress: true })
+        yield* execution.interrupt(entry.recovery.childSessionID)
         cancelled.push(entry.recovery.childSessionID)
         return cancelled
       })
