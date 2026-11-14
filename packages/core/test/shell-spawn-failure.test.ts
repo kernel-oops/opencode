@@ -5,12 +5,14 @@ import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Config } from "@opencode/core/config"
 import { Environment } from "@opencode/core/environment/index"
 import { Location } from "@opencode/core/location"
+import { PersistentPty } from "@opencode/core/persistent-pty"
 import { Shell } from "@opencode/core/shell"
 import { AppProcess } from "@opencode/util/process"
 import { Global } from "@opencode/util/global"
 import { hostEnvironmentLayer } from "./fixture/environment"
 import { tempGlobalLayer } from "./fixture/global"
 import { tempLocationLayer } from "./fixture/location"
+import { disabledPersistentPtyLayer } from "./fixture/persistent-pty"
 import { it } from "./lib/effect"
 
 const build = (environment: Layer.Layer<Environment.Service, unknown, unknown>) =>
@@ -19,6 +21,8 @@ const build = (environment: Layer.Layer<Environment.Service, unknown, unknown>) 
     Global.node.replace(tempGlobalLayer),
     Config.node.replace(Config.testLayer()),
     Environment.node.replace(environment as never),
+    // Without the process daemon, local commands use the spawner this test breaks.
+    PersistentPty.node.replace(disabledPersistentPtyLayer),
   ])
 
 it.live("create fails instead of hanging when the spawner dies", () =>

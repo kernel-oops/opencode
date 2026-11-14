@@ -76,7 +76,8 @@ describe("SubagentCompletion", () => {
           Effect.sync(() => {
             completed.push(id)
           }),
-      } satisfies Pick<Job.Interface, "completeBackground">
+        paused: () => Effect.succeed(false),
+      } satisfies Pick<Job.Interface, "completeBackground" | "paused">
 
       yield* SubagentCompletion.deliver(sessions, jobs, {
         status: "completed",
@@ -138,7 +139,8 @@ describe("SubagentCompletion", () => {
       }
       const jobs = {
         completeBackground: () => Effect.void,
-      } satisfies Pick<Job.Interface, "completeBackground">
+        paused: () => Effect.succeed(false),
+      } satisfies Pick<Job.Interface, "completeBackground" | "paused">
       const output = ["Subagent cancelled", "", "Background work still running:", "- shell (shell_1): bun test"].join(
         "\n",
       )

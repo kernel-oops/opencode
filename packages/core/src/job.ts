@@ -558,6 +558,7 @@ export const make = Effect.gen(function* () {
             ...job.info,
             status: "cancelled" as const,
             completed_at,
+            ...(options?.suppress ? { metadata: { ...job.info.metadata, suppressed: true } } : {}),
           },
         }
         // Settling work owns its outbox row: the settlement commit writes or deletes it.

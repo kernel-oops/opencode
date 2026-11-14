@@ -18,6 +18,8 @@ export interface SyntheticSession<E = never> {
     readonly text: string
     readonly description?: string
     readonly metadata?: SessionSchema.Metadata
+    /** false: retain the report without waking the parent (a paused parent). */
+    readonly resume?: boolean
   }) => Effect.Effect<unknown, E>
 }
 
@@ -54,13 +56,19 @@ export function formatBody(
 
 export const deliver = Effect.fnUntraced(function* <E>(
   sessions: SyntheticSession<E>,
-  jobs: Pick<Job.Interface, "completeBackground">,
-  input: Pick<Job.Info, "status" | "output" | "error" | "notificationID"> & {
-    recovery: Extract<Job.Recovery, { kind: "subagent" }>
-  },
+  jobs: Pick<Job.Interface, "completeBackground" | "paused">,
+  input: Pick<Job.Info, "status" | "output" | "error" | "notificationID"> &
+    Partial<Pick<Job.Info, "metadata">> & {
+      recovery: Extract<Job.Recovery, { kind: "subagent" }>
+    },
 ) {
   if (input.status === "running") return
   const recovery = input.recovery
+  // A suppressed cancellation (task_cancel, stop all) never reaches the parent's context.
+  if (input.metadata?.suppressed === true) {
+    if (input.notificationID) yield* jobs.completeBackground(input.notificationID)
+    return
+  }
   const body =
     input.status === "completed"
       ? (input.output ?? NO_TEXT)
@@ -70,8 +78,11 @@ export const deliver = Effect.fnUntraced(function* <E>(
   // The body is all a recovered outbox row keeps, so the still-running list is how a replay tells this period apart.
   // Only the model-facing tag says "running": the job and the message metadata keep the period's real status.
   const state = input.status === "completed" && body.includes(STILL_RUNNING) ? "running" : input.status
+  // A paused parent retains the completion durably in its inbox without waking it.
+  const paused = yield* jobs.paused(recovery.parentSessionID)
   yield* sessions.synthetic({
     ...(input.notificationID ? { id: input.notificationID } : {}),
+    ...(paused ? { resume: false } : {}),
     sessionID: recovery.parentSessionID,
     description: recovery.description,
     text: `<subagent sessionID="${recovery.childSessionID}" state="${state}" description="${recovery.description}">\n${body}\n</subagent>`,
