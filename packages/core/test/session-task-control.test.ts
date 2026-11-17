@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Layer, Schedule } from "effect"
+import { Deferred, Effect, Layer, RcMap, Schedule } from "effect"
+import fs from "node:fs/promises"
+import { eq } from "drizzle-orm"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Global } from "@opencode/util/global"
@@ -19,17 +21,37 @@ import { SessionTaskControl } from "@opencode/core/session/task-control"
 import { Instance } from "@opencode/core/instance/service"
 import { Shell } from "@opencode/core/shell"
 import { ShellTool } from "@opencode/core/tool/plugin/shell"
+import { SessionTable } from "@opencode/core/session/sql"
 import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
 import { offlineModels } from "./fixture/models"
 import { testEffect } from "./lib/effect"
 
 const calls = {
+  forceLive: undefined as string | undefined,
   interruptResult: true,
   interrupted: [] as string[],
   woken: [] as string[],
   onInterrupt: undefined as ((sessionID: string) => Effect.Effect<void>) | undefined,
 }
+
+const instanceNode = makeGlobalNode({
+  service: Instance.Service,
+  layer: Layer.effect(
+    Instance.Service,
+    Effect.gen(function* () {
+      const locations = yield* LocationServiceMap.Service
+      return Instance.Service.of({
+        provide: (session) => Effect.provide(locations.get(session.location)),
+        live: (session) =>
+          calls.forceLive === session.location.directory
+            ? Effect.succeed(true)
+            : RcMap.has(locations.rcMap, LocationServiceMap.canonical(session.location)),
+      })
+    }),
+  ),
+  deps: [LocationServiceMap.node],
+})
 
 const executionNode = makeGlobalNode({
   service: SessionExecution.Service,
@@ -64,7 +86,12 @@ const it = testEffect(
       Instance.node,
       LocationServiceMap.node,
     ]),
-    [SessionExecution.node.replace(executionNode), Global.node.replace(tempGlobalLayer), offlineModels],
+    [
+      SessionExecution.node.replace(executionNode),
+      Instance.node.replace(instanceNode),
+      Global.node.replace(tempGlobalLayer),
+      offlineModels,
+    ],
   ),
 )
 
@@ -75,11 +102,102 @@ const withDir = <A, E, R>(body: (dir: string) => Effect.Effect<A, E, R>) =>
   ).pipe(Effect.flatMap((dir) => body(dir.path)))
 
 describe("SessionTaskControl", () => {
+  it.live("status and cancellation never start cold descendant Locations", () =>
+    withDir((dir) =>
+      withDir((cold) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const instances = yield* Instance.Service
+          const control = yield* SessionTaskControl.Service
+          const database = yield* Database.Service
+          const store = yield* SessionStore.Service
+          const parent = yield* sessions.create({ location: Location.Ref.make({ directory: AbsolutePath.make(dir) }) })
+          const child = yield* sessions.create({ parentID: parent.id })
+          yield* database.db
+            .update(SessionTable)
+            .set({ directory: AbsolutePath.make(cold) })
+            .where(eq(SessionTable.id, child.id))
+            .run()
+          const stored = (yield* store.get(child.id))!
+          expect(yield* instances.live!(stored)).toBe(false)
+          expect((yield* control.status(parent.id)).shells).toEqual([])
+          expect(yield* instances.live!(stored)).toBe(false)
+          yield* control.cancelOne(parent.id, child.id)
+          yield* control.stopAll(parent.id)
+          expect(yield* instances.live!(stored)).toBe(false)
+        }),
+      ),
+    ),
+  )
+
+  it.live("a removed descendant Location does not block status, cancel-one or stop-all for live shells", () =>
+    withDir((dir) =>
+      withDir((gone) =>
+        Effect.gen(function* () {
+          const sessions = yield* Session.Service
+          const instances = yield* Instance.Service
+          const control = yield* SessionTaskControl.Service
+          const database = yield* Database.Service
+          const parent = yield* sessions.create({ location: Location.Ref.make({ directory: AbsolutePath.make(dir) }) })
+          const child = yield* sessions.create({ parentID: parent.id })
+          const grandchild = yield* sessions.create({ parentID: child.id })
+          const shell = yield* Shell.Service.pipe(instances.provide(parent))
+          yield* database.db
+            .update(SessionTable)
+            .set({ directory: AbsolutePath.make(gone) })
+            .where(eq(SessionTable.id, child.id))
+            .run()
+          yield* Effect.promise(() => fs.rm(gone, { recursive: true }))
+          // Model a Location that was live/booting when checked but vanished before acquisition.
+          calls.forceLive = gone
+          const start = (sessionID: Session.ID) =>
+            Effect.acquireRelease(
+              shell.create({
+                command: `"${process.execPath}" -e "setInterval(()=>{},1000)"`,
+                cwd: dir,
+                timeout: 0,
+                metadata: { sessionID },
+              }),
+              (info) => shell.stop(info.id, "killed").pipe(Effect.andThen(shell.wait(info.id)), Effect.orDie),
+            )
+          const own = yield* start(parent.id)
+          const nested = yield* start(grandchild.id)
+          expect((yield* control.status(parent.id)).shells.map((info) => info.id).sort()).toEqual(
+            [own.id, nested.id].sort(),
+          )
+          expect((yield* control.cancelOne(parent.id, child.id)).stoppedShells).toEqual([nested.id])
+          expect((yield* shell.wait(nested.id)).status).toBe("killed")
+          expect((yield* control.stopAll(parent.id)).stoppedShells).toEqual([own.id])
+          expect((yield* shell.wait(own.id)).status).toBe("killed")
+        }),
+      ),
+    ).pipe(Effect.ensuring(Effect.sync(() => (calls.forceLive = undefined)))),
+  )
+
+  it.live("a corrupt ancestry cycle terminates without making the caller its own descendant", () =>
+    withDir((dir) =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const control = yield* SessionTaskControl.Service
+        const database = yield* Database.Service
+        const parent = yield* sessions.create({ location: Location.Ref.make({ directory: AbsolutePath.make(dir) }) })
+        const child = yield* sessions.create({ parentID: parent.id })
+        yield* database.db.update(SessionTable).set({ parent_id: child.id }).where(eq(SessionTable.id, parent.id)).run()
+        expect((yield* control.status(parent.id)).shells).toEqual([])
+        expect((yield* control.cancelOne(parent.id, parent.id)).owned).toBe(false)
+        calls.interrupted.length = 0
+        yield* control.cancelOne(parent.id, child.id)
+        expect(calls.interrupted).toEqual([child.id])
+      }),
+    ),
+  )
+
   for (const state of ["running", "completed", "untracked"] as const) {
     it.live(`stops ${state} descendants' shells without deleting output or touching unrelated sessions`, () =>
       withDir((dir) =>
         Effect.gen(function* () {
           calls.interruptResult = false
+          calls.woken.length = 0
           const sessions = yield* Session.Service
           const jobs = yield* Job.Service
           const control = yield* SessionTaskControl.Service
@@ -153,7 +271,13 @@ describe("SessionTaskControl", () => {
           yield* shell.wait(nested.id)
           expect((yield* shell.wait(first.id)).status).toBe("killed")
           expect(yield* jobs.get(first.id)).toMatchObject({ status: "cancelled", metadata: { suppressed: true } })
-          expect(yield* sessions.inbox(child.id)).toEqual([])
+          const notes = yield* sessions.inbox(child.id)
+          expect(notes).toHaveLength(1)
+          expect(notes[0]).toMatchObject({
+            type: "synthetic",
+            payload: { text: expect.stringContaining("No completion notification will arrive; do not wait for one.") },
+          })
+          expect(calls.woken).toEqual([])
           expect((yield* shell.output(first.id)).output).toContain("retained")
           expect(yield* Effect.promise(() => Bun.file(first.file).exists())).toBe(true)
           expect((yield* shell.get(own.id)).status).toBe("running")

@@ -163,7 +163,7 @@ export function useTaskControls(sessionID: () => string | undefined): TaskContro
       dialog.replace(() => (
         <DialogConfirm
           title="Stop all work"
-          message="Stop this response, its descendant tasks and their running shells? Shell output and results already delivered are kept."
+          message="Stop this response, its descendant tasks, and this session's and its descendants' running shells? Shell output and results already delivered are kept."
           initial="cancel"
           label={{ confirm: "Stop all work", cancel: "Cancel" }}
           onConfirm={() => void act(() => api().stopAll(params())).finally(resolve)}

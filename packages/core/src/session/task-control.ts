@@ -10,6 +10,7 @@ import { SessionStore } from "./store.js"
 import { NotFoundError } from "./error.js"
 import { Instance } from "../instance/service.js"
 import { Shell } from "../shell.js"
+import { Session } from "../session.js"
 
 export const Status = SessionTask.Status
 export type Status = typeof Status.Type
@@ -55,6 +56,7 @@ const layer = Layer.effect(
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
     const instances = yield* Instance.Service
+    const sessions = yield* Session.Service
 
     const get = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
@@ -73,11 +75,13 @@ const layer = Layer.effect(
         ),
       )
 
-    const tree = (sessionID: SessionSchema.ID): Effect.Effect<Array<SessionSchema.Info>> =>
+    const tree = (sessionID: SessionSchema.ID, seen = new Set([sessionID])): Effect.Effect<Array<SessionSchema.Info>> =>
       Effect.gen(function* () {
         const descendants: Array<SessionSchema.Info> = []
         for (const child of yield* store.list({ parentID: sessionID })) {
-          descendants.push(...(yield* tree(child.id)), child)
+          if (seen.has(child.id)) continue
+          seen.add(child.id)
+          descendants.push(...(yield* tree(child.id, seen)), child)
         }
         return descendants
       })
@@ -90,7 +94,14 @@ const layer = Layer.effect(
         const key = JSON.stringify(session.location)
         if (locations.has(key)) continue
         locations.add(key)
-        const shell = yield* Shell.Service.pipe(instances.provide(session), Effect.orDie)
+        // Status polls must not boot historical worktrees; recovery already loads running shells' Locations.
+        if (instances.live && !(yield* instances.live(session))) continue
+        const shell = yield* Shell.Service.pipe(
+          instances.provide(session),
+          // A live/booting Location can disappear between the check and acquisition.
+          Effect.catchTag("FileSystem.DirectoryNotFoundError", () => Effect.succeed(undefined)),
+        )
+        if (!shell) continue
         for (const info of yield* shell.list()) {
           const sessionID = sessions.find((session) => session.id === info.metadata.sessionID)?.id
           if (!sessionID) continue
@@ -110,6 +121,23 @@ const layer = Layer.effect(
           return entry.info.id
         }),
       )
+    })
+
+    const recordStops = Effect.fnUntraced(function* (entries: Effect.Success<ReturnType<typeof shells>>) {
+      for (const sessionID of new Set(entries.map((entry) => entry.info.sessionID))) {
+        yield* sessions
+          .synthetic({
+            sessionID,
+            description: "Background shells explicitly cancelled",
+            text: [
+              "Your controller explicitly stopped these background shells:",
+              ...entries.filter((entry) => entry.info.sessionID === sessionID).map((entry) => `- ${entry.info.id}`),
+              "Their output and logs are retained. No completion notification will arrive; do not wait for one.",
+            ].join("\n"),
+            resume: false,
+          })
+          .pipe(Effect.orDie)
+      }
     })
 
     const status: Interface["status"] = Effect.fn("SessionTaskControl.status")(function* (sessionID) {
@@ -160,14 +188,17 @@ const layer = Layer.effect(
         const interrupted = yield* execution.interrupt(session.id)
         if (job?.status === "running" || interrupted) cancelled.push(session.id)
       }
+      yield* recordStops(runningShells)
       return { cancelled, stoppedShells }
     })
 
     const stopAll: Interface["stopAll"] = Effect.fn("SessionTaskControl.stopAll")(function* (sessionID) {
       const session = yield* get(sessionID)
       const result = yield* cancel(yield* tree(sessionID))
-      const stoppedShells = [...result.stoppedShells, ...(yield* stopShells(yield* shells([session])))]
+      const ownShells = yield* shells([session])
+      const stoppedShells = [...result.stoppedShells, ...(yield* stopShells(ownShells))]
       const interrupted = yield* execution.interrupt(sessionID)
+      yield* recordStops(ownShells)
       return StopAllResult.make({ interrupted, cancelled: result.cancelled, stoppedShells })
     })
 
@@ -177,7 +208,10 @@ const layer = Layer.effect(
         const owned = yield* tree(parentSessionID)
         const child = owned.find((session) => session.id === childSessionID)
         if (!child) return CancelOneResult.make({ owned: false, cancelled: [], stoppedShells: [] })
-        const result = yield* cancel([...(yield* tree(childSessionID)), child])
+        const result = yield* cancel([
+          ...(yield* tree(childSessionID, new Set([parentSessionID, childSessionID]))),
+          child,
+        ])
         return CancelOneResult.make({ owned: true, ...result })
       },
     )
@@ -189,5 +223,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Job.node, SessionExecution.node, SessionStore.node, Instance.node],
+  deps: [Job.node, SessionExecution.node, SessionStore.node, Instance.node, Session.node],
 })
