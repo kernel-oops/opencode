@@ -16,7 +16,7 @@ const StatusInput = Schema.Struct({
 const CancelInput = Schema.Struct({
   sessionID: SessionSchema.ID.annotate({
     description:
-      "The childSessionID of a background subagent you launched (from the subagent tool's background result, or from task_status).",
+      "The sessionID of a descendant subagent to cancel, including an idle, completed or untracked child or grandchild.",
   }),
 })
 
@@ -33,6 +33,7 @@ export const Plugin = {
           description: [
             "Lists the subagents you launched with the subagent tool that are still tracked in this process.",
             "For each one, shows its sessionID, agent, description, and job status (running, completed, error, cancelled).",
+            "Also lists running shells owned by this session and its persisted descendants, even when no job is tracked.",
             "You are notified automatically when a background subagent finishes; use this tool only if you need to check the current state on demand, not as a substitute for those notifications.",
             "DO NOT sleep, poll, or call this in a loop to wait on a background subagent — wait for its completion notification instead.",
           ].join("\n"),
@@ -44,10 +45,14 @@ export const Plugin = {
                 const status =
                   input.sessionID === undefined
                     ? full
-                    : { ...full, background: full.background.filter((task) => task.sessionID === input.sessionID) }
+                    : {
+                        ...full,
+                        background: full.background.filter((task) => task.sessionID === input.sessionID),
+                        shells: full.shells.filter((shell) => shell.sessionID === input.sessionID),
+                      }
                 return {
                   output: status,
-                  content:
+                  content: [
                     status.background.length === 0
                       ? input.sessionID === undefined
                         ? "No background subagents are tracked for this session."
@@ -55,6 +60,10 @@ export const Plugin = {
                       : status.background
                           .map((task) => `- ${task.sessionID} (${task.agent}): ${task.status} — ${task.description}`)
                           .join("\n"),
+                    ...status.shells.map(
+                      (shell) => `- Shell ${shell.id} (${shell.sessionID}): running — ${shell.command}`,
+                    ),
+                  ].join("\n"),
                 }
               }),
               Effect.mapError((error) => new ToolFailure({ message: "Unable to read task status", error })),
@@ -64,8 +73,9 @@ export const Plugin = {
           name: "task_cancel",
           options: { codemode: false },
           description: [
-            "Cancels one of your own background subagents by its sessionID, interrupting it and cancelling its own background descendants first.",
-            "Only subagents you launched from this session can be cancelled; a sessionID that is not one of yours, or is not currently tracked, is refused.",
+            "Cancels a descendant subagent by its sessionID, interrupting it and cancelling its descendants first.",
+            "Persisted descendants are owned even when idle, completed or no longer tracked after a restart. Sessions outside your descendant tree are refused.",
+            "Also stops running shells belonging to that descendant tree, keeping their retained output and logs.",
             "The subagent's notification is suppressed: you will not be notified when it would otherwise have completed.",
           ].join("\n"),
           input: CancelInput,
@@ -78,9 +88,14 @@ export const Plugin = {
                   ? Effect.succeed({
                       output: result,
                       content:
-                        result.cancelled.length === 0
+                        result.cancelled.length === 0 && result.stoppedShells.length === 0
                           ? `Subagent ${input.sessionID} was not running; nothing to cancel.`
-                          : `Cancelled: ${result.cancelled.join(", ")}.`,
+                          : [
+                              ...(result.cancelled.length ? [`Cancelled: ${result.cancelled.join(", ")}.`] : []),
+                              ...(result.stoppedShells.length
+                                ? [`Stopped shells (output retained): ${result.stoppedShells.join(", ")}.`]
+                                : []),
+                            ].join("\n"),
                     })
                   : new ToolFailure({
                       message: `Session ${input.sessionID} is not a background subagent owned by this session.`,

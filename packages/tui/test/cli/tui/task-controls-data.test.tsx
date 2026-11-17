@@ -29,7 +29,7 @@ test("a paused controller appears in the row and palette through the real TUI da
   const nextCalls = createFetch(
     (url) =>
       url.pathname === `/api/session/${sessionID}/task`
-        ? json({ paused: false, active: true, background: [] })
+        ? json({ paused: false, active: true, background: [], shells: [] })
         : undefined,
     nextEvents,
   )
@@ -83,7 +83,7 @@ test("a paused controller appears in the row and palette through the real TUI da
     const pending = data.session.task.sync(sessionID)
     expect(data.session.task.get(sessionID)).toBeUndefined()
     expect(commands().some((command) => command.id === "session.resume-controller")).toBe(false)
-    status.resolve(json({ paused: true, active: false, background: [] }))
+    status.resolve(json({ paused: true, active: false, background: [], shells: [] }))
     await pending
     expect(data.session.task.get(sessionID)?.paused).toBe(true)
     await app.waitForFrame((frame) => frame.includes("Resume controller"))

@@ -37,7 +37,7 @@ export const cardSession = (
 }
 
 export const runningTasks = (snapshot?: TaskControlSnapshot) =>
-  snapshot?.background.filter((task) => task.status === "running").length ?? 0
+  (snapshot?.background.filter((task) => task.status === "running").length ?? 0) + (snapshot?.shells?.length ?? 0)
 export const stopAllAvailable = (status: string, snapshot?: TaskControlSnapshot) =>
   status !== "idle" || snapshot?.active === true || runningTasks(snapshot) > 0
 export const emergencyStopReady = (presses: number) => presses >= 2
@@ -128,9 +128,15 @@ export function useTaskControls(sessionID: () => string | undefined): TaskContro
   const data = useData()
   const dialog = useDialog()
   const { navigate } = useRoute()
-  const snapshot = () => { const id = sessionID(); return id ? data.session.task.get(id) : undefined }
+  const snapshot = () => {
+    const id = sessionID()
+    return id ? data.session.task.get(id) : undefined
+  }
   const params = () => ({ sessionID: sessionID()! })
-  const refresh = () => { const id = sessionID(); return id ? data.session.task.sync(id) : Promise.resolve() }
+  const refresh = () => {
+    const id = sessionID()
+    return id ? data.session.task.sync(id) : Promise.resolve()
+  }
   createEffect(() => {
     const id = sessionID()
     if (id) onCleanup(data.session.task.observe(id))
@@ -157,7 +163,7 @@ export function useTaskControls(sessionID: () => string | undefined): TaskContro
       dialog.replace(() => (
         <DialogConfirm
           title="Stop all work"
-          message="Stop this response and every background task it owns? Results already delivered are kept."
+          message="Stop this response, its descendant tasks and their running shells? Shell output and results already delivered are kept."
           initial="cancel"
           label={{ confirm: "Stop all work", cancel: "Cancel" }}
           onConfirm={() => void act(() => api().stopAll(params())).finally(resolve)}
@@ -170,10 +176,21 @@ export function useTaskControls(sessionID: () => string | undefined): TaskContro
       <DialogSelect
         title={`Background tasks (${runningTasks(snapshot())} running)`}
         emptyView={<text>No background tasks for this session.</text>}
-        options={taskOptions(snapshot()?.background ?? [], (id) => {
-          dialog.clear()
-          navigate({ type: "session", sessionID: id })
-        })}
+        options={taskOptions(
+          [
+            ...(snapshot()?.background ?? []),
+            ...(snapshot()?.shells ?? []).map((shell) => ({
+              sessionID: shell.sessionID,
+              agent: "shell",
+              description: `${shell.id}: ${shell.command}`,
+              status: "running" as const,
+            })),
+          ],
+          (id) => {
+            dialog.clear()
+            navigate({ type: "session", sessionID: id })
+          },
+        )}
       />
     ))
   useTaskControlBindings(snapshot, { stop, resume, all, tasks })

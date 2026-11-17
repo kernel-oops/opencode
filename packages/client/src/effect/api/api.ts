@@ -15,6 +15,7 @@ import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { AgentAttachment } from "@opencode/schema/prompt"
 import type { FileDiff } from "@opencode/schema/file-diff"
 import type { Money } from "@opencode/schema/money"
+import type { Shell } from "@opencode/schema/shell"
 import type { Form } from "@opencode/schema/form"
 import type { DateTime } from "effect"
 import type { Skill } from "@opencode/schema/skill"
@@ -25,7 +26,6 @@ import type { EventLog } from "@opencode/schema/event-log"
 import type { Workspace } from "@opencode/schema/workspace"
 import type { Instruction } from "@opencode/schema/instruction"
 import type { Snapshot } from "@opencode/schema/snapshot"
-import type { Shell } from "@opencode/schema/shell"
 import type { Generate } from "@opencode/schema/generate"
 import type { Provider } from "@opencode/schema/provider"
 import type { Integration } from "@opencode/schema/integration"
@@ -353,6 +353,7 @@ export type SessionTaskStatusOutput = {
     readonly description: string
     readonly status: "running" | "completed" | "error" | "cancelled"
   }>
+  readonly shells: ReadonlyArray<{ readonly id: Shell.ID; readonly sessionID: Session.ID; readonly command: string }>
 }
 export type SessionTaskStatusOperation<E = never> = (
   input: SessionTaskStatusInput,
@@ -371,7 +372,11 @@ export type SessionTaskResumeOperation<E = never> = (
 ) => Effect.Effect<SessionTaskResumeOutput, E>
 
 export type SessionTaskStopAllInput = { readonly sessionID: Session.ID }
-export type SessionTaskStopAllOutput = { readonly interrupted: boolean; readonly cancelled: ReadonlyArray<Session.ID> }
+export type SessionTaskStopAllOutput = {
+  readonly interrupted: boolean
+  readonly stoppedShells: ReadonlyArray<Shell.ID>
+  readonly cancelled: ReadonlyArray<Session.ID>
+}
 export type SessionTaskStopAllOperation<E = never> = (
   input: SessionTaskStopAllInput,
 ) => Effect.Effect<SessionTaskStopAllOutput, E>

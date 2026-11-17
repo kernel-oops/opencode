@@ -34,6 +34,7 @@ const snapshot = (input: Partial<TaskControlSnapshot> = {}): TaskControlSnapshot
   paused: false,
   active: false,
   background: [],
+  shells: [],
   ...input,
 })
 
@@ -42,6 +43,10 @@ test("stop-all availability considers active response and running background tas
   expect(stopAllAvailable("running")).toBe(true)
   expect(stopAllAvailable("idle", snapshot({ active: true }))).toBe(true)
   expect(stopAllAvailable("idle", snapshot({ background: [task()] }))).toBe(true)
+  const shells = [{ id: "sh_running", sessionID: "child-1", command: "long job" }]
+  expect(stopAllAvailable("idle", snapshot({ shells }))).toBe(true)
+  expect(runningTasks(snapshot({ shells }))).toBe(1)
+  expect(taskBadge(task({ status: "completed" }))).toBe("Completed")
   expect(stopAllAvailable("idle", snapshot({ background: [task({ status: "completed" })] }))).toBe(false)
   expect(runningTasks(snapshot({ background: [task(), task({ sessionID: "c2", status: "error" })] }))).toBe(1)
   expect(emergencyStopReady(1)).toBe(false)
@@ -70,7 +75,9 @@ test("a subagent card finds its session when the running call's metadata is miss
   expect(cardSession(undefined, undefined, "ses_continued", "Any")).toBe("ses_continued")
   const observed = snapshot({ background: [task({ sessionID: "ses_new", description: "Repair DV review blockers" })] })
   expect(cardSession(observed, undefined, undefined, "Repair DV review blockers")).toBe("ses_new")
-  const ambiguous = snapshot({ background: [task({ sessionID: "ses_a", description: "Same" }), task({ sessionID: "ses_b", description: "Same" })] })
+  const ambiguous = snapshot({
+    background: [task({ sessionID: "ses_a", description: "Same" }), task({ sessionID: "ses_b", description: "Same" })],
+  })
   expect(cardSession(ambiguous, undefined, undefined, "Same")).toBeUndefined()
 })
 

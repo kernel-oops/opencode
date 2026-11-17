@@ -110,7 +110,7 @@ test("session background reads the shared task observer honestly across failures
     setSessionID("other")
     await settle("root")
     expect(background.phase()).toBe("loading")
-    setTasks("other", { paused: false, active: false, background: [] })
+    setTasks("other", { paused: false, active: false, background: [], shells: [] })
     await settle("other")
     expect(background.phase()).toBe("ready")
     expect(listed()).toEqual([])

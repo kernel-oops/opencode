@@ -519,8 +519,6 @@ export type SessionTaskBackground = {
   status: "running" | "completed" | "error" | "cancelled"
 }
 
-export type SessionTaskStopAllResult = { interrupted: boolean; cancelled: Array<SessionID> }
-
 export type SessionForkBoundary =
   | { type: "before"; messageID: SessionMessageID }
   | { type: "through"; messageID: SessionMessageID }
@@ -630,6 +628,14 @@ export type SessionMessageShell = {
   status: "running" | "exited" | "timeout" | "killed"
   exit?: number | "Infinity" | "-Infinity" | "NaN"
   output?: { output: string; cursor: number; size: number; truncated: boolean }
+}
+
+export type SessionTaskBackgroundShell = { id: ShellID; sessionID: SessionID; command: string }
+
+export type SessionTaskStopAllResult = {
+  interrupted: boolean
+  stoppedShells: Array<ShellID>
+  cancelled: Array<SessionID>
 }
 
 export type ShellInfo = {
@@ -1241,8 +1247,6 @@ export type ModelVariant = {
 
 export type PermissionRuleset = Array<PermissionRule>
 
-export type SessionTaskStatus = { paused: boolean; active: boolean; background: Array<SessionTaskBackground> }
-
 export type UsageLimitsBudget = {
   id: string
   limit: MoneyUSD
@@ -1299,6 +1303,13 @@ export type SessionInboxCompaction = {
   type: "compaction"
   payload: SessionInboxCompactionPayload
   delivery: SessionInboxDelivery
+}
+
+export type SessionTaskStatus = {
+  paused: boolean
+  active: boolean
+  background: Array<SessionTaskBackground>
+  shells: Array<SessionTaskBackgroundShell>
 }
 
 export type SessionMessageToolStateCompleted = {
