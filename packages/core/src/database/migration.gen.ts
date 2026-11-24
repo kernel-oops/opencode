@@ -63,6 +63,11 @@ import m60 from "./migration/20261029073502_session_time_busy.js"
 import m61 from "./migration/20261029165540_schedule_checks.js"
 import m62 from "./migration/20261030054400_job.js"
 import m63 from "./migration/20261104100530_schedule_delivery.js"
+import m64 from "./migration/20261116043204_automation.js"
+import m65 from "./migration/20261116181958_automation_event_position.js"
+import m66 from "./migration/20261116213417_automation_active_index.js"
+import m67 from "./migration/20261119211416_machine.js"
+import m68 from "./migration/20261120004954_machine-key.js"
 
 export const migrations = [
   m00,
@@ -129,4 +134,9 @@ export const migrations = [
   m61,
   m62,
   m63,
+  m64,
+  m65,
+  m66,
+  m67,
+  m68,
 ] satisfies DatabaseMigration.Migration[]

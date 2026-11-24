@@ -17,7 +17,8 @@ import { SessionInstructions } from "@opencode/core/session/instructions"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Tool } from "@opencode/core/tool"
 import { ReadTool } from "@opencode/core/tool/plugin/read"
-import { ReadToolFileSystem } from "@opencode/core/tool/read-filesystem"
+import { InstructionDiscovery } from "@opencode/core/instruction-discovery"
+import { Flag } from "@opencode/core/flag"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
@@ -32,15 +33,17 @@ const readToolNode = makeLocationNode({
   layer: Layer.effectDiscard(registerToolPlugin(ReadTool.Plugin)),
   deps: [
     Tool.node,
-    ReadToolFileSystem.node,
     Environment.node,
     FileAccess.node,
     Image.node,
     Permission.node,
     SessionInstructions.node,
+    InstructionDiscovery.node,
     Skill.node,
     FSUtil.node,
     Location.node,
+    Config.node,
+    Flag.node,
   ],
 })
 const sessionID = Session.ID.make("ses_read_bound_test")
@@ -81,6 +84,7 @@ const withRead = <A, E, R>(
         imageLayer,
       ),
     ),
+    Effect.provide(Layer.succeed(Flag.Overrides, undefined)),
   )
 
 const call = (input: unknown, id = "call-read") => ({
@@ -112,7 +116,7 @@ describe("bound read tool", () => {
       )
       expect(result).toMatchObject({ status: "completed" })
       if (result.status !== "completed") return
-      expect(result.output).toMatchObject({ type: "text-page", content: "two", offset: 2, truncated: true, next: 3 })
+      expect(result.output).toMatchObject({ type: "text", content: "two", offset: 2, next: 3 })
       expect(result.content).toEqual([
         {
           type: "text",
@@ -157,7 +161,7 @@ describe("bound read tool", () => {
       )
       expect(result).toMatchObject({ status: "completed" })
       if (result.status !== "completed") return
-      expect(result.output).toMatchObject({ type: "file", content: "hello\n" })
+      expect(result.output).toMatchObject({ type: "text", content: "hello\n" })
       expect(assertions.map((input) => input.action)).toEqual(["external_directory", "read"])
       expect((assertions[0]?.metadata as any).readBinding).toBeUndefined()
       expect(action(assertions[1])).toMatchObject({ identity: "read", complete: false })
@@ -199,7 +203,7 @@ describe("bound read tool", () => {
       )
       expect(result).toMatchObject({ status: "completed" })
       if (result.status !== "completed") return
-      expect(result.output).toMatchObject({ type: "text-page", content: "a\nb", offset: 1, truncated: true })
+      expect(result.output).toMatchObject({ type: "text", content: "a\nb", offset: 1, next: 3 })
       expect(assertions.map((input) => input.action)).toEqual(["read"])
       expect(assertions[0]).toMatchObject({ resources: ["src/deep/file.txt"], save: ["*"] })
       const read = action(assertions[0])
@@ -239,7 +243,7 @@ describe("bound read tool", () => {
         (registry) => executeTool(registry, call({ path: "README.md" })),
         assertions,
       )
-      expect(result).toMatchObject({ status: "completed", output: { type: "file", content: "hello\n" } })
+      expect(result).toMatchObject({ status: "completed", output: { type: "text", content: "hello\n" } })
       expect(assertions).toMatchObject([{ action: "read", resources: ["README.md"] }])
       expect(action(assertions[0])).toBeUndefined()
     }).pipe(Effect.scoped),

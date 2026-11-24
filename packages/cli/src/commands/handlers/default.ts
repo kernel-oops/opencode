@@ -5,6 +5,7 @@ import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
 import { Config } from "../../config"
 import { Context, Effect, FileSystem, Option, Queue, Schedule, Semaphore } from "effect"
+import { CliError } from "effect/cli"
 import { ServerConnection } from "../../services/server-connection"
 import { Updater } from "../../services/updater"
 import { UpdatePreflight } from "../../services/update-preflight"
@@ -21,9 +22,22 @@ export default Runtime.handler(Commands, (input) =>
     const requestedDirectory = Option.getOrUndefined(input.directory)
     const requestedServer = Option.getOrUndefined(input.server)
     // Alongside an explicit --server the directory names a path on that server, which need not
-    // exist on this machine, so it is forwarded to the TUI rather than entered locally.
+    // exist on this machine, so it is forwarded to the TUI rather than checked or entered locally.
     const remoteDirectory = requestedServer === undefined ? undefined : requestedDirectory
-    if (requestedDirectory !== undefined && remoteDirectory === undefined) process.chdir(requestedDirectory)
+    if (requestedDirectory !== undefined && remoteDirectory === undefined) {
+      const isDirectory = yield* FileSystem.FileSystem.pipe(
+        Effect.flatMap((fileSystem) => fileSystem.stat(requestedDirectory)),
+        Effect.map((info) => info.type === "Directory"),
+        Effect.orElseSucceed(() => false),
+      )
+      // `opencode login` reads as a mistyped command more often than a directory, so answer with help, not ENOENT.
+      if (!isDirectory)
+        return yield* new CliError.ShowHelp({
+          commandPath: [Commands.name],
+          errors: [new CliError.ValidationError({ message: `No directory or command named "${requestedDirectory}"` })],
+        })
+      process.chdir(requestedDirectory)
+    }
     const preflight = UpdatePreflight.make()
     yield* Effect.addFinalizer(() => Effect.promise(() => preflight.close()))
     const serviceStarts = yield* Queue.unbounded<{

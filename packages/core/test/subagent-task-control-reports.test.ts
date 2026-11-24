@@ -1,13 +1,11 @@
 import type { FileSystem } from "@opencode/core/filesystem"
 import { describe, expect } from "bun:test"
-import { AIError, TransportError } from "@opencode/ai/effect"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { Instance } from "@opencode/core/instance/service"
 import { Job } from "@opencode/core/job"
-import { JobTable } from "@opencode/core/job/sql"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import type { LocationServices } from "@opencode/core/location-services"
 import { Model } from "@opencode/core/model"
@@ -16,7 +14,6 @@ import { ProjectTable } from "@opencode/core/project/sql"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { SessionExecution } from "@opencode/core/session/execution"
-import { SubagentReport } from "@opencode/core/session/execution/subagent-report"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionMessage } from "@opencode/core/session/message"
@@ -27,8 +24,7 @@ import { SessionStore } from "@opencode/core/session/store"
 import { SessionNativeTest } from "@opencode/core/session/native-test"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { LayerNode } from "@opencode/util/effect/layer-node"
-import { Cause, Context, DateTime, Deferred, Effect, Exit, Layer, LayerMap, Schema, Scope } from "effect"
-import { eq, sql } from "drizzle-orm"
+import { Context, DateTime, Deferred, Effect, Exit, Layer, LayerMap, Schema, Scope } from "effect"
 import { testEffect } from "./lib/effect"
 import { SubagentJob } from "@opencode/core/session/subagent-job"
 
@@ -351,25 +347,4 @@ function seedAssistant(database: Database.Service["Service"], sessionID: Session
     .pipe(Effect.orDie)
 }
 
-function claimValue(database: Database.Service["Service"], sessionID: SessionID) {
-  return database.db
-    .select({ claimed: SessionTable.time_suspended })
-    .from(SessionTable)
-    .where(eq(SessionTable.id, sessionID))
-    .get()
-    .pipe(
-      Effect.orDie,
-      Effect.map((row) => row?.claimed),
-    )
-}
 
-function claims(database: Database.Service["Service"]) {
-  return database.db
-    .select({ id: SessionTable.id, claimed: SessionTable.time_suspended })
-    .from(SessionTable)
-    .all()
-    .pipe(
-      Effect.orDie,
-      Effect.map((rows) => Object.fromEntries(rows.map((row) => [row.id, row.claimed !== null]))),
-    )
-}

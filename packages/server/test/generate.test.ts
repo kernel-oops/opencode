@@ -46,6 +46,12 @@ const generate = makeLocationNode({
           ),
         image: () => Effect.die("unused"),
         decisions: () => Effect.die("unused"),
+        video: {
+          start: () => Effect.die("unused"),
+          status: () => Effect.die("unused"),
+          result: () => Effect.die("unused"),
+          cancel: () => Effect.die("unused"),
+        },
       })
     }),
   ),
@@ -274,6 +280,7 @@ const readinessFixture = Effect.fn(function* () {
       return ModelResolver.Service.of({
         resolveImage: () => Effect.die("unused"),
         resolveDecision: () => Effect.die("unused"),
+        resolveVideo: () => Effect.die("unused"),
         resolveModel: () => Effect.die("Unused by stateless generation"),
         nativeSteerSupport: () => Effect.die("Unused by stateless generation"),
         fallback: () => Effect.die("Unused by stateless generation"),

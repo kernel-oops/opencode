@@ -1,7 +1,7 @@
 export * as Permission from "./permission.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Context, Deferred, Duration, Effect, Layer, Schema } from "effect"
+import { Context, Deferred, Duration, Effect, Layer, Schema, Scope } from "effect"
 import { Permission } from "@opencode/schema/permission"
 import type { Tool } from "@opencode/schema/tool"
 import { Bus } from "./bus.js"
@@ -143,11 +143,22 @@ export const REVIEW_REQUEST_EXPIRED_MESSAGE =
 export const PERMISSION_REQUEST_EXPIRED_MESSAGE =
   "The user did not answer this permission request within 2 minutes, so it was rejected and did not run. Do not stop or wait: carry on with any other work that does not depend on it. Tell the user in plain words exactly what you wanted to do and why. If the user says to go ahead, retry the same call once; the retry creates a fresh request for them to answer."
 
+/** Actions whose resources are file paths. */
+export const pathActions = ["external_directory", "read", "edit"] as const
+
+/** macOS volumes ignore case by default, so `.OPENCODE/x` opens `.opencode/x`; rules for file paths must match it too. */
+export function ignoresCase(action: string) {
+  return process.platform === "darwin" && pathActions.some((item) => item === action)
+}
+
 export function evaluate(action: string, resource: string, ...rulesets: Permission.Ruleset[]): Permission.Rule {
+  const ignoreCase = ignoresCase(action)
   return (
     rulesets
       .flat()
-      .findLast((rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource)) ?? {
+      .findLast(
+        (rule) => Wildcard.match(action, rule.action) && Wildcard.match(resource, rule.resource, ignoreCase),
+      ) ?? {
       action,
       resource: "*",
       effect: "ask",
@@ -190,6 +201,11 @@ export interface Interface {
   readonly get: (id: ID) => Effect.Effect<Request | undefined>
   readonly forSession: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<Request>>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
+  /**
+   * Marks `call` as made by `parent`, such as a call inside a Code Mode program. It has an ID of its own but no row,
+   * so until the scope closes, requests naming it as their source show on `parent`'s row.
+   */
+  readonly nested: (call: Tool.CallID, parent: Tool.CallID) => Effect.Effect<void, never, Scope.Scope>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
@@ -213,6 +229,7 @@ const layer = Layer.effect(
     const db = (yield* Database.Service).db
     const pending = new Map<ID, Pending>()
     const scope = yield* Effect.scope
+    const parents = new Map<string, Tool.CallID>()
     let closed = false
 
     // Every settlement path (reply, sibling reject, always cascade, expiry, close) first claims the entry
@@ -432,6 +449,17 @@ const layer = Layer.effect(
       }
       return { denied: false, reason: undefined, ask: false, rules: [], agent: undefined, fingerprint: "none" }
     })
+    const nested: Interface["nested"] = (call, parent) =>
+      Effect.acquireRelease(
+        Effect.sync(() => void parents.set(call, parent)),
+        () => Effect.sync(() => void parents.delete(call)),
+      )
+
+    function row(source: AssertInput["source"]) {
+      const parent = source && parents.get(source.id)
+      return parent ? { ...source, id: parent } : source
+    }
+
     const evaluateInput = Effect.fnUntraced(function* (provided: AssertInput, approval?: Approval) {
       // Allocate and freeze the request binding before any asynchronous review. Hooks receive copies.
       const input = structuredClone({ ...provided, id: provided.id ?? ID.create() })
@@ -467,7 +495,7 @@ const layer = Layer.effect(
           action: input.action,
           resources: input.resources,
           metadata: input.metadata,
-          source: input.source,
+          source: row(input.source),
           effect: "deny",
           refusal: reason,
         })
@@ -493,7 +521,7 @@ const layer = Layer.effect(
           action: input.action,
           resources: input.resources,
           metadata: input.metadata,
-          source: input.source,
+          source: row(input.source),
           effect,
         }), false, approval?.receipt,
       )
@@ -507,7 +535,7 @@ const layer = Layer.effect(
                 action: input.action,
                 resources: input.resources,
                 metadata: input.metadata,
-                source: input.source,
+                source: row(input.source),
                 effect: "ask" as const,
               }), true, approval?.receipt,
             )
@@ -639,7 +667,7 @@ const layer = Layer.effect(
         metadata:
           input.metadata &&
           Object.fromEntries(Object.entries(input.metadata).filter(([, value]) => value !== undefined)),
-        source: input.source,
+        source: row(input.source),
         message,
       }
     }
@@ -806,7 +834,12 @@ const layer = Layer.effect(
               .pipe(Effect.ensuring(Deferred.fail(existing.deferred, declined())))
             if (input.experimental?.scope === "request") return
             for (const item of Array.from(pending.values())) {
-              if (item.request.sessionID !== existing.request.sessionID || !claim(item)) continue
+              if (
+                item.request.sessionID !== existing.request.sessionID ||
+                item.request.source?.messageID !== existing.request.source?.messageID ||
+                !claim(item)
+              )
+                continue
               // Feedback applies to the whole batch, so parallel asks don't end the step.
               yield* bus
                 .publish(Permission.Event.Replied, {
@@ -880,7 +913,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
     })
 
-    return Service.of({ ask, assert, assertNotDenied, allows, reply, get, forSession, list, close })
+    return Service.of({ ask, assert, assertNotDenied, allows, reply, get, forSession, list, nested, close })
   }),
 )
 

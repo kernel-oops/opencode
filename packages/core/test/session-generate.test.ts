@@ -97,6 +97,7 @@ const client = Layer.mock(LLMClient.Service)({
 })
 const resolutions: Array<unknown> = []
 const models = Layer.mock(SessionRunnerModel.Service)({
+  select: (session) => Effect.fail(new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })),
   resolve: (_session, _available, _request, policy) =>
     Effect.sync(() => {
       resolutions.push(policy)
@@ -131,6 +132,7 @@ const builtins = Layer.mock(InstructionBuiltIns.Service, {
 const discovery = Layer.mock(InstructionDiscovery.Service, {
   project: true,
   global: true,
+  claude: true,
   load: () => Effect.succeed(Instructions.empty),
 })
 const skills = Layer.mock(SkillInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })

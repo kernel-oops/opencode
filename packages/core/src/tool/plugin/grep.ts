@@ -5,13 +5,13 @@ import { ToolFailure } from "@opencode/ai/effect"
 import { Effect, Schema } from "effect"
 import { realpath, stat } from "node:fs/promises"
 import path from "path"
-import { Environment } from "../../environment/index.js"
 import { FileSystem } from "../../filesystem.js"
 import { Location } from "../../location.js"
 import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
 import { Ripgrep } from "../../ripgrep.js"
 import { RelativePath } from "../../schema.js"
+import { ToolSearch } from "../search.js"
 import { BoundExternal } from "../bound/external.js"
 import { BoundExternalFile } from "@opencode/util/bound/external-file"
 import { BoundSearchDirectory } from "@opencode/util/bound/search-directory"
@@ -80,16 +80,12 @@ type Bindings = {
 export const Plugin = {
   id: "opencode.tool.grep",
   effect: Effect.fn("GrepTool.Plugin")(function* (ctx: Context) {
-    const environment = yield* Environment.Service
     const ripgrep = yield* Ripgrep.Service
     const location = yield* Location.Service
     const access = yield* FileAccess.Service
     const permission = yield* Permission.Service
     // Descriptor pinning walks the host filesystem directly, so it only applies to the local environment.
     const bindable = location.workspaceID === undefined && process.platform === "linux"
-
-    const missingPath = (requested: string | undefined) =>
-      Effect.fail(new ToolFailure({ message: `Search path does not exist: ${requested ?? "."}` }))
 
     yield* ctx.tool
       .transform((editor) =>
@@ -103,11 +99,16 @@ export const Plugin = {
           execute: (input, context) =>
             Effect.gen(function* () {
               const initial = yield* access.resolve({ path: input.path ?? "." })
+              yield* ToolSearch.available(initial.environment)
+              // A machine target is searched by that machine's own ripgrep, so only a target on this server is pinned.
+              const pinned = bindable && initial.machine === undefined
 
               // A root-owned ancestor alias (a home directory mounted elsewhere) is reviewed by its canonical name.
-              const canonical = yield* Effect.promise(() => realpath(initial.absolute).catch(() => undefined))
+              const canonical = pinned
+                ? yield* Effect.promise(() => realpath(initial.absolute).catch(() => undefined))
+                : undefined
               const aliased =
-                bindable &&
+                pinned &&
                 initial.externalDirectory !== undefined &&
                 canonical !== undefined &&
                 canonical !== initial.absolute &&
@@ -119,13 +120,15 @@ export const Plugin = {
               // ask a well-formed question first and discover the answer's shape afterwards here, so an unapproved
               // request does learn whether `requested` exists and its type — a narrower, intentional trade-off for
               // the exact-file-search feature, not an accidental reorder.
-              const requestedType = yield* Environment.typeFollowing(environment.files, requested.absolute).pipe(
-                Effect.catchTag("Environment.NotFound", () => missingPath(input.path)),
+              const requestedType = yield* ToolSearch.pathType(
+                requested.environment.files,
+                requested.absolute,
+                input.path ?? ".",
               )
 
               // An `include` naming one plain file inside an external directory is an exact file search.
               const exact =
-                bindable &&
+                pinned &&
                 requested.externalDirectory !== undefined &&
                 requestedType === "directory" &&
                 (aliased || canonical === initial.absolute)
@@ -148,7 +151,7 @@ export const Plugin = {
               const cwd = kind === "directory" ? root : path.dirname(root)
 
               const bind = Effect.promise(async (): Promise<Bindings> => {
-                if (!bindable) return {}
+                if (!pinned) return {}
                 const file = external && kind === "file" ? await BoundExternalFile.bind(root) : undefined
                 const directory =
                   kind === "directory"
@@ -246,9 +249,9 @@ export const Plugin = {
                         })
                     })
                     yield* verifyBindings
-                    const limit = input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT
-                    const matches = yield* ripgrep
-                      .grep({
+                    const result = yield* ToolSearch.bounded(input.limit ?? FileSystem.DEFAULT_SEARCH_LIMIT, (limit) =>
+                      ripgrep.grep({
+                        environment: target.environment,
                         cwd: directoryBinding ? directoryBinding.cwd : cwd,
                         pattern: input.pattern,
                         file: fileBinding
@@ -259,38 +262,23 @@ export const Plugin = {
                         include: fileBinding || target !== requested ? undefined : input.include,
                         literal: input.literal,
                         caseSensitive: input.caseSensitive,
-                        limit: limit + 1,
+                        limit,
                         oneFileSystem: Boolean(directoryBinding),
-                      })
-                      .pipe(
-                        Effect.timeoutOrElse({
-                          duration: FileSystem.DEFAULT_SEARCH_TIMEOUT_MS,
-                          orElse: () =>
-                            Effect.fail(
-                              new ToolFailure({
-                                message: `Search timed out after ${FileSystem.DEFAULT_SEARCH_TIMEOUT_MS / 1_000} seconds. Consider using a more specific path or pattern.`,
-                              }),
-                            ),
-                        }),
-                        Effect.map((result) =>
-                          result.map((match) =>
-                            FileSystem.Match.make({
-                              ...match,
-                              entry: FileSystem.Entry.make({
-                                ...match.entry,
-                                path: RelativePath.make(
-                                  path.relative(
-                                    location.directory,
-                                    fileBinding ? root : path.resolve(cwd, match.entry.path),
-                                  ),
-                                ),
-                              }),
-                            }),
+                      }),
+                    )
+                    const matches = result.items.map((match) =>
+                      FileSystem.Match.make({
+                        ...match,
+                        entry: FileSystem.Entry.make({
+                          ...match.entry,
+                          path: RelativePath.make(
+                            path.relative(location.directory, fileBinding ? root : path.resolve(cwd, match.entry.path)),
                           ),
-                        ),
-                      )
+                        }),
+                      }),
+                    )
                     yield* verifyBindings
-                    return { matches: matches.slice(0, limit), truncated: matches.length > limit }
+                    return { matches, truncated: result.truncated }
                   }),
                 (bindings) =>
                   Effect.promise(async () => {
@@ -311,13 +299,14 @@ export const Plugin = {
                 ),
                 metadata: { matches: result.matches.length, truncated: result.truncated },
               })),
-              Effect.mapError((error) =>
-                error instanceof ToolFailure
-                  ? error
-                  : error instanceof Ripgrep.InvalidPatternError
-                    ? new ToolFailure({ message: `Invalid regex pattern: ${error.message}` })
-                    : new ToolFailure({ message: `Unable to grep for ${input.pattern}`, error }),
-              ),
+              Effect.mapError((error) => {
+                if (error instanceof ToolFailure) return error
+                if (error instanceof Ripgrep.InvalidGlobError)
+                  return new ToolFailure({ message: `Invalid glob in include ${error.message}` })
+                if (error instanceof Ripgrep.InvalidPatternError)
+                  return new ToolFailure({ message: `Invalid regex pattern: ${error.message}` })
+                return new ToolFailure({ message: `Unable to grep for ${input.pattern}`, error })
+              }),
             ),
         }),
       )

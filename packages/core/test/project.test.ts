@@ -478,10 +478,11 @@ describe("Project.resolve", () => {
     }),
   )
 
-  it.live("falls back to root commit when origin is missing", () =>
+  it.live("falls back to root commit when origin is missing and the cached id is corrupt", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
       yield* Effect.promise(() => initRepo(tmp.path, { commit: true }))
+      yield* Effect.promise(() => Bun.write(path.join(tmp.path, ".git", "opencode"), "\u0000".repeat(40)))
       const project = yield* Project.Service
 
       const result = yield* project.resolve(abs(tmp.path))
@@ -547,7 +548,48 @@ describe("Project.resolve", () => {
       const result = yield* project.resolve(abs(tmp.path))
 
       expect(result.previous).toBe(Project.ID.make("old-id"))
-      expect(result.id).toBe(remoteID("github.com/owner/repo"))
+      expect(result.id).toBe(Project.ID.make("old-id"))
+    }),
+  )
+
+  it.live("keeps the cached id when the remote url changes", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() => initRepo(tmp.path, { commit: true, remote: "git@bitbucket.org:owner/repo.git" }))
+      yield* Effect.promise(() => Bun.write(path.join(tmp.path, ".git", "opencode"), `${remoteID("bitbucket.org/owner/repo")}\n`))
+      yield* Effect.promise(() =>
+        $`git remote set-url origin git@ssh.bitbucket.org:owner/repo.git`.cwd(tmp.path).quiet(),
+      )
+      const project = yield* Project.Service
+
+      const result = yield* project.resolve(abs(tmp.path))
+
+      expect(result.id).toBe(remoteID("bitbucket.org/owner/repo"))
+      expect(result.previous).toBe(result.id)
+    }),
+  )
+
+  it.live("uses the remote when no cached id exists", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() => initRepo(tmp.path, { commit: true, remote: "git@ssh.bitbucket.org:owner/repo.git" }))
+      const project = yield* Project.Service
+
+      const result = yield* project.resolve(abs(tmp.path))
+
+      expect(result.previous).toBeUndefined()
+      expect(result.id).toBe(remoteID("ssh.bitbucket.org/owner/repo"))
+    }),
+  )
+
+  it.live("uses the remote when the cached id is corrupt", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() => initRepo(tmp.path, { commit: true, remote: "git@github.com:owner/repo.git" }))
+      yield* Effect.promise(() => Bun.write(path.join(tmp.path, ".git", "opencode"), "\u0000".repeat(40)))
+      const project = yield* Project.Service
+
+      expect((yield* project.resolve(abs(tmp.path))).id).toBe(remoteID("github.com/owner/repo"))
     }),
   )
 
@@ -650,7 +692,7 @@ describe("Project.resolve", () => {
       yield* Effect.promise(() => $`git worktree add ${worktree} -b test-${Date.now()}`.cwd(tmp.path).quiet())
       const project = yield* Project.Service
       const db = (yield* Database.Service).db
-      const id = remoteID("github.com/owner/repo")
+      const id = Project.ID.make("old-id")
       yield* db
         .insert(ProjectTable)
         .values({

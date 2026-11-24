@@ -10,6 +10,8 @@ import {
   LanguageModel,
   ProviderConfigurationError,
   type ProviderPackage,
+  VideoModel,
+  VideoModelSchema,
 } from "@opencode/ai/effect"
 import { Auth, mergeTransport } from "@opencode/ai/route"
 import { OpenAIResponses } from "@opencode/ai/protocols"
@@ -160,6 +162,9 @@ export interface Interface {
   readonly fallback: () => Effect.Effect<Info | undefined>
   /** An enabled image model by ref, or undefined when no image model has that ref. */
   readonly resolveImage: (ref: Ref) => Effect.Effect<ImageModel | undefined, MediaError>
+  /** An enabled video model by ref, or undefined when no video model has that ref. */
+  readonly resolveVideo: (ref: Ref) => Effect.Effect<VideoModel | undefined, MediaError>
+  /** An enabled decision model by ref, or undefined when no decision model has that ref. */
   readonly resolveDecision: (ref: Ref) => Effect.Effect<DecisionModel | undefined, MediaError>
   readonly resolve: (requested?: Ref, options?: Options) => Effect.Effect<Resolved | undefined, Error>
   readonly resolveModel: (model: Info, variant?: VariantID, options?: Options) => Effect.Effect<Resolved, Error>
@@ -371,6 +376,7 @@ const fromCatalogMedia = Effect.fn("ModelResolver.fromCatalogMedia")(function* <
   dependencies?: Dependencies,
 ) {
   const { resolved, configured, module, settings } = yield* loadCatalogPackage(model, credential, dependencies)
+  const timeouts = Provider.timeouts(configured)
   const tls = Provider.tls(configured)
   const runtime: unknown = yield* Effect.try({
     try: () => module.model(resolved.modelID ?? resolved.id, settings),
@@ -386,10 +392,14 @@ const fromCatalogMedia = Effect.fn("ModelResolver.fromCatalogMedia")(function* <
         })
       : runtime
   if (!is(adapted)) return yield* unsupported(resolved)
-  if (!tls || !(adapted instanceof DecisionModel || adapted instanceof ImageModel)) return adapted
+  if (!(adapted instanceof DecisionModel || adapted instanceof ImageModel || adapted instanceof VideoModel))
+    return adapted
   // Media and decision models are plain classes with readonly fields, so copy onto the same prototype.
   const copy: Runtime = Object.assign(Object.create(Object.getPrototypeOf(adapted)), adapted, {
-    http: { ...adapted.http, tls },
+    transport: mergeTransport(adapted.transport, {
+      timeout: { total: timeouts.timeout, headers: timeouts.headerTimeout, chunk: timeouts.chunkTimeout },
+      http: { tls },
+    }),
   })
   return copy
 })
@@ -406,6 +416,7 @@ const constructionError = (model: RuntimeInfo, cause: unknown) =>
 
 const isImageModel = Schema.is(ImageModelSchema)
 const isDecisionModel = Schema.is(DecisionModelSchema)
+const isVideoModel = Schema.is(VideoModelSchema)
 
 function prepareRuntimeModel(model: RuntimeInfo) {
   if (model.settings?.apiKey !== "") return model
@@ -626,8 +637,15 @@ export const layer = Layer.effect(
       }),
       fallback,
       resolveModel: load,
-      resolveImage: (ref) => loadMedia(ref, "image", isImageModel),
-      resolveDecision: (ref) => loadMedia(ref, "decision", isDecisionModel),
+      resolveImage: Effect.fn("ModelResolver.resolveImage")(function* (ref) {
+        return yield* loadMedia(ref, "image", isImageModel)
+      }),
+      resolveVideo: Effect.fn("ModelResolver.resolveVideo")(function* (ref) {
+        return yield* loadMedia(ref, "video", isVideoModel)
+      }),
+      resolveDecision: Effect.fn("ModelResolver.resolveDecision")(function* (ref) {
+        return yield* loadMedia(ref, "decision", isDecisionModel)
+      }),
       nativeSteerSupport: Effect.fn("ModelResolver.nativeSteerSupport")(function* (requested) {
         // Mirrors SessionRunnerModel: explicit selections come from the available catalog.
         const selected = requested

@@ -14,6 +14,12 @@ const generate = Layer.succeed(
   Generate.Service.of({
     image: () => Effect.die("unused"),
     decisions: () => Effect.die("unused"),
+    video: {
+      start: () => Effect.die("unused"),
+      status: () => Effect.die("unused"),
+      result: () => Effect.die("unused"),
+      cancel: () => Effect.die("unused"),
+    },
     text: () => Effect.die("The host must retain Core's acknowledged result"),
     result: (input) =>
       Effect.sync(() => {

@@ -309,7 +309,7 @@ const layer = Layer.effect(
     const cached = Effect.fnUntraced(function* (dir: string) {
       return yield* fs.readFileString(path.join(dir, "opencode")).pipe(
         Effect.map((value) => value.trim()),
-        Effect.map((value) => (value ? ID.make(value) : undefined)),
+        Effect.map((value) => (value && !/[\u0000-\u001f\u007f]/.test(value) ? ID.make(value) : undefined)),
         Effect.orElseSucceed(() => undefined),
       )
     })
@@ -361,9 +361,10 @@ const layer = Layer.effect(
           return value
         })
       const previous = yield* cached(repo.commonDirectory)
+      // Fork: a valid cached id wins, so editing a remote's URL (e.g. its host) cannot fork the project's identity.
       const id =
-        (yield* remote(repo).pipe(fallback(undefined))) ??
         previous ??
+        (yield* remote(repo).pipe(fallback(undefined))) ??
         (yield* rootCommit(repo).pipe(fallback(undefined)))
       const canonical =
         repo.gitDirectory === repo.commonDirectory

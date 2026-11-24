@@ -30,7 +30,7 @@ import {
   SkillNotFoundError,
 } from "@opencode/protocol/errors"
 import { AbsolutePath } from "@opencode/core/schema"
-import { awaitPlugins, locationErrors } from "../location"
+import { locationErrors } from "../location"
 import { failedMessageDecode, failedSnapshot, missingMessage, missingSession } from "./session-error"
 
 function missingForm(id: Form.ID) {
@@ -589,8 +589,6 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           const info = yield* session
             .get(ctx.params.sessionID)
             .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
-          // The allowance check reads the settled catalog, as the model routes do.
-          yield* awaitPlugins
           return { data: yield* SessionNativeTest.status(nativeTest, info) }
         }),
       )
@@ -600,8 +598,6 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           const info = yield* session
             .get(ctx.params.sessionID)
             .pipe(Effect.catchTag("Session.NotFoundError", missingSession))
-          // The allowance check reads the settled catalog, as the model routes do.
-          yield* awaitPlugins
           return { data: yield* SessionNativeTest.update(nativeTest, info, ctx.payload) }
         }),
       )
