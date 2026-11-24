@@ -154,8 +154,8 @@ test("strict retention counts wrappers and keeps only complete fitting trailing 
   const oversized = strictUser("Oversized " + "x".repeat(60_000))
   const large = SessionCompaction.splitConversation([older, oversized], 15_000, true)!
   expect(large.keepID).toBeUndefined()
-  // The old non-strict policy still retains the oversized newest exchange.
-  expect(SessionCompaction.splitConversation([older, oversized], 15_000)!.keepID).toBe(oversized.id)
+  // Since upstream ad8858de43 the non-strict policy also summarises an oversized newest message rather than keep it.
+  expect(SessionCompaction.splitConversation([older, oversized], 15_000)!.keepID).toBeUndefined()
   const checkpoint = Schema.decodeUnknownSync(SessionMessage.CompactionCompleted)({
     id: SessionMessage.ID.create(),
     type: "compaction",

@@ -166,8 +166,6 @@ test("nests a method under client.experimental exactly when its route is experim
     "session.instructions.entry.put",
     "session.instructions.entry.remove",
     "session.log",
-    "session.nativeTest.get",
-    "session.nativeTest.put",
     "session.skill",
     "session.stats",
     "session.wait",

@@ -91,7 +91,8 @@ describe("ConfigCompactionPlugin.Plugin", () => {
         expect(yield* recent(provider, id)).toBe(expected)
       }
       const oversized = [messages[0], SessionMessage.User.make({ id: SessionMessage.ID.create(), type: "user", text: "latest-marker" + "x".repeat(400_000), time: { created: DateTime.makeUnsafe(0) } })]
-      expect(yield* recent("openai", "gpt-6.1-sol", oversized)).toBe(oversized[1].id)
+      // Since upstream ad8858de43 a non-strict model also summarises an oversized newest message.
+      expect(yield* recent("openai", "gpt-6.1-sol", oversized)).toBeUndefined()
       expect(yield* recent("other", "no-override", oversized)).toBeUndefined()
     }),
   )

@@ -195,7 +195,7 @@ function summary(view: View) {
           : `on ${view.trigger.server} ${view.trigger.event}`
   const action =
     view.action.type === "prompt"
-      ? `prompt ${view.action.to.session ?? `subagent ${view.action.to.subagent}`}: ${JSON.stringify(clip(view.action.prompt))}`
+      ? `prompt ${view.action.to.session ?? `subagent ${view.action.to.subagent}`}${view.action.delivery ? ` (${view.action.delivery})` : ""}: ${JSON.stringify(clip(view.action.prompt))}`
       : view.action.type === "shell"
         ? `shell: ${JSON.stringify(clip(view.action.command))}`
         : `code: ${JSON.stringify(

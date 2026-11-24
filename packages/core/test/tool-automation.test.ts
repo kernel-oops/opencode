@@ -312,6 +312,14 @@ describe("AutomationTools", () => {
         `aut_2 "watch": cron "0 9 * * 1-5" (America/New_York), paused, next 2026-10-27T09:20:00.000-04:00, code: "const t = await tools.slack.read_thread({})"`,
       ])
       expect(list).toStartWith("Now: ")
+      // Fork: a prompt's delivery mode shows in the text, so queued supervision can be verified without Code Mode.
+      expect(
+        yield* direct(registry, "automation_create", {
+          name: "supervise",
+          trigger: { type: "every", every: "1 hour" },
+          action: { type: "prompt", prompt: "supervise", delivery: "queue" },
+        }),
+      ).toContain(`prompt ${sessionID} (queue): "supervise"`)
     }),
   )
 

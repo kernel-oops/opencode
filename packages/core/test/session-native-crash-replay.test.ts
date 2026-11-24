@@ -33,7 +33,8 @@ const setup = Effect.gen(function* () {
   yield* bus.publish(SessionEvent.Step.Started, { ...base, agent: Agent.ID.make("build"), model, started: 0 })
   const replay = Effect.gen(function* () {
     const row = yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, assistantMessageID)).get()
-    const message = yield* SessionHistory.decodeMessageRow(row!)
+    // Part rows are on by default (upstream v2.4), so load the message with its session_part rows.
+    const message = yield* SessionHistory.loadMessageRow(db, row!)
     expect(message).not.toHaveProperty("finish")
     expect(message).not.toHaveProperty("error")
     return { same: JSON.stringify(toLLMMessages([message], model, "openai")), switched: JSON.stringify(toLLMMessages([message], switched, "openai")) }

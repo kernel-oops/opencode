@@ -514,6 +514,8 @@ const layer = Layer.effect(
           ).effect,
       )
       const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
+      // Fork: reviewers see the row (parent) source, so the binding checks below compare against that same source.
+      const source = row(input.source)
       const target = yield* hooks.reviewPermission(
         structuredClone({
           sessionID: input.sessionID,
@@ -521,7 +523,7 @@ const layer = Layer.effect(
           action: input.action,
           resources: input.resources,
           metadata: input.metadata,
-          source: row(input.source),
+          source,
           effect,
         }), false, approval?.receipt,
       )
@@ -535,7 +537,7 @@ const layer = Layer.effect(
                 action: input.action,
                 resources: input.resources,
                 metadata: input.metadata,
-                source: row(input.source),
+                source,
                 effect: "ask" as const,
               }), true, approval?.receipt,
             )
@@ -573,8 +575,8 @@ const layer = Layer.effect(
       }
       const unchanged = !Object.values(changes).some(Boolean)
       const requestBindingUnchanged =
-        reviewBinding(event) === reviewBinding(input) &&
-        (!reviewed || reviewBinding(reviewed.event) === reviewBinding({ ...input, agent: ceiling.agent }))
+        reviewBinding(event) === reviewBinding({ ...input, source }) &&
+        (!reviewed || reviewBinding(reviewed.event) === reviewBinding({ ...input, source, agent: ceiling.agent }))
       const receiptValid = (reviewed?.valid() ?? false) && requestBindingUnchanged
       const sourceAllowed = !ceiling.ask || (reviewed?.event.effect === "allow" && receiptValid) || (approval !== undefined && reviewed?.event.effect !== "deny" && receiptValid)
       const marker = target.review ?? reviewed?.review

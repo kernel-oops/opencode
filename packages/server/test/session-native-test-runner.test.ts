@@ -89,6 +89,13 @@ it.live("real runner: A native while B stays HTTP; a pending disable keeps the l
   const aid = Session.ID.make(a.body.data.id)
   const bid = Session.ID.make(b.body.data.id)
   const route = (id: string) => `/api/experimental/session/${id}/native-test`
+  // Model reads no longer wait for plugins (upstream ce7b4252d8): as a client, wait until the config provider has loaded.
+  const models = `/api/model?${new URLSearchParams({ "location[directory]": directory.path })}`
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const list = (yield* call("GET", models)).body?.data as { providerID: string; id: string }[] | undefined
+    if (list?.some((model) => model.providerID === "fixture" && model.id === "gpt-6")) break
+    yield* Effect.sleep("25 millis")
+  }
   expect((yield* call("PUT", route(aid), { nativeSteer: "response.steer", debug: "metadata" })).status).toBe(200)
   expect((yield* call("POST", `/api/session/${aid}/prompt`, { text: "Original" })).status).toBe(200)
   yield* Deferred.await(parentReady)

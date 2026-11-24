@@ -24,6 +24,23 @@ const config = (allowance: boolean) => ({
   },
 })
 
+// Model reads no longer wait for plugins (upstream ce7b4252d8): as a client, wait until the config providers have loaded.
+const modelsLoaded = (
+  call: (method: string, route: string) => Effect.Effect<{ body?: Record<string, any> }>,
+  directory: string,
+  wanted: string[],
+) =>
+  Effect.gen(function* () {
+    const route = `/api/model?${new URLSearchParams({ "location[directory]": directory })}`
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const ids = ((yield* call("GET", route)).body?.data as { providerID: string; id: string }[] | undefined)?.map(
+        (model) => `${model.providerID}/${model.id}`,
+      )
+      if (wanted.every((id) => ids?.includes(id))) return
+      yield* Effect.sleep("25 millis")
+    }
+  })
+
 const setup = (allowance: boolean) =>
   Effect.gen(function* () {
     const tmp = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-native-test-")))
@@ -41,6 +58,7 @@ const setup = (allowance: boolean) =>
       })
     const created = yield* call("POST", "/api/session", { title: "Native test", location: { directory: tmp.path } })
     expect(created.status).toBe(200)
+    yield* modelsLoaded(call, tmp.path, ["fixture/gpt-6"])
     return { call, server, sessionID: created.body!.data.id as string }
   })
 
@@ -145,6 +163,7 @@ it.live("refuses a known non-Responses route offline without reserving the lane,
         const text = await response.text()
         return { status: response.status, body: text ? (JSON.parse(text) as Record<string, any>) : undefined }
       })
+    yield* modelsLoaded(call, tmp.path, ["chatfix/chat", "fixture/gpt-6"])
     const chat = (yield* call("POST", "/api/session", { title: "Chat", location: { directory: tmp.path } })).body!.data.id as string
     const responses = (yield* call("POST", "/api/session", { title: "Responses", location: { directory: tmp.path } })).body!.data.id as string
     expect((yield* call("POST", `/api/session/${responses}/model`, { model: { providerID: "fixture", id: "gpt-6" } })).status).toBe(204)

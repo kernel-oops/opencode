@@ -11,6 +11,7 @@ import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { SessionEvent } from "@opencode/core/session/event"
+import { SessionHistory } from "@opencode/core/session/history"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionProjector } from "@opencode/core/session/projector"
@@ -63,7 +64,10 @@ const setup = Effect.gen(function* () {
     recoverContinuation: true,
     recoverOverflow: Effect.succeed(false),
   }
-  const message = db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, assistantMessageID)).get()
+  // Part rows are on by default (upstream v2.4), so read the message with its session_part rows folded back in.
+  const message = db.select().from(SessionMessageTable).where(eq(SessionMessageTable.id, assistantMessageID)).get().pipe(
+    Effect.flatMap((row) => (row ? SessionHistory.withParts(db, [row]).pipe(Effect.map(([hydrated]) => hydrated)) : Effect.succeed(row))),
+  )
   return { db, inbox, llm, sessionID, assistantMessageID, correction, input, message }
 })
 

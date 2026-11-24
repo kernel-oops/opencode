@@ -349,7 +349,8 @@ test("a sequenced request leaves only once the prompt made before it has settled
   const prepared = Promise.withResolvers<void>()
   const paths: string[] = []
   const setup = fixture((request) => {
-    paths.push(new URL(request.url).pathname.split("/").at(-1) ?? "")
+    // Fork: the post-acknowledgement inbox read (delivery proof) is a GET, not a send.
+    if (request.method !== "GET") paths.push(new URL(request.url).pathname.split("/").at(-1) ?? "")
     return Promise.resolve(Response.json({ data: { id: "msg_admitted" } }))
   })
   try {
@@ -378,7 +379,8 @@ test("a sequenced request that stays open holds the next send until it has reach
   const prepared = Promise.withResolvers<void>()
   const paths: string[] = []
   const setup = fixture((request) => {
-    paths.push(new URL(request.url).pathname.split("/").at(-1) ?? "")
+    // Fork: the post-acknowledgement inbox read (delivery proof) is a GET, not a send.
+    if (request.method !== "GET") paths.push(new URL(request.url).pathname.split("/").at(-1) ?? "")
     return Promise.resolve(Response.json({ data: { id: "msg_admitted" } }))
   })
   // A shell command's request: the server answers it when the command's process exits.

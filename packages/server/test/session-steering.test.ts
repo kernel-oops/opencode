@@ -30,7 +30,7 @@ it.live("HTTP admit-only steering preserves an active generation and delivers at
     Global.node.replace(tempGlobalLayer),
     Bus.node.replace(Bus.configured({ persist: true })),
     llmClient.replace(Layer.succeed(LLMClient.Service, llm)),
-    SessionRunnerModel.node.replace(Layer.succeed(SessionRunnerModel.Service, { select: () => Effect.die("unused"), resolve: () => Effect.succeed(model) })),
+    SessionRunnerModel.node.replace(Layer.succeed(SessionRunnerModel.Service, { select: (session) => Effect.fail(new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })), resolve: () => Effect.succeed(model) })),
     SessionTitle.node.replace(Layer.succeed(SessionTitle.Service, { generate: () => Effect.void })),
   ]
   const options = { app: { version: "test" }, database: { path: database }, models: { fetch: false }, fs: { filewatcher: false } }
