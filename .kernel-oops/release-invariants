@@ -8,6 +8,9 @@ packages/core test/session-native-crash-replay.test.ts     done-receipt recovery
 packages/core test/anthropic-legacy-replay.test.ts         interrupted/cross-provider reasoning never becomes Anthropic text
 
 # f8a78b89: experimental flags are read per field across config documents, not from the last whole experimental block.
+# B21: the schedule tests that guarded it went with schedules (upstream automations); flag.test.ts below still guards it.
+
+# B21 v2.4.1: schedules became automations; the fork's queued delivery and carry-over, and project identity.
 packages/core test/automation.test.ts                      automation prompts keep queued delivery (schedule-era fork)
 packages/core test/database-migration.test.ts              schedule rows carry delivery, one-shots and renamed tool names into automations
 packages/core test/project.test.ts                         a valid cached .git/opencode id wins over a changed remote

@@ -17238,7 +17238,7 @@
             "$ref": "#/components/schemas/Automation.ShellActionInput"
           }
         ],
-        "description": "What it does: { type: \"prompt\", prompt, to? } sends a prompt; { type: \"code\", code, args? } runs Code Mode; { type: \"shell\", command } runs a fixed shell command."
+        "description": "What it does: { type: \"prompt\", prompt, to?, delivery? } sends a prompt; { type: \"code\", code, args? } runs Code Mode; { type: \"shell\", command } runs a fixed shell command."
       },
       "Automation.CodeActionInput": {
         "type": "object",

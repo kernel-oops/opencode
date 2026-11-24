@@ -215,7 +215,7 @@ export const Request = Schema.Struct({
   }),
   action: ActionInput.annotate({
     description:
-      'What it does: { type: "prompt", prompt, to? } sends a prompt; { type: "code", code, args? } runs Code Mode; { type: "shell", command } runs a fixed shell command.',
+      'What it does: { type: "prompt", prompt, to?, delivery? } sends a prompt; { type: "code", code, args? } runs Code Mode; { type: "shell", command } runs a fixed shell command.',
   }),
   expires: Schema.String.pipe(optional).annotate({
     description: 'When it stops for good: an instant, a wall-clock time in tz, or "in 8 hours".',

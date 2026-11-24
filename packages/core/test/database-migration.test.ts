@@ -556,10 +556,18 @@ describe("DatabaseMigration", () => {
         )
         yield* db.run(sql`INSERT INTO session_v2 VALUES ('ses_1', 'prj_1', '/repo')`)
         yield* DatabaseMigration.applyOnly(db, [scheduleMigration, scheduleChecksMigration, scheduleDeliveryMigration])
-        const insert = (id: string, when: string, prompt: string, delivery: string | null, remaining: number | null) =>
+        const insert = (
+          id: string,
+          when: string,
+          prompt: string,
+          delivery: string | null,
+          remaining: number | null,
+          status = "active",
+          ends: number | null = null,
+        ) =>
           db.run(sql`
-            INSERT INTO schedule (id, session_id, name, action, "when", tz, status, next_due_at, remaining_runs, delivery, run_count, time_created, time_updated)
-            VALUES (${id}, 'ses_1', ${id}, ${JSON.stringify({ type: "prompt", prompt })}, ${when}, 'UTC', 'active', 60000, ${remaining}, ${delivery}, 0, 1, 2)
+            INSERT INTO schedule (id, session_id, name, action, "when", tz, status, next_due_at, ends_at, remaining_runs, delivery, run_count, time_created, time_updated)
+            VALUES (${id}, 'ses_1', ${id}, ${JSON.stringify({ type: "prompt", prompt })}, ${when}, 'UTC', ${status}, 60000, ${ends}, ${remaining}, ${delivery}, 0, 1, 2)
           `)
         yield* insert(
           "sch_queued",
@@ -570,12 +578,27 @@ describe("DatabaseMigration", () => {
         )
         yield* insert("sch_once", '{"type":"at","at":"2026-11-25T09:00"}', "review", null, 1)
         yield* insert("sch_limited", '{"type":"every","every":"1 hour"}', "limited", "queue", 3)
+        yield* insert("sch_in", '{"type":"in","in":"2 hours"}', "steered", "steer", 1)
+        yield* insert("sch_paused", '{"type":"every","every":"1 hour"}', "supervise", "queue", null, "paused", 120000)
 
         yield* DatabaseMigration.applyOnly(db, [automationMigration, automationEventPosition, automationActiveIndex])
 
-        const rows = yield* db.all<{ id: string; action: string }>(sql`SELECT id, action FROM automation ORDER BY id`)
+        const rows = yield* db.all<{ id: string; action: string; status: string; expires_at: number | null }>(
+          sql`SELECT id, action, status, expires_at FROM automation ORDER BY id`,
+        )
+        expect(rows.map((row) => ({ id: row.id, status: row.status, expires: row.expires_at }))).toEqual([
+          { id: "aut_in", status: "active", expires: null },
+          { id: "aut_once", status: "active", expires: null },
+          { id: "aut_paused", status: "paused", expires: 120000 },
+          { id: "aut_queued", status: "active", expires: null },
+        ])
         expect(rows.map((row) => ({ id: row.id, action: JSON.parse(row.action) }))).toEqual([
+          { id: "aut_in", action: { type: "prompt", prompt: "steered", to: { session: "ses_1" }, delivery: "steer" } },
           { id: "aut_once", action: { type: "prompt", prompt: "review", to: { session: "ses_1" } } },
+          {
+            id: "aut_paused",
+            action: { type: "prompt", prompt: "supervise", to: { session: "ses_1" }, delivery: "queue" },
+          },
           {
             id: "aut_queued",
             action: {
