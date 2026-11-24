@@ -28,6 +28,9 @@ test("Home and End navigate a subagent transcript", async () => {
     fetch: (url) => {
       if (url.pathname === "/api/session") return json({ data: [session], cursor: {} })
       if (url.pathname === `/api/session/${session.id}`) return json({ data: session })
+      // Fork: a cold subagent route loads its parent to hydrate the family.
+      if (url.pathname === "/api/session/ses_parent")
+        return json({ data: { ...session, id: "ses_parent", parentID: undefined, title: "Parent" } })
       if (url.pathname === `/api/session/${session.id}/message`)
         return json({ data: messages.toReversed(), cursor: {} })
       if (url.pathname === `/api/session/${session.id}/inbox`) return json({ data: [] })

@@ -46,28 +46,32 @@ export function SubagentsTab(props: { sessionID: string }) {
     if (!current) return []
 
     const jobs = data.job.list(data.session.root(current.id))
-    const result = sessionFamily<SessionInfo>(data.session.list(), current.id).map(
-      ({ session, prefix }): SubagentEntry => {
-        const title = withTimestampedFallback(session)
-        const agentMatch = title.match(/@(\w+) subagent/)
-        return {
-          sessionID: session.id,
-          agent: session.agent
-            ? Locale.titlecase(session.agent)
-            : agentMatch
-              ? Locale.titlecase(agentMatch[1])
-              : "Subagent",
-          title: agentMatch ? title.replace(agentMatch[0], "").trim() || title : title,
-          status: data.session.status(session.id),
-          model: shortModelLabel(session.model),
-          jobs: ownedJobs(jobs, session.id, (id) => data.session.get(id)?.parentID).map((job) => job.id),
-          current: session.id === route.sessionID,
-          prefix,
-        }
-      },
-    )
-
-    return result.filter((entry) => filter.active === (entry.status === "running" || entry.jobs.length > 0))
+    const owned = (id: string) => ownedJobs(jobs, id, (id) => data.session.get(id)?.parentID).map((job) => job.id)
+    const active = (session: SessionInfo) =>
+      data.session.status(session.id) === "running" || owned(session.id).length > 0
+    // Fork: filter inside sessionFamily so an idle ancestor of an active descendant stays as a navigable row.
+    return sessionFamily<SessionInfo>(
+      data.session.list(),
+      current.id,
+      (session) => filter.active === active(session),
+    ).map(({ session, prefix }): SubagentEntry => {
+      const title = withTimestampedFallback(session)
+      const agentMatch = title.match(/@(\w+) subagent/)
+      return {
+        sessionID: session.id,
+        agent: session.agent
+          ? Locale.titlecase(session.agent)
+          : agentMatch
+            ? Locale.titlecase(agentMatch[1])
+            : "Subagent",
+        title: agentMatch ? title.replace(agentMatch[0], "").trim() || title : title,
+        status: data.session.status(session.id),
+        model: shortModelLabel(session.model),
+        jobs: owned(session.id),
+        current: session.id === route.sessionID,
+        prefix,
+      }
+    })
   })
 
   let selectedSessionID = ""

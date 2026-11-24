@@ -2,10 +2,10 @@ import { expect, test } from "bun:test"
 import { TextRenderable, type Renderable } from "@opentui/core"
 import { createTestRenderer } from "@opentui/core/testing"
 import { Effect, FileSystem } from "effect"
-import { Global } from "@opencode/util/global"
 import type { SessionMessageInfo } from "@opencode/client"
 import { createEventStream, createFetch, directory, json } from "./fixture/tui-client"
 import { tmpdir } from "./fixture/fixture"
+import { isolatedGlobal } from "./fixture/app"
 import { waitForHighlightedFrame } from "./fixture/frame"
 
 const session = {
@@ -78,7 +78,7 @@ test("an expanded background shell keeps its 1 MiB tail on a whole character", a
       args: { sessionID: session.id },
       terminalHandoff: async () => ({ renderer: setup.renderer, mode: "dark", complete: () => {} }),
       log: () => {},
-    }).pipe(Effect.provide(Global.layerWith({ state: state.path })), Effect.provide(FileSystem.layerNoop({}))),
+    }).pipe(Effect.provide(isolatedGlobal(state.path)), Effect.provide(FileSystem.layerNoop({}))),
   )
   try {
     await waitForHighlightedFrame(setup, (frame) => frame.includes("Started it"))

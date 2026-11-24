@@ -153,6 +153,8 @@ export function createFetch(override?: FetchHandler, events?: ReturnType<typeof 
       return json({ location: { directory, project: { id: "proj_test", directory: worktree } }, data: [] })
     if (/^\/api\/session\/[^/]+\/permission$/.test(url.pathname)) return json({ data: [] })
     if (/^\/api\/session\/[^/]+\/form$/.test(url.pathname)) return json({ data: [] })
+    // Fork: the client re-reads the inbox after a prompt is acknowledged, as proof of delivery.
+    if (request.method === "GET" && /^\/api\/session\/[^/]+\/inbox$/.test(url.pathname)) return json({ data: [] })
     if (/^\/api\/session\/[^/]+\/task$/.test(url.pathname)) return json({ paused: false, active: false, background: [] })
     if (/^\/api\/experimental\/session\/[^/]+\/terminal$/.test(url.pathname)) return json({ data: [] })
     if (
